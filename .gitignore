@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+# Secrets, local config, runtime state and logs must never be committed
+.env
+config.toml
+agent.toml
+known_hub
+state.json
+state.json.bak
+logs/
+*.jsonl
+*.pem
+*.key
+# Models and llama.cpp binaries
+*.gguf
+llama.cpp/
+bin/
