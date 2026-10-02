@@ -64,7 +64,9 @@ def test_ollama_host_env_on_all_interfaces(make_config, monkeypatch):
     monkeypatch.setenv("OLLAMA_HOST", "0.0.0.0:11435")
     monkeypatch.setattr(doctor, "local_ip_addresses", lambda: [])
     cfg = make_config(f"http://127.0.0.1:{free_port()}")
-    assert doctor.check_exposure(cfg)[0].level == "error"
+    finding = doctor.check_exposure(cfg)[0]
+    assert finding.level == "error"
+    assert f"OLLAMA_HOST=127.0.0.1:{cfg.ollama.url.rsplit(':', 1)[1]}" in finding.fix
 
 
 def test_token_checks(make_config, monkeypatch):

@@ -177,7 +177,7 @@ def check_ports(config: Config) -> list[Finding]:
 
 def check_exposure(config: Config) -> list[Finding]:
     findings = []
-    fix = "Bind Ollama to loopback: " + migration_steps(config.ollama.url).splitlines()[0]
+    fix = "Bind Ollama to loopback with OLLAMA_HOST:\n" + migration_steps(config.ollama.url)
     env_host = os.environ.get("OLLAMA_HOST", "")
     if env_host:
         host = urlsplit(env_host if "://" in env_host else f"http://{env_host}").hostname or ""
