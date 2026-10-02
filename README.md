@@ -6,13 +6,14 @@ the Hub exactly as they talk to Ollama today; the Hub decides, per model, whethe
 a helper can make it faster or let it run a model that doesn't fit, and only
 uses a helper when a benchmark proves it wins.
 
-> **Status: Phase 4 (secure tunnel).** The hub runs in front of your Ollama
-> with a priority queue and a terminal UI; helpers join and report their GPUs,
-> and a model you plan for split mode runs across the hub's GPU and the
-> helpers' GPUs with llama.cpp. Split-mode traffic is encrypted by default
-> (mutually authenticated TLS 1.3); unencrypted direct mode is an opt-in by
-> both owners. Automatic plans with benchmarks arrive in Phase 5. Everything
-> else is served by your local Ollama, exactly as before.
+> **Status: Phase 5 (planner).** The hub runs in front of your Ollama with a
+> priority queue and a terminal UI; helpers join and report their GPUs. For a
+> model that doesn't fit the hub's GPU, the hub benchmarks plain Ollama
+> against split mode (the model spread over the hub's and helpers' GPUs with
+> llama.cpp) and uses split mode only if it is measurably faster. Split-mode
+> traffic is encrypted (mutually authenticated TLS 1.3) unless both owners opt
+> in to direct mode. Everything else is served by your local Ollama, exactly
+> as before.
 
 ## What it can and can't do
 
@@ -27,11 +28,11 @@ model. VRAM moves hundreds of GB/s, system RAM tens of GB/s, a gigabit LAN about
 | Several requests at once (agents, batch jobs, several users) | **A little**: helper VRAM leaves the Hub room for a larger context and more parallel requests, but every request still runs through the Hub. Helpers never run Ollama or their own copy of a model. |
 | Helper on Wi-Fi or across the internet | **No** for split mode. Wi-Fi helpers get a loud warning. |
 
-**Golden rule: OllamaPower must never make things slower.** Today that means:
-a model that fits on the hub's GPU is never split, and if split mode can't
-start, Ollama serves the request as before. From Phase 5 every non-local plan
-is also benchmarked against plain local Ollama and only used if it beats it
-(by 10 % by default).
+**Golden rule: OllamaPower must never make things slower.** A model that fits
+on the hub's GPU is never split. Any other model runs split only after a
+benchmark showed split generating at least 10 % (`planner.min_gain`) faster
+than plain Ollama, and only while nothing that benchmark depended on has
+changed. If split mode fails, Ollama serves the request.
 
 ## Requirements
 
@@ -72,13 +73,13 @@ listen on anything but loopback (remote access is OllamaGate's job).
 | **1 Overview** | front door, Ollama, queue, the running split session (layers per device), requests, helpers and lendable VRAM, control-plane port and key fingerprint, the hub's GPU/VRAM bars, loaded models (VRAM %, last tok/s, spill warning), active requests, recent events, warnings |
 | **2 Nodes** | every helper: status (🟢 lending · 🟡 paused · 🔴 offline · ⚠ incompatible), name, IP, GPU, VRAM total/free/lendable, GPU %, CPU/RAM, link (RTT, Mbps, wired/Wi-Fi), role, tunnel mode |
 | **3 Node detail** | full capabilities, GPU/VRAM/CPU sparklines, network-test history, last tunnel test (secure vs direct) |
-| **4 Models** | installed models: size, quantisation, loaded VRAM %, whether they fit the hub's VRAM, plan, last tok/s |
+| **4 Models** | installed models: size, loaded VRAM %, whether they fit the hub's VRAM, engine and mode (auto/pinned), Ollama vs split tok/s from the last benchmark, why; benchmark and first-load progress |
 | **5 Log** | filterable event feed: joins, leaves, pauses, bans, failed logins, net tests |
 
 Keys: `1`–`5` tabs · `Enter` helper details · `P` pause/resume a helper (the
 hub stops using it) · `K` kick · `N` network test · `T` tunnel mode · `M` tunnel test · `X`
 forget an offline helper · `/` filter · `Q` quit. Destructive actions ask
-first. `B`/`L`/`F` (benchmark, pin plan, force local) arrive with the planner.
+first. Models tab: `B` benchmark · `L` pin split · `F` force local · `U` automatic.
 
 ### The front door
 
@@ -215,29 +216,65 @@ about 0.03 ms per round trip: more than a gigabit LAN can carry, and under 1 %
 of a typical token's time for real models. Measure your own LAN; see
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-## Split mode
+## Split mode and the planner
 
 One model across the hub's GPU and the helpers' GPUs, for models that don't
-fit on the hub alone:
+fit on the hub alone. The hub decides by itself, by measuring:
 
 ```bash
-ollamapower models plan llama3.1:70b --split [--ctx 8192]   # checks the model, previews, saves the plan
-ollamapower models unplan llama3.1:70b                      # back to plain Ollama
-ollamapower llamacpp install | status                       # the pinned llama.cpp (also done automatically)
+ollamapower models list                      # engine per model, why, last benchmark (Ollama vs split tok/s)
+ollamapower models show <model>              # memory estimate, plan, benchmark history
+ollamapower models benchmark <model> [--ctx N]
+ollamapower models pin <model> split|local   # override the benchmark   (TUI: L / F)
+ollamapower models force-local <model>       # same as `pin <model> local`
+ollamapower models unpin <model>             # automatic again           (TUI: U)
+ollamapower models exclude <model> <helper> [--undo]
+ollamapower llamacpp install | status        # the pinned llama.cpp (also done automatically)
 ```
 
-The first request for a planned model starts a split session:
+### How the hub decides
+
+1. **Does it fit?** From the model's GGUF file: weights + KV cache at the
+   plan's context + `planner.memory_margin` (10 %), against the hub's VRAM.
+   Ollama's `/api/ps` showing the model partly on the CPU (a *spill*) counts
+   as "doesn't fit" too. A model that fits stays on Ollama.
+2. **Benchmark.** The same workload on plain Ollama and on each split
+   candidate (all eligible helpers, best link first; GPU-only helpers before
+   adding CPU-only ones): a ~512-token prompt, then 128 tokens at temperature
+   0 with a fixed seed, through the real front door, tunnel and all. Measured:
+   load time, time to first token, prompt and generation tokens/s. Results
+   are kept in `state.json` (last 20 per model).
+3. **Choose.** Split only if its generation speed beats Ollama by
+   `planner.min_gain`, or if Ollama couldn't run the model at all.
+4. **Keep it honest.** The choice is tied to the model's digest, the context,
+   the llama.cpp build and the exact helpers with their tunnel modes. If any
+   of these changes (a helper leaves, the model is re-pulled), the model goes
+   back to Ollama until it is benchmarked again.
+
+Benchmarks run when you ask (`models benchmark`, `B` in the Models tab) and,
+with `planner.auto_benchmark` (on by default), by themselves for models that
+were used in the last day and don't fit - but only after the hub has been idle
+for `planner.idle_seconds` (5 minutes). An automatic benchmark unloads
+Ollama's models while it runs and gives way the moment a request arrives.
+
+Your pins always win over the benchmark (`models pin`, `force-local`); a
+pinned model is still never split if it fits on the hub's GPU alone.
+
+### What a split session does
+
+The first request for a model routed to split mode starts a session:
 
 1. The hub finds the model's GGUF file in Ollama's store (via `/api/show`; no
-   second copy) and reads its layer sizes.
-2. If it fits on the hub's GPU, nothing changes: Ollama serves it.
-3. Ollama is asked to unload its models (`keep_alive: 0`) and the hub waits
+   second copy).
+2. Ollama is asked to unload its models (`keep_alive: 0`) and the hub waits
    until `/api/ps` is empty, so the two never fight over VRAM.
-4. Each eligible helper starts `rpc-server` (bound to its loopback) and
+3. Each helper of the plan starts `rpc-server` (bound to its loopback) and
    reports how much memory its owner lends right now.
-5. The hub places the layers: its own GPU first, then the helpers, the rest on
+4. The hub places the layers: its own GPU first, then the helpers, the rest on
    its CPU; a helper never gets more than its owner's cap. `llama-server`
-   starts on `127.0.0.1` with exactly that placement.
+   starts on `127.0.0.1` with exactly that placement. The first load sends
+   the weights to the helpers (the Models tab shows progress and an ETA in
+   secure mode); helpers cache them on disk, so later loads are quick.
 
 Clients don't notice: `/api/chat` and `/api/generate` are translated to and
 from llama-server (streaming NDJSON, the final `done` object with token counts
@@ -245,11 +282,19 @@ and durations, tool calls, `format`, `think`, sampling options), `/v1/*`
 requests pass straight through, and `/api/ps` lists the split model with
 `"ollamapower": {"engine": "split", "nodes": [...]}`. The session stops after
 `split.keep_alive` seconds idle (Ollama gets the GPU back on its next
-request), when a helper leaves or its owner pauses, or with `models unplan`.
+request), when a helper leaves or its owner pauses, or when the plan changes.
 
-If anything fails (no eligible helper, a helper refuses, llama-server doesn't
-start), the request is served by Ollama and the reason shows as a warning;
-split mode retries a minute later.
+### When something breaks
+
+- **Before the first token** (a helper vanished, llama-server didn't start or
+  stalled): the request is answered by Ollama instead, transparently.
+- **Mid-answer:** the stream ends with an Ollama-style `{"error": ...}`
+  object (never a fake `done`), and the model is marked *degraded*.
+- **Stalls:** no token for `split.stall_timeout` seconds counts as a failure.
+- A degraded model runs on Ollama for at least `planner.retry_after` seconds
+  and until every helper of its plan is back; then split mode is used again.
+  The reason, and the last lines of llama-server's output on a crash, are in
+  the warnings and the event log.
 
 Limits today: images (vision models' projector isn't loaded), raw/suffix
 `generate` prompts and per-request `num_ctx` are not supported in split mode
@@ -326,8 +371,8 @@ clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
 | 1 Front door (done) | Ollama-compatible passthrough with true streaming, priority queue, `/ollamapower/status`, `doctor` port migration |
 | 2 Agents & telemetry (done) | Control plane with protocol version and Hub key pinning, GPU telemetry, net tests, Hub and agent TUIs, CLI |
 | 3 Split MVP (done) | llama.cpp pin/download/verify, Ollama blob resolver, `rpc-server`/`llama-server` lifecycle, layer placement under the lending caps, API translation, direct-mode relay |
-| **4 Secure tunnel** (done) | Per-session pinned TLS 1.3 relays, hub-address allowlist checked before TLS, two-owner direct mode, `nodes tunnel-test` overhead measurement |
-| 5 Planner | Memory estimate, spill detection, benchmarks, automatic "never slower" plan choice, fault tolerance |
+| 4 Secure tunnel (done) | Per-session pinned TLS 1.3 relays, hub-address allowlist checked before TLS, two-owner direct mode, `nodes tunnel-test` overhead measurement |
+| **5 Planner** (done) | Memory estimate, spill detection, benchmarks through the real path, automatic "never slower" choice tied to a benchmark key, pins and exclusions, idle auto-benchmarks, transparent fallback, degraded plans and recovery |
 | 6 Lending & polish | Schedules, auto-yield, real benchmark numbers, start scripts |
 
 Later ideas, not planned yet: speculative decoding with helpers running the

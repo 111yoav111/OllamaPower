@@ -3,8 +3,9 @@
 OllamaPower lets other machines on your network take part in running your
 models, so it is built to fail closed. This file describes the threat model and
 what is (and isn't) protected. It is updated after every build phase; this is
-the **Phase 4** version: the front door, the control plane between the hub
-and its helpers, and split mode (llama.cpp RPC) with its encrypted tunnel.
+the **Phase 5** version: the front door, the control plane between the hub
+and its helpers, split mode (llama.cpp RPC) with its encrypted tunnel, and
+the planner that decides when to use it.
 
 ## Threat model
 
@@ -156,6 +157,29 @@ as it could use Ollama directly before.
   through it.
 - **Overhead is measured, not guessed.** `nodes tunnel-test` measures the real
   path in both modes so the owner can decide; see `docs/BENCHMARKS.md`.
+
+### Planner (Phase 5)
+
+- **No client can choose the engine.** Benchmarks steer their own requests
+  with `X-OllamaPower-Engine` / `-Helpers` / `-Ctx` headers, which are
+  honoured only together with `X-OllamaPower-Bench` carrying a random secret
+  the hub makes at every start (compared in constant time). Without it they
+  are ignored, and like every `X-OllamaPower-*` header they never reach
+  Ollama.
+- **Benchmarks use a synthetic prompt** (fixed English text with a random
+  first line), never anything a client sent; only timings are stored.
+- **Answers are never faked.** If llama-server dies mid-answer, the stream
+  ends with an error object, never with a `done` object that would make a
+  cut-off answer look complete. A failure before the first token is retried
+  on Ollama instead, so the client gets a real answer.
+- **Decisions can't go stale silently.** A split decision is tied to the
+  model digest, context, llama.cpp build and the exact helpers with their
+  tunnel modes; if a helper's tunnel mode changes (e.g. to direct), the old
+  decision no longer applies.
+- **Availability, honestly:** an automatic benchmark unloads Ollama's models
+  while it runs (only when the hub has been idle for `planner.idle_seconds`,
+  and it stops as soon as a request arrives). Turn it off with
+  `planner.auto_benchmark = false`.
 
 ### Control-plane encryption (Phase 0 building blocks)
 

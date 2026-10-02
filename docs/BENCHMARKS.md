@@ -39,3 +39,16 @@ small compiled relay or direct mode inside WireGuard/Tailscale - a decision
 for the owner, never switched silently.
 
 **LAN numbers:** not measured yet (no multi-machine setup in development).
+
+## Split mode vs plain Ollama (the planner's own benchmarks)
+
+The hub benchmarks every model that doesn't fit its GPU (`ollamapower models
+benchmark <model>`, or automatically when idle) and keeps the results in
+`state.json`; `ollamapower models show <model>` lists them (load time, time
+to first token, prompt and generation tokens/s, which helpers and tunnel
+modes). Split mode is used only when it wins by `planner.min_gain`.
+
+**Real model numbers:** not measured yet. The development container has no
+GPU and no second machine, so its only split runs use a tiny generated test
+model, which says nothing about real speed-ups. Numbers from the owner's
+hub and helpers go here (Phase 7).
