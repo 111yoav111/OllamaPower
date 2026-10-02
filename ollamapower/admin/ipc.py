@@ -1,17 +1,25 @@
-"""Local-only admin control channel between the CLI and the running server.
+"""Local-only admin control channel between the CLI and the running hub.
 
 The hub keeps its live state in memory, so CLI commands such as
-``ollamapower status`` must talk to the running process. They do so
-over a channel that is never reachable from the network:
+``ollamapower status`` must talk to the running process. They do so over a
+channel that is never reachable from the network:
 
 * POSIX: a Unix domain socket in a ``0700`` directory, created ``0600``.
 * Windows: a TCP socket bound to ``127.0.0.1`` on a random port.
 
-On both, every request must carry a 256-bit secret that the server writes to
-an owner-only ``admin.json`` file, and every reply carries an HMAC proof over
-a fresh client nonce, so the CLI can't be fooled by another local process
-that grabbed a stale port. The files are removed on shutdown. Messages are
-single-line JSON.
+Both sides share a 256-bit secret that the hub writes to an owner-only
+``admin.json``. **The secret itself never crosses the channel** (OllamaGate's
+original design sent it with every request, so a process that grabbed a stale
+port could collect it):
+
+1. On connect the server sends ``{"challenge": <random>}``.
+2. Each request carries a fresh client ``nonce`` and
+   ``auth = HMAC(secret, "client:" + challenge + ":" + nonce)``; the server
+   refuses a reused nonce on the connection.
+3. Each reply carries ``proof = HMAC(secret, "server:" + challenge + ":" + nonce)``,
+   so the CLI only trusts answers from whoever knows the secret.
+
+The files are removed on shutdown. Messages are single-line JSON.
 """
 
 from __future__ import annotations
@@ -24,17 +32,20 @@ import logging
 import os
 import secrets
 import socket
-import stat
 import sys
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
+
+from ..files import private_dir, write_private
 
 log = logging.getLogger("ollamapower.admin")
 
 MAX_MESSAGE = 64 * 1024
 IDLE_TIMEOUT = 30.0
+MAX_REQUESTS_PER_CONNECTION = 10_000
 # AF_UNIX paths are limited to ~104 bytes on macOS and 108 on Linux.
 MAX_UNIX_PATH = 100
 Handler = Callable[[str, dict[str, Any]], Awaitable[Any]]
@@ -43,7 +54,7 @@ __all__ = ["AdminError", "NotRunning", "ControlClient", "start_control_server", 
 
 
 class AdminError(Exception):
-    """An error meant to be shown to the admin (bad device id, etc.)."""
+    """An error meant to be shown to the admin (bad id, etc.)."""
 
 
 class NotRunning(Exception):
@@ -54,34 +65,9 @@ def run_dir(config_dir: Path) -> Path:
     return config_dir / "run"
 
 
-def _proof(secret: str, nonce: str) -> str:
-    return hmac.new(secret.encode(), b"ollamapower-server:" + nonce.encode(), hashlib.sha256).hexdigest()
-
-
-def _private_dir(path: Path) -> None:
-    """Create ``path`` as a directory only we can use; refuse anything suspicious."""
-    path.mkdir(parents=True, exist_ok=True)
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        raise RuntimeError(f"{path} must be a real directory, not a symlink")
-    if sys.platform != "win32":
-        if st.st_uid != os.getuid():
-            raise RuntimeError(f"{path} is not owned by the current user")
-        os.chmod(path, 0o700)
-
-
-def _write_private_json(path: Path, data: dict[str, Any]) -> None:
-    tmp = path.with_suffix(".tmp")
-    try:
-        tmp.unlink()
-    except FileNotFoundError:
-        pass
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(fd, json.dumps(data).encode())
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
+def _mac(secret: str, role: str, challenge: str, nonce: str) -> str:
+    message = f"ollamapower-{role}:{challenge}:{nonce}".encode()
+    return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
 
 def use_unix_socket() -> bool:
@@ -132,11 +118,15 @@ class ControlServer:
 async def _serve_connection(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, secret: str, handler: Handler
 ) -> None:
+    challenge = secrets.token_hex(16)
+    seen: set[str] = set()
+
     async def reply(message: dict[str, Any]) -> None:
         writer.write(json.dumps(message).encode() + b"\n")
         await writer.drain()
 
     try:
+        await reply({"challenge": challenge})
         while True:
             try:
                 line = await asyncio.wait_for(reader.readline(), IDLE_TIMEOUT)
@@ -148,16 +138,19 @@ async def _serve_connection(
             if request is None:
                 await reply({"ok": False, "error": "malformed request"})
                 continue
-            given, nonce = request.get("secret"), request.get("nonce")
+            nonce, auth = request.get("nonce"), request.get("auth")
             if (
-                not isinstance(given, str)
-                or not isinstance(nonce, str)
-                or len(nonce) > 128
-                or not hmac.compare_digest(given.encode(), secret.encode())
+                not isinstance(nonce, str)
+                or not isinstance(auth, str)
+                or not 16 <= len(nonce) <= 128
+                or nonce in seen
+                or len(seen) >= MAX_REQUESTS_PER_CONNECTION
+                or not hmac.compare_digest(auth, _mac(secret, "client", challenge, nonce))
             ):
                 await reply({"ok": False, "error": "unauthorized"})
                 break
-            proof = _proof(secret, nonce)
+            seen.add(nonce)
+            proof = _mac(secret, "server", challenge, nonce)
             cmd, args = request.get("cmd"), request.get("args") or {}
             if not isinstance(cmd, str) or not isinstance(args, dict):
                 await reply({"ok": False, "error": "malformed request", "proof": proof})
@@ -166,7 +159,7 @@ async def _serve_connection(
                 message = {"ok": True, "result": await handler(cmd, args)}
             except AdminError as exc:
                 message = {"ok": False, "error": str(exc)}
-            except Exception:  # noqa: BLE001 - never kill the server over an admin command
+            except Exception:  # noqa: BLE001 - never kill the hub over an admin command
                 log.exception("admin command %s failed", cmd)
                 message = {"ok": False, "error": "internal error"}
             message["proof"] = proof
@@ -182,7 +175,7 @@ async def _serve_connection(
 
 
 def _alive(info_path: Path) -> bool:
-    """Is an OllamaPower hub answering on the channel described by ``info_path``?"""
+    """Is a hub answering on the channel described by ``info_path``?"""
     try:
         client = ControlClient.from_info_file(info_path, timeout=1.0)
     except NotRunning:
@@ -205,8 +198,12 @@ def _socket_path(rdir: Path) -> tuple[Path, Path | None]:
 
 
 async def start_control_server(config_dir: Path, handler: Handler) -> ControlServer:
+    """Start the channel. Raises ``RuntimeError`` if another hub runs or the directory is unsafe."""
     rdir = run_dir(config_dir)
-    _private_dir(rdir)
+    try:
+        private_dir(rdir)
+    except OSError as exc:
+        raise RuntimeError(str(exc)) from None
     info_path = rdir / "admin.json"
     if info_path.exists() and await asyncio.to_thread(_alive, info_path):
         raise RuntimeError("another OllamaPower hub is already running")
@@ -229,7 +226,7 @@ async def start_control_server(config_dir: Path, handler: Handler) -> ControlSer
     if use_unix_socket():
         sock_path, temp_dir = _socket_path(rdir)
         if sock_path.exists() or sock_path.is_symlink():
-            sock_path.unlink()  # stale: the liveness check above found no server
+            sock_path.unlink()  # stale: the liveness check above found no hub
         old_umask = os.umask(0o177)
         try:
             server = await asyncio.start_unix_server(on_connect, path=str(sock_path), limit=MAX_MESSAGE)
@@ -242,7 +239,7 @@ async def start_control_server(config_dir: Path, handler: Handler) -> ControlSer
         server = await asyncio.start_server(on_connect, host="127.0.0.1", port=0, limit=MAX_MESSAGE)
         info = {"transport": "tcp", "port": server.sockets[0].getsockname()[1]}
     info.update(secret=secret, pid=os.getpid())
-    _write_private_json(info_path, info)
+    write_private(info_path, json.dumps(info).encode())
     return ControlServer(server, info_path, sock_path, secret, writers, temp_dir)
 
 
@@ -268,10 +265,27 @@ class ControlClient:
         self.timeout = timeout
         self._sock: socket.socket | None = None
         self._buf = b""
+        self._challenge = ""
 
-    def _connect(self) -> socket.socket:
+    def _readline(self) -> dict[str, Any]:
+        sock = self._sock
+        assert sock is not None
+        while b"\n" not in self._buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise NotRunning("admin connection closed")
+            self._buf += chunk
+            if len(self._buf) > 64 * MAX_MESSAGE:
+                raise NotRunning("oversized reply from admin channel")
+        line, _, self._buf = self._buf.partition(b"\n")
+        message = _parse(line)
+        if message is None:
+            raise NotRunning("invalid reply from admin channel")
+        return message
+
+    def _connect(self) -> None:
         if self._sock is not None:
-            return self._sock
+            return
         try:
             if self.info.get("transport") == "unix":
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -282,33 +296,32 @@ class ControlClient:
         except (OSError, KeyError, ValueError, TypeError) as exc:
             raise NotRunning("the OllamaPower hub is not running (admin socket unreachable)") from exc
         self._sock = sock
-        return sock
+        hello = self._readline()
+        challenge = hello.get("challenge")
+        if not isinstance(challenge, str) or not 16 <= len(challenge) <= 128:
+            self.close()
+            raise NotRunning("admin channel did not send a challenge; refusing to trust it")
+        self._challenge = challenge
 
     def call(self, cmd: str, **args: Any) -> Any:
         secret = str(self.info.get("secret", ""))
-        nonce = secrets.token_hex(16)
-        payload = json.dumps({"secret": secret, "nonce": nonce, "cmd": cmd, "args": args}).encode() + b"\n"
-        if len(payload) > MAX_MESSAGE:
-            raise AdminError("request too large")
         try:
-            sock = self._connect()
-            sock.sendall(payload)
-            while b"\n" not in self._buf:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    raise NotRunning("admin connection closed")
-                self._buf += chunk
+            self._connect()
+            nonce = secrets.token_hex(16)
+            auth = _mac(secret, "client", self._challenge, nonce)
+            payload = json.dumps({"nonce": nonce, "auth": auth, "cmd": cmd, "args": args}).encode() + b"\n"
+            if len(payload) > MAX_MESSAGE:
+                raise AdminError("request too large")
+            assert self._sock is not None
+            self._sock.sendall(payload)
+            reply = self._readline()
         except OSError as exc:  # timeouts, resets, broken pipes
             self.close()
             raise NotRunning(f"lost connection to the OllamaPower hub ({type(exc).__name__})") from exc
-        line, _, self._buf = self._buf.partition(b"\n")
-        reply = _parse(line)
-        if reply is None:
-            raise NotRunning("invalid reply from admin channel")
         if reply.get("error") == "unauthorized" and "proof" not in reply:
-            raise AdminError("unauthorized (is admin.json from another instance?)")
+            raise AdminError("unauthorized (is admin.json from another hub?)")
         proof = reply.get("proof")
-        if not isinstance(proof, str) or not hmac.compare_digest(proof, _proof(secret, nonce)):
+        if not isinstance(proof, str) or not hmac.compare_digest(proof, _mac(secret, "server", self._challenge, nonce)):
             raise NotRunning("admin channel did not prove it is the OllamaPower hub; refusing to trust it")
         if not reply.get("ok"):
             raise AdminError(str(reply.get("error", "error")))
@@ -318,6 +331,7 @@ class ControlClient:
         if self._sock is not None:
             self._sock.close()
             self._sock = None
+        self._buf = b""
 
     def __enter__(self) -> ControlClient:
         return self

@@ -48,9 +48,11 @@ an attacker who already runs code as the owner on the Hub or a helper.
   directories are refused. `doctor` checks the permissions. `hub` refuses to
   run as root.
 - **Admin channel.** `status` reaches the hub only over a local channel (Unix
-  socket `0600`, or `127.0.0.1` on Windows) that requires a 256-bit secret from
-  an owner-only file, and the hub proves itself with an HMAC on every reply
-  (OllamaGate's design).
+  socket `0600`, or `127.0.0.1` on Windows) keyed by a 256-bit secret in an
+  owner-only file. The secret never crosses the channel: the hub sends a fresh
+  challenge per connection, every request answers it with an HMAC over a
+  single-use nonce, and every reply carries the hub's own HMAC. A process that
+  grabs a stale port learns nothing and can't forge answers.
 
 Out of scope here: any local process running as you can use the front door,
 as it could use Ollama directly before.
