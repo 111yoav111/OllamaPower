@@ -21,8 +21,8 @@ is new), **drop** (not carried over).
 | `src/tasks/divisible_task.py` | replace | `ollamapower/hub/planner/` | 3, 5 | The idea of splitting work by each node's free capacity becomes a *split plan*: layers/tensor-split proportions across Hub GPU and helper devices. `_compute_weights` (capacity-proportional weights with a floor) is the model for `--tensor-split`. |
 | `src/tasks/task.py` | drop | — | — | Abstract executable task; agents run processes (`rpc-server`, Ollama), not Python tasks. |
 | `src/tasks/simul_task.py`, `src/tasks/rend_task.py` | drop | — | — | Simulation/render demo workloads; kept out of the repo per spec. |
-| `src/master/server.py` | adapt | `ollamapower/hub/control_server.py` | 2 | Kept: accept loop, handshake → hello → token → welcome, per-node read loop, kick, disconnect cleanup. Changes: protocol version, key pinning, failed-auth rate limit, `CAPABILITIES`/`HEARTBEAT` telemetry, `RPC_*` and overflow packets. Bound address comes from config (DCP hard-coded `0.0.0.0`). |
-| `src/worker/client.py` | adapt | `ollamapower/agent/client.py` | 2 | Kept: reconnect every 5 s, handshake + token, receive loop, status heartbeat. Replaced: `ProcessPoolExecutor` task execution → `rpc_manager.py` (manages `rpc-server`) and `overflow.py` (calls local Ollama). |
+| `src/master/server.py` | adapt (done) | `ollamapower/hub/control_server.py`, `hub/nodes.py` | 2 | Kept: accept loop, handshake → hello → token → welcome, per-node read loop, kick, disconnect cleanup. Changes: protocol version, key pinning, failed-auth rate limit, `CAPABILITIES`/`HEARTBEAT` telemetry, `RPC_*` and overflow packets. Bound address comes from config (DCP hard-coded `0.0.0.0`). |
+| `src/worker/client.py` | adapt (done) | `ollamapower/agent/client.py` | 2 | Kept: reconnect every 5 s, handshake + token, receive loop, status heartbeat. Replaced: `ProcessPoolExecutor` task execution → `rpc_manager.py` (manages `rpc-server`) and `overflow.py` (calls local Ollama). |
 | `src/master/master_ui.py` | drop (logic kept) | `ollamapower/hub/tui/` | 2 | tkinter removed entirely. The logic behind it (worker table from `on_worker_status_change`, kick action, metrics panel, event popups) is rebuilt as the Textual Hub TUI reading `get_snapshot()`. |
 | `src/worker/worker_ui.py` | drop (logic kept) | `ollamapower/agent/tui/` | 2 | Same: connection state, assigned id and current work become the Textual agent TUI. |
 | `src/master/main_master.py`, `src/worker/main_worker.py` | replace | `ollamapower/__main__.py` | 1, 2 | `ollamapower hub` / `ollamapower agent` (Typer). No UI thread + backend thread split: Textual and the servers share one event loop, like OllamaGate. |
@@ -69,12 +69,15 @@ Fixed in the port (with tests where it makes sense):
 - Task ids came from a module-global `itertools.count`; kept, but the payload
   carries its own ids from Phase 2 on.
 
-Left for the phase that rewrites the code (noted so they are not forgotten):
+Fixed in Phase 2, when the server and client were ported:
 
-- The handshake trusts whatever RSA key the server sends (no pinning) — Phase 2,
-  TOFU fingerprint pinning.
-- `ctrl_hello` / `ctrl_welcome` travel unencrypted after the key exchange and
-  carry no protocol version — Phase 2.
-- The master bound `0.0.0.0` unconditionally and dropped workers at ≥ 90 % CPU
-  — Phase 2 (configurable bind; GPU-aware lending rules instead).
-- No rate limit or ban on failed auth — Phase 2.
+- The handshake trusted whatever RSA key the server sent → the hub key is
+  persistent and pinned by agents on first use; checked before the token.
+- `ctrl_hello` / `ctrl_welcome` travelled unencrypted with no protocol
+  version → `hello`/`welcome` messages inside the encrypted session, with a
+  MAJOR.MINOR protocol version.
+- The master bound `0.0.0.0` with no filter and dropped workers at ≥ 90 % CPU
+  → configurable bind with a private-network allowlist; owner-set lending
+  rules instead of the CPU cut-off.
+- No rate limit or ban on failed auth → per-IP bans with doubling.
+- A kicked worker reconnected immediately → it waits a minute.

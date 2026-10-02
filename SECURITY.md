@@ -3,7 +3,8 @@
 OllamaPower lets other machines on your network take part in running your
 models, so it is built to fail closed. This file describes the threat model and
 what is (and isn't) protected. It is updated after every build phase; this is
-the **Phase 1** version: the inherited building blocks and the front door.
+the **Phase 2** version: the front door and the control plane between the hub
+and its helpers.
 
 ## Threat model
 
@@ -57,7 +58,40 @@ an attacker who already runs code as the owner on the Hub or a helper.
 Out of scope here: any local process running as you can use the front door,
 as it could use Ollama directly before.
 
-### Control plane (Phase 0 building blocks)
+### Control plane (Phase 2)
+
+- **Who may connect.** The control port (9000) drops connections from outside
+  `control.allowed_networks` (private ranges, loopback and CGNAT/Tailscale by
+  default) before sending a single byte; `doctor` warns if public ranges are
+  added. At most `max_nodes` handshakes run at once and each must finish
+  within 10 s.
+- **The hub can't be impersonated.** The hub's RSA key is persistent
+  (`hub_key.pem`, owner-only) and agents pin its SHA-256 fingerprint on first
+  use (`known_hub`), after the owner compared it with what the hub prints, or
+  given up front with `--hub-fingerprint`. A headless agent with no way to ask
+  refuses unknown keys. The pin is checked **before the token is sent**; a
+  changed key stops the agent with an alert, and it does not retry.
+- **Token.** Checked in constant time inside the encrypted session; a wrong
+  token stops the agent (no retry loop).
+- **Failed logins are banned.** 5 failures (bad token, malformed or oversized
+  handshake, timeout) from one IP in 10 minutes ban it for 10 minutes,
+  doubling on repeat up to a day. Banned IPs are dropped before the handshake.
+- **Nothing large before authentication.** Frames are capped at 64 KB until
+  the token checks out.
+- **Strict protocol.** One module defines every message, its direction and
+  field types; anything else drops the connection. Protocol majors must match
+  (an outdated helper is shown as incompatible, with the fix).
+- **Agent reports are untrusted.** Capabilities, telemetry and test results
+  are bounded in size and depth and made terminal-safe before the hub stores
+  or shows them. Agents can't make the hub run anything.
+- **The helper's owner decides.** Lending rules live on the helper and only its
+  owner changes them; the hub can pause or kick a helper but never widen what
+  it lends. Unencrypted direct mode needs **both** owners to opt in and keeps a
+  warning on screen.
+- **Agent requests are refused for now.** Split-mode and overflow requests are
+  answered "not available" until Phases 3 and 6.
+
+### Control-plane encryption (Phase 0 building blocks)
 
 - **Encrypted control plane.** Every packet after the handshake is one
   AES-256-GCM frame with a fresh random 96-bit nonce (tested for uniqueness);
@@ -81,12 +115,12 @@ as it could use Ollama directly before.
 
 ## Known gaps (closed in later phases)
 
-- **Hub key pinning (Phase 2).** The DCP handshake trusts whatever RSA key the
-  Hub presents, so an active man-in-the-middle could read the token. Phase 2
-  pins the Hub key fingerprint on each agent (trust on first use, confirmed by
-  the owner) and refuses a changed key.
-- **Failed-auth rate limiting (Phase 2).** Per-IP limits and temporary bans
-  arrive with the control-plane server.
+- **Trust on first use.** If someone already impersonates the hub at the
+  moment a helper connects for the very first time *and* the owner confirms
+  without comparing fingerprints, the helper trusts the wrong hub. Compare the
+  fingerprint, or pass it with `--hub-fingerprint`.
+- **Network-test throughput** runs over the encrypted control channel, so it
+  understates a fast link; the split-mode tunnel is measured separately later.
 - **llama.cpp RPC is unauthenticated and unencrypted (Phases 3-4).** It will
   only ever listen on a helper's loopback, reached through a mutually
   authenticated TLS 1.3 tunnel; plain TCP only as an explicit per-helper opt-in
