@@ -37,6 +37,8 @@ class BanList:
         now = time.monotonic() if now is None else now
         if len(self._records) >= self.MAX_TRACKED and ip not in self._records:
             self._forget_stale(now)
+            if len(self._records) >= self.MAX_TRACKED:
+                return None  # every slot holds an active ban: keep them all
         record = self._records.setdefault(ip, _Record())
         record.failures.append(now)
         while record.failures and now - record.failures[0] > self.window:
@@ -58,8 +60,17 @@ class BanList:
         return self._records.pop(ip, None) is not None
 
     def _forget_stale(self, now: float) -> None:
-        for ip in [ip for ip, r in self._records.items() if r.banned_until < now and not r.failures]:
+        """Make room: drop expired failures, then records that are neither banned nor recent.
+
+        Active bans are never evicted, so flooding the table from many addresses
+        can't un-ban anyone.
+        """
+        for record in self._records.values():
+            while record.failures and now - record.failures[0] > self.window:
+                record.failures.popleft()
+        for ip in [ip for ip, r in self._records.items() if r.banned_until <= now and not r.failures]:
             del self._records[ip]
-        if len(self._records) >= self.MAX_TRACKED:  # still full: drop the oldest entries
-            for ip in list(self._records)[: self.MAX_TRACKED // 10]:
+        if len(self._records) >= self.MAX_TRACKED:  # still full: drop the oldest records that aren't banned
+            unbanned = [ip for ip, r in self._records.items() if r.banned_until <= now]
+            for ip in unbanned[: self.MAX_TRACKED // 10]:
                 del self._records[ip]
