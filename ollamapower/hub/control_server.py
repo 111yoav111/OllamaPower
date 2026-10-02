@@ -105,9 +105,11 @@ class ControlServer:
     async def close(self) -> None:
         if self.server is not None:
             self.server.close()
-        for node in self.registry.connected:
-            if node.channel is not None:
-                await node.channel.close("hub shutting down")
+        # All at once: each close may wait a few seconds for a slow helper.
+        await asyncio.gather(
+            *(n.channel.close("hub shutting down") for n in self.registry.connected if n.channel is not None),
+            return_exceptions=True,
+        )
         for task in list(self._tasks):
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -248,6 +250,9 @@ class ControlServer:
             log.warning("dropping %s: %s", node.name, exc)
         except (OSError, asyncio.IncompleteReadError):
             reason = "connection lost"
+        except Exception:  # noqa: BLE001 - a bug must cost one helper's connection, not the hub
+            log.exception("unexpected error in the session with %s", node.name)
+            reason = "internal error"
         finally:
             self.registry.detach(node, channel, reason)
 

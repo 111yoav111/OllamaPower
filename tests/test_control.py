@@ -127,7 +127,7 @@ async def test_agent_joins_reports_and_heartbeats(setup):
     assert snap["vram_total"] == 24 * GIB and snap["vram_free"] == 20 * GIB
     assert snap["vram_lendable"] == 8 * GIB  # capped by the helper owner's rule
     assert snap["link"]["kind"] in ("loopback", "unknown")
-    assert node.capabilities["ollama"] == {"present": False}
+    assert node.capabilities["ollama"]["present"] is False
     assert agent.state.connection == "connected" and agent.state.pinned
     assert any(e["kind"] == "node_join" for e in setup.hub.recent_events)
     assert await until(lambda: len(node.history) >= 2, 6)
@@ -348,3 +348,118 @@ def test_sanitize_bounds_untrusted_reports():
     assert "\x1b" not in clean["name"] and len(clean["name"]) <= 201
     assert clean["n"] is None and clean["big"] is None
     assert len(clean) == 64
+
+
+# ----- review regressions ----------------------------------------------------------------
+
+
+async def test_odd_shaped_reports_cannot_break_status(setup):
+    ch = await _raw_connect(setup.hub.control.port)
+    await ch.send("hello", **_hello())
+    await ch.recv()
+    await ch.send(
+        "capabilities", capabilities={"gpus": [{"index": [1]}, {"index": 0, "vram_total": "lots"}, 7], "network": 3}
+    )
+    await ch.send("heartbeat", seq=1, telemetry={"gpus": 5, "cpu_percent": "high"})
+    await ch.send("lend_state", state="lending", lending={"gpus": 3, "max_vram_gb": "5", "allow_direct": "yes"})
+    await asyncio.sleep(0.2)
+    node = setup.node("raw")
+    assert node.connected  # still served
+    snap = setup.hub.get_snapshot()["nodes"][0]
+    assert snap["gpus"] == [
+        {
+            "index": 0,
+            "name": None,
+            "backend": None,
+            "vram_total": None,
+            "vram_used": None,
+            "vram_free": 0,
+            "util": None,
+            "temp": None,
+        }
+    ]
+    assert snap["cpu_percent"] is None and snap["lending"]["max_vram_gb"] == 0.0
+    assert node.tunnel_effective == "secure"  # "yes" is not True
+    await ch.close()
+
+
+async def test_slow_key_confirmation_is_not_a_failed_login(tmp_path, hub_key):
+    s = Setup(tmp_path, hub_key, handshake_timeout=0.5)
+    await s.start()
+    try:
+
+        async def slow_owner(addr, fp):
+            await asyncio.sleep(1.0)  # longer than the hub's handshake timeout
+            return True
+
+        agent = s.agent(confirm=slow_owner)
+        s.run(agent)
+        assert await until(lambda: agent.state.connection == "connected", 6)
+        assert not any(e["kind"] == "auth_failed" for e in s.hub.recent_events)
+    finally:
+        await s.close()
+
+
+async def test_stopping_agent_says_goodbye(setup):
+    agent = setup.agent()
+    task = setup.run(agent)
+    assert await until(lambda: setup.node() is not None and setup.node().connected)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert await until(lambda: any(e["kind"] == "node_leave" for e in setup.hub.recent_events))
+    leave = [e for e in setup.hub.recent_events if e["kind"] == "node_leave"][-1]
+    assert leave["reason"] == "left: agent stopping"
+
+
+async def test_failing_sensor_keeps_heartbeats_going(setup):
+    agent = setup.agent()
+
+    def broken():
+        raise RuntimeError("sensor")
+
+    agent.telemetry.sample = broken
+    setup.run(agent)
+    assert await until(lambda: setup.node() is not None and len(setup.node().history) >= 2, 6)
+    assert setup.node().connected
+
+
+async def test_saving_rules_keeps_one_off_overrides_out_of_agent_toml(setup):
+    agent = setup.agent()
+    agent.config.agent.name = "temp\n[evil]"
+    agent.config.hub.fingerprint = "ab" * 32
+    await agent.update_rules(max_vram_gb=4.0)
+    text = agent.config.path.read_text()
+    assert "max_vram_gb = 4.0" in text and "temp" not in text and "abab" not in text
+    from ollamapower.agent.config import AgentConfig, load_agent_config, save_agent_config
+
+    cfg = AgentConfig(config_dir=setup.tmp / "toml")
+    cfg.agent.name = 'line\nbreak "quoted"'
+    save_agent_config(cfg)
+    assert load_agent_config(setup.tmp / "toml").agent.name == 'line\nbreak "quoted"'
+
+
+def test_active_bans_survive_a_full_table():
+    from ollamapower.hub.bans import BanList
+
+    bans = BanList(failures=1, window=60, ban_seconds=600, max_seconds=600)
+    bans.MAX_TRACKED = 10
+    for i in range(10):
+        bans.fail(f"10.0.0.{i}", now=0)
+    for i in range(50):
+        bans.fail(f"10.0.1.{i}", now=1)  # flood from other addresses
+    assert all(bans.banned(f"10.0.0.{i}", now=2) for i in range(10))
+
+
+def test_control_socket_is_dual_stack():
+    if not socket.has_dualstack_ipv6():
+        pytest.skip("no dual-stack sockets here")
+    from ollamapower.__main__ import _control_socket
+
+    sock = _control_socket("0.0.0.0", 0)
+    port = sock.getsockname()[1]
+    try:
+        for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            with socket.socket(family) as c:
+                c.connect((host, port))
+    finally:
+        sock.close()

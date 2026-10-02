@@ -11,7 +11,6 @@ shape and makes strings terminal-safe before anything stores or shows it.
 
 from __future__ import annotations
 
-import asyncio
 import math
 import time
 from collections import deque
@@ -51,7 +50,88 @@ def sanitize(value: Any, depth: int = 0) -> Any:
 
 
 def _num(value: Any, default: float = 0.0) -> float:
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
+    return default
+
+
+def _opt_num(value: Any) -> float | None:
+    number = _num(value, math.nan)
+    return None if math.isnan(number) else number
+
+
+def _index(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 1024 else None
+
+
+# Agents report free-form data; these coerce it into the exact shapes the hub
+# relies on, so one odd (or hostile) report can't break views of every helper.
+
+GPU_NUMBERS = ("vram_total", "vram_used", "util", "temp")
+
+
+def clean_gpu(entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict) or _index(entry.get("index")) is None:
+        return None
+    gpu: dict[str, Any] = {"index": entry["index"]}
+    for key in ("name", "vendor", "backend", "driver", "cuda"):
+        if isinstance(entry.get(key), str):
+            gpu[key] = safe_text(entry[key], 80)
+    for key in GPU_NUMBERS:
+        value = _opt_num(entry.get(key))
+        if value is not None:
+            gpu[key] = max(0, int(value))
+    if entry.get("unified") is True:
+        gpu["unified"] = True
+    return gpu
+
+
+def clean_gpus(value: Any) -> list[dict[str, Any]]:
+    gpus = [g for g in (clean_gpu(e) for e in (value if isinstance(value, list) else [])[:16]) if g is not None]
+    return list({g["index"]: g for g in gpus}.values())  # one entry per index
+
+
+def clean_telemetry(value: Any) -> dict[str, Any]:
+    t = value if isinstance(value, dict) else {}
+    out: dict[str, Any] = {"gpus": clean_gpus(t.get("gpus"))}
+    for key in ("cpu_percent", "ram_total", "ram_used", "load"):
+        number = _opt_num(t.get(key))
+        out[key] = None if number is None else max(0.0, number)
+    return out
+
+
+def clean_lending(value: Any) -> dict[str, Any]:
+    r = value if isinstance(value, dict) else {}
+    gpus = r.get("gpus") if isinstance(r.get("gpus"), list) else []
+    schedule = r.get("schedule") if isinstance(r.get("schedule"), list) else []
+    return {
+        "max_vram_gb": max(0.0, _num(r.get("max_vram_gb"))),
+        "max_vram_percent": int(min(100.0, max(0.0, _num(r.get("max_vram_percent"))))),
+        "gpus": [g for g in (_index(x) for x in gpus[:16]) if g is not None],
+        "allow_cpu": r.get("allow_cpu") is True,
+        "allow_overflow": r.get("allow_overflow") is True,
+        "allow_direct": r.get("allow_direct") is True,
+        "schedule": [safe_text(w, 20) for w in schedule[:8] if isinstance(w, str)],
+        "paused": r.get("paused") is True,
+    }
+
+
+def clean_capabilities(value: Any) -> dict[str, Any]:
+    caps = sanitize(value if isinstance(value, dict) else {}) or {}
+    caps["gpus"] = clean_gpus(caps.get("gpus"))
+    if not isinstance(caps.get("network"), dict):
+        caps["network"] = {}
+    if not isinstance(caps["network"].get("kind"), str):
+        caps["network"]["kind"] = "unknown"
+    for key in ("cpu", "ollama"):
+        if not isinstance(caps.get(key), dict):
+            caps[key] = {}
+    if not isinstance(caps.get("backends"), list):
+        caps["backends"] = []
+    caps["backends"] = [b for b in caps["backends"] if isinstance(b, str)]
+    if not isinstance(caps["ollama"].get("models"), list):
+        caps["ollama"]["models"] = []
+    return caps
 
 
 @dataclass
@@ -104,17 +184,13 @@ class Node:
         return link
 
     def gpus(self) -> list[dict[str, Any]]:
-        """Static GPU facts merged with the latest telemetry."""
-        static = self.capabilities.get("gpus") if isinstance(self.capabilities.get("gpus"), list) else []
-        live = {g.get("index"): g for g in self.telemetry.get("gpus", []) if isinstance(g, dict)}
+        """Static GPU facts merged with the latest telemetry (both already cleaned)."""
+        live = {g["index"]: g for g in self.telemetry.get("gpus", [])}
         out = []
-        for g in static:
-            if not isinstance(g, dict):
-                continue
-            merged = {**g, **live.get(g.get("index"), {})}
-            total = int(_num(merged.get("vram_total")))
-            used = int(_num(merged.get("vram_used")))
-            merged["vram_free"] = max(0, total - used) if merged.get("vram_used") is not None else total
+        for g in self.capabilities.get("gpus", []):
+            merged = {**g, **live.get(g["index"], {})}
+            total, used = merged.get("vram_total", 0), merged.get("vram_used")
+            merged["vram_free"] = max(0, total - used) if used is not None else total
             out.append(merged)
         return out
 
@@ -207,7 +283,6 @@ class NodeRegistry:
         self.emit = emit
         self.heartbeat_timeout = heartbeat_timeout
         self.nodes: dict[str, Node] = {}
-        self.version = 0  # bumped on every change, for cheap TUI refreshes
         if state is not None:
             self._load(state.data.get("nodes", {}))
 
@@ -219,8 +294,8 @@ class NodeRegistry:
                 continue
             node = Node(node_id=node_id, name=safe_text(str(d.get("name", node_id[:8])), 64))
             node.ip = safe_text(str(d.get("last_ip", "")), 64)
-            node.capabilities = sanitize(d.get("capabilities") or {}) or {}
-            node.lending = sanitize(d.get("lending") or {}) or {}
+            node.capabilities = clean_capabilities(d.get("capabilities"))
+            node.lending = clean_lending(d.get("lending"))
             node.hub_paused = d.get("hub_paused") is True
             node.tunnel_mode = d.get("tunnel_mode") if d.get("tunnel_mode") in TUNNEL_MODES else "secure"
             node.first_seen = _num(d.get("first_seen"), time.time())
@@ -230,7 +305,6 @@ class NodeRegistry:
             self.nodes[node_id] = node
 
     def _save(self, node: Node) -> None:
-        self.version += 1
         if self.state is None:
             return
         self.state.upsert_node(
@@ -303,14 +377,14 @@ class NodeRegistry:
         self.emit("node_leave", node=node.node_id, name=node.name, reason=reason)
 
     def update_capabilities(self, node: Node, caps: dict[str, Any]) -> None:
-        node.capabilities = sanitize(caps) or {}
-        lending = node.capabilities.pop("lending", None)
+        lending = caps.get("lending")
+        node.capabilities = clean_capabilities({k: v for k, v in caps.items() if k != "lending"})
         if isinstance(lending, dict):
-            node.lending = lending
+            node.lending = clean_lending(lending)
         self._save(node)
 
     def heartbeat(self, node: Node, telemetry: dict[str, Any]) -> None:
-        node.telemetry = sanitize(telemetry) or {}
+        node.telemetry = clean_telemetry(telemetry)
         node.last_heartbeat = time.monotonic()
         node.last_seen = time.time()
         gpus = node.gpus()
@@ -323,13 +397,12 @@ class NodeRegistry:
                 _num(node.telemetry.get("cpu_percent")),
             )
         )
-        self.version += 1
 
     def set_lend_state(self, node: Node, state: str, reason: str, lending: dict[str, Any] | None) -> None:
         changed = state != node.lend_state
         node.lend_state, node.lend_reason = state, safe_text(reason, 200)
         if lending is not None:
-            node.lending = sanitize(lending) or {}
+            node.lending = clean_lending(lending)
         self._save(node)
         if changed:
             self.emit("lend_state", node=node.node_id, name=node.name, state=state, reason=node.lend_reason)
@@ -366,7 +439,6 @@ class NodeRegistry:
         if node.connected:
             raise ValueError("disconnect the node first")
         del self.nodes[node.node_id]
-        self.version += 1
         if self.state is not None:
             self.state.data["nodes"].pop(node.node_id, None)
             self.state.save_soon()
@@ -376,8 +448,3 @@ class NodeRegistry:
         order = {"lending": 0, "yielding": 1, "paused": 2, "incompatible": 3, "offline": 4}
         nodes = sorted(self.nodes.values(), key=lambda n: (order.get(n.status, 9), n.name.lower()))
         return [n.summary() for n in nodes]
-
-
-async def wait_closed(channel: Channel | None, reason: str) -> None:
-    if channel is not None:
-        await asyncio.shield(channel.close(reason))

@@ -111,11 +111,6 @@ class Hub:
         self.event_seq += 1
         self.recent_events.append({"seq": self.event_seq, "ts": time.time(), "kind": kind, **fields})
 
-    @property
-    def version(self) -> int:
-        """Changes whenever something a view shows may have changed (cheap TUI refresh check)."""
-        return self.event_seq + self.registry.version + self.requests_total + len(self.streams)
-
     # ----- control plane -----------------------------------------------------------------
 
     async def start_control(self, key: Any, token: str | None, sock: Any = None) -> ControlServer:
