@@ -1,17 +1,150 @@
 from __future__ import annotations
 
+import json
+import os
+import signal
+import subprocess
+import sys
+
+import httpx
+import pytest
 from typer.testing import CliRunner
 
 from ollamapower import __version__
 from ollamapower.__main__ import cli
+from ollamapower.admin import ipc
+from ollamapower.admin.service import Admin
+from ollamapower.core.auth import TOKEN_ENV
+from ollamapower.files import read_env_file
+
+from .conftest import free_port, wait_for
+
+
+def run(*args, env=None):
+    return CliRunner().invoke(cli, list(args), env=env)
+
+
+@pytest.fixture
+def cfg_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("OLLAMAPOWER_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("OLLAMAPOWER_TOKEN", raising=False)
+    return tmp_path
 
 
 def test_version():
-    result = CliRunner().invoke(cli, ["version"])
-    assert result.exit_code == 0
-    assert __version__ in result.output
+    result = run("version")
+    assert result.exit_code == 0 and __version__ in result.output
 
 
 def test_no_args_shows_help():
-    result = CliRunner().invoke(cli, [])
-    assert "Usage" in result.output
+    assert "Usage" in run().output
+
+
+def test_init_creates_everything_once(cfg_env):
+    result = run("init")
+    assert result.exit_code == 0, result.output
+    token = read_env_file(cfg_env / ".env")[TOKEN_ENV]
+    assert token.startswith("op_") and len(token) > 40
+    assert (cfg_env / "config.toml").exists() and json.loads((cfg_env / "state.json").read_text())["version"] == 1
+    if sys.platform != "win32":
+        assert oct(os.stat(cfg_env / ".env").st_mode)[-3:] == "600"
+    again = run("init")
+    assert "already set" in again.output and read_env_file(cfg_env / ".env")[TOKEN_ENV] == token
+    rotated = run("init", "--rotate-token")
+    assert "rotated" in rotated.output and read_env_file(cfg_env / ".env")[TOKEN_ENV] != token
+
+
+def test_status_when_not_running(cfg_env):
+    result = run("status")
+    assert result.exit_code == 3 and "not running" in result.output
+
+
+@pytest.fixture
+def admin_frontdoor(frontdoor, cfg_env):
+    control = frontdoor.run(ipc.start_control_server(frontdoor.config.config_dir, Admin(frontdoor.hub).dispatch))
+    yield frontdoor
+    frontdoor.run(control.close())
+
+
+def test_status_over_the_admin_channel(admin_frontdoor, client):
+    fd = admin_frontdoor
+    assert wait_for(lambda: fd.call(lambda: fd.hub.ollama.reachable))
+    result = run("status", "--json")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["ollama"]["version"] == "0.0.0-fake"
+    plain = run("status").output
+    assert "Front door:" in plain and "big:70b" in plain and "⚠ big:70b is only 50% in VRAM" in plain
+
+
+def test_logs_command(admin_frontdoor, client):
+    fd = admin_frontdoor
+    client.post(fd.url + "/api/chat", json={"model": "small:1b", "messages": []})
+    path = fd.config.logs_dir / "requests.jsonl"
+    assert wait_for(lambda: path.exists() and path.read_text().strip())
+    out = run("logs", "--file", "requests").output
+    assert "/api/chat" in out and "model=small:1b" in out
+    raw = run("logs", "--json", "--kind", "request").output.splitlines()
+    assert json.loads(raw[-1])["path"] == "/api/chat"
+    assert run("logs", "--file", "bogus").exit_code == 2
+
+
+def test_doctor_exit_code(cfg_env):
+    (cfg_env / "config.toml").write_text(f'[ollama]\nurl = "http://127.0.0.1:{free_port()}"\n')
+    result = run("doctor")
+    assert result.exit_code == 1 and "[ERROR]" in result.output and "fix:" in result.output
+
+
+def test_hub_refuses_non_loopback(cfg_env):
+    (cfg_env / "config.toml").write_text('[hub]\nhost = "0.0.0.0"\n')
+    result = run("hub", "--allow-root")
+    assert result.exit_code == 2 and "Refusing to listen on 0.0.0.0" in result.output
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="needs root to test the root check")
+def test_hub_refuses_root(cfg_env):
+    result = run("hub")
+    assert result.exit_code == 2 and "root" in result.output
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGINT handling differs on Windows")
+def test_hub_end_to_end(fake_ollama, tmp_path):
+    """The real `ollamapower hub` process: serves, answers `status`, shuts down cleanly on Ctrl+C."""
+    upstream, rec = fake_ollama
+    port = free_port()
+    (tmp_path / "config.toml").write_text(f'[hub]\nport = {port}\n[ollama]\nurl = "{upstream.url}"\n')
+    env = {**os.environ, "OLLAMAPOWER_CONFIG_DIR": str(tmp_path)}
+    env.pop("OLLAMAPOWER_TOKEN", None)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "ollamapower", "hub", "--no-tui", "--allow-root"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        url = f"http://127.0.0.1:{port}"
+
+        def up():
+            try:
+                return httpx.get(url + "/ollamapower/status", timeout=0.5, trust_env=False).status_code == 200
+            except httpx.HTTPError:
+                return False
+
+        assert wait_for(up, 15), proc.stdout.read() if proc.poll() is not None else "hub did not start"
+        r = httpx.post(url + "/api/chat", json={"model": "small:1b", "messages": []}, trust_env=False)
+        assert r.status_code == 200
+        status = subprocess.run(
+            [sys.executable, "-m", "ollamapower", "status", "--json"], env=env, capture_output=True, text=True
+        )
+        assert status.returncode == 0, status.stderr
+        assert json.loads(status.stdout)["requests"]["total"] >= 1
+        assert (tmp_path / "run" / "admin.json").exists()
+    finally:
+        proc.send_signal(signal.SIGINT)
+        out, _ = proc.communicate(timeout=15)
+    assert proc.returncode == 0, out
+    assert "front door on" in out and "OLLAMAPOWER_TOKEN is not set" in out
+    assert not (tmp_path / "run" / "admin.json").exists()
+    assert (tmp_path / "state.json").exists()
+    kinds = [json.loads(line)["kind"] for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert kinds[0] == "hub_start" and kinds[-1] == "hub_stop"
