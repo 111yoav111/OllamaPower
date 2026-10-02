@@ -56,3 +56,20 @@ def test_lines_are_valid_json(tmp_path):
     log.close()
     line = (tmp_path / "events.jsonl").read_text().splitlines()[0]
     assert json.loads(line)["text"] == 'quote " newline \n'
+
+
+def test_read_entries_limit_reads_only_what_it_needs(tmp_path):
+    log = EventLog(tmp_path, 2000, 3)
+    for i in range(200):
+        log.request(n=i, pad="x" * 50)
+        log.event("tick", n=i)
+    log.close()
+    last = read_entries(tmp_path, ["events", "requests"], limit=5)
+    assert [(e["kind"], e["n"]) for e in last] == [
+        ("tick", 197),
+        ("request", 198),
+        ("tick", 198),
+        ("request", 199),
+        ("tick", 199),
+    ]
+    assert [e["n"] for e in read_entries(tmp_path, ["requests"], kinds=["request"], limit=3)] == [197, 198, 199]

@@ -12,7 +12,6 @@ import datetime as dt
 import json
 import logging
 import time
-from collections import deque
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -380,7 +379,7 @@ def logs(
     def show(entry: dict[str, Any]) -> None:
         typer.echo(json.dumps(entry) if as_json else _format_entry(entry))
 
-    for entry in deque(read_entries(config.logs_dir, files, kinds), maxlen=max(limit, 0)):
+    for entry in read_entries(config.logs_dir, files, kinds, limit):
         show(entry)
     if follow:
         try:

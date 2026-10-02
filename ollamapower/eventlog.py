@@ -5,15 +5,20 @@ events file, one line per front-door request to the requests file. Only
 metadata is written - never prompts, responses or secrets. Files rotate at
 ``logging.file_max_bytes`` and are owner-only.
 
+Writing happens on a background thread (``QueueHandler`` -> ``QueueListener``)
+so disk I/O and rotation never stall the event loop that serves streams.
+
 ``ollamapower logs`` reads them back (they are also plain ``grep`` material).
 """
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import logging.handlers
 import os
+import queue
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -34,22 +39,34 @@ class _PrivateRotatingHandler(logging.handlers.RotatingFileHandler):
                 os.umask(old)
 
 
+# Lines waiting for the writer thread; beyond this they are dropped (and counted).
+MAX_PENDING = 10_000
+
+
 class JsonlLog:
-    """One rotating JSON-lines file."""
+    """One rotating JSON-lines file, written by a background thread."""
 
     def __init__(self, path: Path, max_bytes: int, backups: int) -> None:
         private_dir(path.parent)
         self.path = path
-        self._handler = _PrivateRotatingHandler(path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8")
-        self._handler.setFormatter(logging.Formatter("%(message)s"))
+        self.dropped = 0
+        self._file = _PrivateRotatingHandler(path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8")
+        self._file.setFormatter(logging.Formatter("%(message)s"))
+        self._queue: queue.Queue[logging.LogRecord] = queue.Queue(MAX_PENDING)
+        self._listener = logging.handlers.QueueListener(self._queue, self._file)
+        self._listener.start()
 
     def write(self, kind: str, **fields: Any) -> None:
         line = json.dumps({"ts": round(time.time(), 6), "kind": kind, **fields}, default=str, ensure_ascii=False)
-        record = logging.LogRecord("ollamapower.jsonl", logging.INFO, "", 0, line, None, None)
-        self._handler.handle(record)
+        try:
+            self._queue.put_nowait(logging.LogRecord("ollamapower.jsonl", logging.INFO, "", 0, line, None, None))
+        except queue.Full:
+            self.dropped += 1  # never block the event loop on a stuck disk
 
     def close(self) -> None:
-        self._handler.close()
+        """Write everything still queued, then close the file."""
+        self._listener.stop()
+        self._file.close()
 
 
 class EventLog:
@@ -73,7 +90,7 @@ class EventLog:
 class NullEventLog(EventLog):
     """Discards everything (tests, or when the log directory is unusable)."""
 
-    def __init__(self) -> None:  # noqa: D107 - nothing to open
+    def __init__(self) -> None:  # nothing to open
         pass
 
     def event(self, kind: str, **fields: Any) -> None:
@@ -103,19 +120,36 @@ def _parse(line: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def read_entries(logs_dir: Path, files: list[str], kinds: list[str] | None = None) -> Iterator[dict[str, Any]]:
-    """All entries of the given log files (``events``/``requests``), oldest first per file, merged by time."""
-    entries: list[dict[str, Any]] = []
-    for name in files:
-        for path in _files_oldest_first(logs_dir / LOG_FILES[name]):
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    entry = _parse(line)
-                    if entry is not None and (not kinds or entry.get("kind") in kinds):
-                        entry.setdefault("log", name)
-                        entries.append(entry)
-    entries.sort(key=lambda e: e.get("ts", 0) if isinstance(e.get("ts"), (int, float)) else 0)
-    yield from entries
+def _ts(entry: dict[str, Any]) -> float:
+    ts = entry.get("ts")
+    return float(ts) if isinstance(ts, (int, float)) else 0.0
+
+
+def _tail(path: Path, name: str, kinds: list[str] | None, limit: int) -> list[dict[str, Any]]:
+    """The last ``limit`` matching entries of one log, reading rotated files only as far back as needed."""
+    newest_first: list[dict[str, Any]] = []
+    for file in reversed(_files_oldest_first(path)):
+        with open(file, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()  # one file at most file_max_bytes
+        while lines and len(newest_first) < limit:
+            entry = _parse(lines.pop())
+            if entry is not None and (not kinds or entry.get("kind") in kinds):
+                entry.setdefault("log", name)
+                newest_first.append(entry)
+        if len(newest_first) >= limit:
+            break
+    return newest_first[::-1]
+
+
+def read_entries(
+    logs_dir: Path, files: list[str], kinds: list[str] | None = None, limit: int = 1000
+) -> list[dict[str, Any]]:
+    """The last ``limit`` entries across the given logs (``events``/``requests``), oldest first."""
+    if limit <= 0:
+        return []
+    per_log = [_tail(logs_dir / LOG_FILES[name], name, kinds, limit) for name in files]
+    merged = list(heapq.merge(*per_log, key=_ts))
+    return merged[-limit:]
 
 
 def follow_entries(
