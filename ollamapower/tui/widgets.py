@@ -8,7 +8,6 @@ device named ``[blink]...`` can't restyle the admin screen.
 
 from __future__ import annotations
 
-import datetime as dt
 import time
 from typing import Any
 
@@ -19,17 +18,14 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
 
+from ..cli_common import duration, ts  # noqa: F401 - re-exported for the TUIs
+from ..cli_common import gb as gib  # noqa: F401
+from ..ollama.client import human_bytes  # noqa: F401
 from ..textsafe import safe
 
 
 def t(value: Any, style: str = "") -> Text:
     return Text("-" if value is None or value == "" else safe(value), style=style)
-
-
-def ts(value: float | None) -> str:
-    if value is None:
-        return "-"
-    return dt.datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def ago(value: float | None, now: float | None = None) -> str:
@@ -45,13 +41,6 @@ def ago(value: float | None, now: float | None = None) -> str:
     return f"{secs // 86400}d ago"
 
 
-def duration(secs: float) -> str:
-    secs = int(secs)
-    h, rem = divmod(secs, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
-
-
 # Helper status dots (README legend: 🟢 lending · 🟡 paused · 🔴 offline · ⚠ incompatible).
 STATUS_DOT = {
     "lending": Text("●", style="bold green"),
@@ -60,21 +49,6 @@ STATUS_DOT = {
     "offline": Text("●", style="bold red"),
     "incompatible": Text("⚠", style="bold red"),
 }
-
-
-def human_bytes(n: int | float | None) -> str:
-    if n is None:
-        return "-"
-    size = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024 or unit == "TB":
-            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
-        size /= 1024
-    return f"{n} B"
-
-
-def gib(n: int | float | None) -> str:
-    return "-" if n is None else f"{float(n) / 1024**3:.1f}"
 
 
 def bar(used: float, total: float, width: int = 24) -> Text:
