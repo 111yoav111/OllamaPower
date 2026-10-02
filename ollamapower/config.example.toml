@@ -1,0 +1,35 @@
+# OllamaPower hub configuration. Every key is optional; these are the defaults.
+# Any value can also be set with an env var: OLLAMAPOWER_<SECTION>__<KEY>,
+# e.g. OLLAMAPOWER_HUB__MAX_CONCURRENCY=2.
+# Secrets never go here: the cluster token lives in .env (see `ollamapower init`).
+
+[hub]
+# The front door. 127.0.0.1:11434 is Ollama's usual address, so clients need no change.
+# Anything but loopback is refused unless you pass --i-know-what-im-doing
+# (remote access is OllamaGate's job).
+host = "127.0.0.1"
+port = 11434
+# Inference requests sent to Ollama at once; the rest wait in the priority queue
+# (X-OllamaPower-Priority: critical | high | normal | low). Match OLLAMA_NUM_PARALLEL.
+max_concurrency = 4
+# Requests allowed to wait; more get "503 busy" at once.
+max_queue = 256
+# Seconds a request may wait for a slot.
+queue_timeout = 300.0
+# Largest inference request body (images make chat requests big).
+max_body_bytes = 104857600
+max_connections = 512
+
+[ollama]
+# Where the real Ollama listens after the port move (`ollamapower doctor` shows how).
+# Must be a loopback address.
+url = "http://127.0.0.1:11435"
+connect_timeout = 5.0
+# Max seconds between two chunks from Ollama (loading a big model can be slow).
+read_timeout = 600.0
+
+[logging]
+level = "info"   # debug | info | warning | error
+# logs/events.jsonl and logs/requests.jsonl rotate at this size; this many old files are kept.
+file_max_bytes = 10485760
+file_backups = 5
