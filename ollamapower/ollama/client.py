@@ -33,10 +33,20 @@ class LoadedModel:
 
 
 @dataclass
+class InstalledModel:
+    name: str
+    size: int
+    digest: str = ""
+    parameter_size: str = ""
+    quantization: str = ""
+
+
+@dataclass
 class OllamaStatus:
     reachable: bool
     version: str = ""
-    models: list[LoadedModel] = field(default_factory=list)
+    models: list[LoadedModel] = field(default_factory=list)  # loaded now (/api/ps)
+    installed: list[InstalledModel] = field(default_factory=list)  # on disk (/api/tags)
     error: str = ""
 
 
@@ -61,13 +71,34 @@ def parse_ps(data: object) -> list[LoadedModel]:
     return models
 
 
+def parse_tags(data: object) -> list[InstalledModel]:
+    raw = data.get("models") if isinstance(data, dict) else None
+    out = []
+    for m in raw if isinstance(raw, list) else []:
+        if isinstance(m, dict):
+            details = m.get("details") if isinstance(m.get("details"), dict) else {}
+            out.append(
+                InstalledModel(
+                    name=safe_text(str(m.get("name") or m.get("model") or "?"), 120),
+                    size=_int(m.get("size")),
+                    digest=safe_text(str(m.get("digest", "")), 80),
+                    parameter_size=safe_text(str(details.get("parameter_size", "")), 20),
+                    quantization=safe_text(str(details.get("quantization_level", "")), 20),
+                )
+            )
+    return out
+
+
 async def probe(client: httpx.AsyncClient) -> OllamaStatus:
     try:
         version = (await client.get("/api/version", timeout=PROBE_TIMEOUT)).json().get("version", "")
         ps = (await client.get("/api/ps", timeout=PROBE_TIMEOUT)).json()
+        tags = (await client.get("/api/tags", timeout=PROBE_TIMEOUT)).json()
     except (httpx.HTTPError, ValueError, AttributeError) as exc:
         return OllamaStatus(reachable=False, error=type(exc).__name__)
-    return OllamaStatus(reachable=True, version=safe_text(str(version), 40), models=parse_ps(ps))
+    return OllamaStatus(
+        reachable=True, version=safe_text(str(version), 40), models=parse_ps(ps), installed=parse_tags(tags)
+    )
 
 
 def human_bytes(n: int) -> str:

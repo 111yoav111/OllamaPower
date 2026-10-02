@@ -1,0 +1,78 @@
+Screen {
+    background: $surface;
+}
+
+.banner {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.warnings {
+    border: round $error;
+    padding: 0 1;
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.panel {
+    border: round $primary-darken-2;
+    padding: 0 1;
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.filter {
+    margin: 0 0 1 0;
+}
+
+.grow {
+    height: 1fr;
+}
+
+Sparkline {
+    height: 2;
+    margin: 0 0 1 0;
+}
+
+.spark-label {
+    height: 1;
+}
+
+.buttons {
+    height: auto;
+    margin: 1 0;
+}
+
+.buttons Button {
+    margin: 0 1 0 0;
+}
+
+.field {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.field-key {
+    width: 28;
+    padding: 1 1 0 0;
+}
+
+.field-value {
+    width: 1fr;
+}
+
+ConfirmScreen, InputScreen, MessageScreen, RulesScreen {
+    align: center middle;
+}
+
+.dialog {
+    width: 72;
+    height: auto;
+    border: thick $primary;
+    background: $panel;
+    padding: 1 2;
+}
+
+.dialog.wide {
+    width: 96;
+}
