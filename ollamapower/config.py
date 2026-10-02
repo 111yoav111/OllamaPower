@@ -98,7 +98,7 @@ class ControlConfig:
 class LlamaCppConfig:
     # auto | cpu | metal | vulkan | cuda12 | cuda13 | rocm. auto = Metal on Apple
     # Silicon, Vulkan with a GPU, CPU otherwise. CUDA is faster on NVIDIA but a
-    # 600-850 MB download.
+    # 580-770 MB download.
     backend: str = "auto"
     # Use your own build instead of downloading (it must be the pinned build).
     path: str = ""

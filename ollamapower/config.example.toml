@@ -50,7 +50,7 @@ max_ban_seconds = 86400
 [llamacpp]
 # The llama.cpp build used for split mode (pinned and SHA-256 checked).
 # auto = Metal on Apple Silicon, Vulkan if there is a GPU, CPU otherwise.
-# cuda12 / cuda13 are usually faster on NVIDIA but a 600-850 MB download;
+# cuda12 / cuda13 are usually faster on NVIDIA but a 580-770 MB download;
 # rocm needs AMD's ROCm runtime on Linux.
 backend = "auto"
 # Your own build instead of the download (it must be the pinned build).

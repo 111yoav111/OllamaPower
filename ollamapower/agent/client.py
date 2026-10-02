@@ -10,8 +10,9 @@ Lifecycle, retried every ``RECONNECT_DELAY`` seconds like DCP:
 3. ``hello`` with the token -> ``welcome`` (or ``reject``: a wrong token or an
    incompatible version stops the agent; a full hub is retried).
 4. ``capabilities``, the lend state, then heartbeats with telemetry every 2 s,
-   while answering network tests. Split-mode requests are answered with "not
-   available yet" until Phase 3.
+   while answering network tests and split-mode requests (``rpc_start`` /
+   ``rpc_stop``, handled by ``RpcManager``, which installs the pinned llama.cpp
+   in the background when the agent starts).
 
 ``AgentState`` holds what the agent TUI and ``ollamapower agent status`` show.
 """
@@ -39,6 +40,7 @@ from ..telemetry import Telemetry, network_info
 from ..textsafe import safe_text
 from .config import AgentConfig, load_agent_config, save_agent_config
 from .pinning import KnownHubs, format_fingerprint, normalize_fingerprint
+from .rpc_manager import RpcManager, RpcRefused
 
 log = logging.getLogger("ollamapower.agent")
 
@@ -115,6 +117,7 @@ class AgentClient:
         self._background: set[asyncio.Task[Any]] = set()
         self._requested: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._heartbeat_seq = 0
+        self.rpc = RpcManager(config, self.state.note, self._rpc_failed)
 
     @property
     def hub_key(self) -> str:
@@ -125,6 +128,7 @@ class AgentClient:
     async def run(self) -> None:
         """Connect and stay connected until stopped (cancelled) or an unrecoverable error."""
         self.state.static = await asyncio.to_thread(self.telemetry.static)
+        self._spawn(self._prepare_llamacpp())
         while True:
             delay = RECONNECT_DELAY
             try:
@@ -143,6 +147,8 @@ class AgentClient:
                     await asyncio.shield(self.channel.close("agent stopping"))
                 raise
             finally:
+                # Without the hub there is no one to lend to: end any split session.
+                await asyncio.shield(self.rpc.stop(reason="hub connection lost"))
                 if self.channel is not None:
                     await self.channel.close()
                     self.channel = None
@@ -275,9 +281,7 @@ class AgentClient:
             while len(self._tests) > MAX_TESTS:
                 self._tests.popitem(last=False)
             if m["kind"] == "up":
-                task = asyncio.ensure_future(self._send_up(channel, m["test_id"], m.get("count", 0), m.get("size", 0)))
-                self._background.add(task)  # keep a reference: the loop only holds weak ones
-                task.add_done_callback(self._background.discard)
+                self._spawn(self._send_up(channel, m["test_id"], m.get("count", 0), m.get("size", 0)))
         elif kind == "net_test_data":
             await self._on_test_data(channel, m)
         elif kind == "net_test_result":
@@ -287,7 +291,63 @@ class AgentClient:
             if fut is not None and not fut.done():
                 fut.set_result(m["result"])
         elif kind == "rpc_start":
-            await channel.send("rpc_error", session_id=m["session_id"], error="split mode is not available yet")
+            self._spawn(self._rpc_start(channel, m))  # starting takes a while; keep reading
+        elif kind == "rpc_stop":
+            await self.rpc.stop(m["session_id"], "stopped by the hub")
+            self.state.version += 1
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.ensure_future(coro)
+        self._background.add(task)  # keep a reference: the loop only holds weak ones
+        task.add_done_callback(self._background.discard)
+
+    # ----- split mode ------------------------------------------------------------------
+
+    async def _prepare_llamacpp(self) -> None:
+        vendors = [g.get("vendor", "") for g in self.state.static.get("gpus", []) if isinstance(g, dict)]
+        await self.rpc.prepare([v for v in vendors if v])
+        self.state.version += 1
+        channel = self.channel
+        if channel is not None and not channel.closed and self.state.connection == "connected":
+            with contextlib.suppress(Exception):
+                await channel.send("capabilities", capabilities=await self.capabilities())
+
+    async def _rpc_start(self, channel: Channel, m: dict[str, Any]) -> None:
+        peer, local = channel.peer, channel.local
+        try:
+            if peer is None or local is None:
+                raise RpcRefused("the connection to the hub is gone")
+            endpoint = await self.rpc.start(m, peer[0], local[0], self.config.lending, self.state.paused)
+        except RpcRefused as exc:
+            self.state.note(f"split session refused: {exc}")
+            with contextlib.suppress(Exception):
+                await channel.send("rpc_error", session_id=m["session_id"], error=str(exc)[:1000])
+            return
+        except Exception as exc:  # noqa: BLE001 - report it to the hub instead of dying silently
+            log.exception("starting rpc-server failed")
+            with contextlib.suppress(Exception):
+                await channel.send(
+                    "rpc_error", session_id=m["session_id"], error=f"internal error ({type(exc).__name__})"
+                )
+            return
+        self.state.version += 1
+        try:
+            await channel.send("rpc_ready", session_id=m["session_id"], endpoint=endpoint)
+        except Exception:  # noqa: BLE001 - the hub is gone: don't keep lending
+            await self.rpc.stop(m["session_id"], "hub connection lost")
+
+    async def _rpc_failed(self, session_id: str, error: str) -> None:
+        self.state.version += 1
+        channel = self.channel
+        if channel is not None and not channel.closed:
+            with contextlib.suppress(Exception):
+                await channel.send("rpc_error", session_id=session_id, error=error[:1000])
+
+    async def _end_session(self, reason: str) -> None:
+        """The owner changed something: stop lending now and tell the hub why."""
+        session = self.rpc.session
+        if session is not None and await self.rpc.stop(session.session_id, reason):
+            await self._rpc_failed(session.session_id, reason)
 
     async def _on_test_data(self, channel: Channel, m: dict[str, Any]) -> None:
         test = self._tests.get(m["test_id"])
@@ -320,7 +380,7 @@ class AgentClient:
         return {
             **self.state.static,
             "agent_version": __version__,
-            "llama_cpp": None,  # Phase 3
+            "llama_cpp": self.rpc.summary(),
             "network": self.state.network,
             "lending": self.lending_dict(),
         }
@@ -340,6 +400,8 @@ class AgentClient:
     async def set_paused(self, paused: bool, reason: str = "paused by the helper's owner") -> None:
         self.state.paused = paused
         self.state.note("lending paused" if paused else "lending resumed")
+        if paused:
+            await self._end_session("lending paused by the helper's owner")
         await self._send_lend_state(reason if paused else "")
 
     async def update_rules(self, **changes: Any) -> dict[str, Any]:
@@ -351,6 +413,7 @@ class AgentClient:
         await asyncio.to_thread(self._save_rules, new)
         self.config.lending = new
         self.state.note("lending rules changed")
+        await self._end_session("the helper's owner changed the lending rules")
         await self._send_lend_state()
         return self.lending_dict()
 

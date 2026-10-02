@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .binaries import BinaryError, LlamaCpp
-from .install import InstallError, Pins, Progress, install
+from .install import InstallError, Pins, Progress, install, install_dir, is_installed
 from .variants import VariantError, archives_for, current_platform, resolve_backend
 
 
@@ -20,8 +20,12 @@ def ensure(
     gpu_vendors: list[str] | None = None,
     progress: Progress | None = None,
     pins: Pins | None = None,
+    download: bool = True,
 ) -> LlamaCpp:
-    """The pinned build: from ``custom_path`` if set, else downloaded and verified into ``base``."""
+    """The pinned build: from ``custom_path`` if set, else downloaded and verified into ``base``.
+
+    With ``download=False`` only an existing install is used.
+    """
     pins = pins or Pins.load()
     try:
         if custom_path:
@@ -29,7 +33,12 @@ def ensure(
         else:
             system, arch = current_platform()
             concrete = resolve_backend(backend, system, arch, gpu_vendors or [])
-            root = install(archives_for(pins.tag, system, arch, concrete), base, pins, progress)
+            variant = archives_for(pins.tag, system, arch, concrete)
+            if not download and not is_installed(install_dir(base, pins.tag, concrete), variant, pins):
+                raise LlamaCppUnavailable(
+                    f"llama.cpp {pins.tag} ({concrete}) is not installed; run `ollamapower llamacpp install`"
+                )
+            root = install(variant, base, pins, progress)
         binaries = LlamaCpp.find(root).probe()
         binaries.check(pins.build)
     except (InstallError, VariantError, BinaryError) as exc:

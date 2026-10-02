@@ -76,6 +76,8 @@ class AgentLlamaCpp:
     # auto | cpu | metal | vulkan | cuda12 | cuda13 | rocm (see the hub's config).
     backend: str = "auto"
     path: str = ""  # your own build instead of the download (must be the pinned build)
+    # Download the pinned build automatically when the agent starts (12-33 MB; CUDA/ROCm much more).
+    auto_install: bool = True
 
 
 @dataclass

@@ -81,6 +81,7 @@ class Setup:
 
     def agent(self, name: str = "desk", token: str = TOKEN, confirm: Any = "yes", **lending) -> AgentClient:
         cfg = AgentConfig(config_dir=self.tmp / name)
+        cfg.llamacpp.auto_install = False  # never download in tests
         cfg.agent.name = name
         for key, value in lending.items():
             setattr(cfg.lending, key, value)
@@ -307,13 +308,18 @@ async def test_network_test_both_ways(setup):
     assert from_agent["rtt_ms"] > 0 and agent.state.last_net_test == from_agent
 
 
-async def test_split_requests_are_declined_for_now(setup):
+async def test_split_request_without_llamacpp_is_refused_with_a_reason(setup):
     agent = setup.agent()
     setup.run(agent)
     assert await until(lambda: setup.node() is not None and setup.node().connected)
-    await setup.node().channel.send("rpc_start", session_id="s", device="CUDA0", vram_cap_mb=1, cache=True, tunnel={})
-    await asyncio.sleep(0.2)
-    assert setup.node().connected  # the agent answered rpc_error and stayed
+    got = []
+    setup.hub.control.on_rpc = lambda node, m: got.append(m)
+    await setup.node().channel.send(
+        "rpc_start", session_id="session-1", device="", vram_cap_mb=0, cache=True, tunnel={"mode": "direct"}
+    )
+    assert await until(lambda: got)
+    assert got[0]["type"] == "rpc_error" and "not ready" in got[0]["error"]
+    assert setup.node().connected  # the agent answered and stayed
 
 
 async def test_outside_allowed_networks_is_dropped(tmp_path, hub_key):

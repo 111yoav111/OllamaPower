@@ -1,7 +1,11 @@
 """The front door: an Ollama-compatible HTTP API on ``127.0.0.1:11434``.
 
-Clients keep talking to "Ollama"; in Phase 1 every request is served by the
-``local-ollama`` engine (the real Ollama, moved to ``127.0.0.1:11435``).
+Clients keep talking to "Ollama". Requests are served by the ``local-ollama``
+engine (the real Ollama, moved to ``127.0.0.1:11435``), except chat and
+generate requests for a model the owner planned for split mode: those go to
+the split engine (llama-server with helper GPUs, see ``engines/split.py``),
+translated to and from Ollama's API. If split mode can't start, Ollama serves
+the request as before.
 
 * **Inference** (``/api/chat``, ``/api/generate``, ``/api/embed``,
   ``/api/embeddings``, ``/v1/chat/completions``, ``/v1/completions``,
@@ -9,8 +13,8 @@ Clients keep talking to "Ollama"; in Phase 1 every request is served by the
   waits in the priority queue for one of ``hub.max_concurrency`` slots and is
   streamed through. ``X-OllamaPower-Priority: critical|high|normal|low`` sets
   its priority (OllamaGate will set it per device later).
-* **``GET /api/ps``**: Ollama's answer plus an ``ollamapower`` field per model
-  (engine, nodes) that normal clients ignore.
+* **``GET /api/ps``**: Ollama's answer plus the running split model, with an
+  ``ollamapower`` field per model (engine, nodes) that normal clients ignore.
 * **Everything else** under ``/``, ``/api/*`` and ``/v1/*`` (tags, show, pull,
   create, blobs, ...) is passed straight through, request body streamed too,
   without queueing.
@@ -40,6 +44,15 @@ from starlette.requests import ClientDisconnect
 from ...scheduling.request_queue import QueueFull, Ticket
 from ...scheduling.task_pool import TaskPriority
 from ...textsafe import safe_text
+from ..engines.split import ENGINE_SPLIT, SplitUnavailable
+from ..engines.translate import (
+    OllamaStream,
+    UnsupportedRequest,
+    chat_request,
+    generate_request,
+    is_load_request,
+    load_reply,
+)
 from ..runtime import ENGINE_LOCAL, Hub
 from .hostcheck import LocalHostOnlyMiddleware
 from .proxy import (
@@ -69,6 +82,8 @@ INFERENCE_ENDPOINTS = frozenset(
 )
 # Native endpoints whose final chunk carries Ollama's timings.
 TIMED_ENDPOINTS = frozenset({"/api/chat", "/api/generate"})
+# What split mode serves; embeddings always go to Ollama.
+SPLIT_ENDPOINTS = frozenset({"/api/chat", "/api/generate", "/v1/chat/completions", "/v1/completions"})
 PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 MAX_PS_BYTES = 4 * 1024 * 1024
 # Bodies bigger than this are parsed off the event loop (base64 images can be huge).
@@ -104,8 +119,8 @@ def requested_model(body: bytes) -> str:
     return safe_text(value, 120) if isinstance(value, str) else ""
 
 
-def annotate_ps(raw: bytes, engines: dict[str, dict[str, Any]]) -> bytes:
-    """Add an ``ollamapower`` field to each model of an ``/api/ps`` answer."""
+def annotate_ps(raw: bytes, extra: list[dict[str, Any]] | None = None) -> bytes:
+    """Add an ``ollamapower`` field to each model of an ``/api/ps`` answer, plus ``extra`` models."""
     try:
         data = json.loads(raw)
     except ValueError:
@@ -115,9 +130,16 @@ def annotate_ps(raw: bytes, engines: dict[str, dict[str, Any]]) -> bytes:
         return raw
     for m in models:
         if isinstance(m, dict):
-            name = m.get("name") or m.get("model") or ""
-            m["ollamapower"] = engines.get(name, {"engine": ENGINE_LOCAL, "nodes": []})
+            m["ollamapower"] = {"engine": ENGINE_LOCAL, "nodes": []}
+    models.extend(extra or [])
     return json.dumps(data).encode()
+
+
+def keep_alive_zero(value: Any) -> bool:
+    """Ollama's "unload now": ``keep_alive`` of 0, "0", "0s", "0m", ..."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value == 0
+    return isinstance(value, str) and value.strip().rstrip("smh") in ("0", "0.0")
 
 
 def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
@@ -138,7 +160,12 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
         )
         app.state.http = client
         app.state.loop = asyncio.get_running_loop()
-        pollers = [asyncio.ensure_future(hub.poll_ollama(client)), asyncio.ensure_future(hub.poll_local())]
+        hub.split.http = client
+        pollers = [
+            asyncio.ensure_future(hub.poll_ollama(client)),
+            asyncio.ensure_future(hub.poll_local()),
+            asyncio.ensure_future(hub.split.run()),
+        ]
         try:
             yield
         finally:
@@ -178,6 +205,78 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     hub.record_generation(stream.model, stats)
             hub.finish_stream(stream, status, outcome)
 
+        async def serve_split(body: bytes) -> Response | None:
+            """Serve from the split engine; None means "let Ollama serve it"."""
+            try:
+                parsed = (
+                    json.loads(body) if len(body) <= INLINE_PARSE_BYTES else await asyncio.to_thread(json.loads, body)
+                )
+            except ValueError:
+                return None  # Ollama answers malformed requests in its own words
+            if not isinstance(parsed, dict):
+                return None
+            native = path.startswith("/api/")
+            if native and is_load_request(path, parsed):
+                unload = keep_alive_zero(parsed.get("keep_alive"))
+                if unload:
+                    await hub.split.stop(stream.model, "unloaded by a client")
+                else:
+                    try:
+                        hub.split.release(await race_kill(hub.split.acquire(stream.model), stream, request.receive))
+                    except SplitUnavailable:
+                        return None
+                finish("complete", 200)
+                return JSONResponse(load_reply(path, str(parsed.get("model", "")), unload))
+            try:
+                translated = (
+                    chat_request(parsed) if path == "/api/chat" else generate_request(parsed) if native else None
+                )
+            except UnsupportedRequest as exc:
+                finish("rejected", 400)
+                return error(path, 400, str(exc))
+            try:
+                session = await race_kill(hub.split.acquire(stream.model), stream, request.receive)
+            except SplitUnavailable:
+                return None
+            released = False
+
+            def done(outcome: str, status: int) -> None:
+                nonlocal released
+                if not released:
+                    released = True
+                    hub.split.release(session)
+                finish(outcome, status)
+
+            try:
+                assert session.client is not None
+                upstream_request = session.client.build_request(
+                    "POST",
+                    "/v1/chat/completions" if native else target,
+                    content=json.dumps(translated).encode() if native else body,
+                    headers={"content-type": "application/json", "accept-encoding": "identity"},
+                )
+                upstream = await race_kill(session.client.send(upstream_request, stream=True), stream, request.receive)
+            except httpx.HTTPError as exc:
+                log.warning("split engine unavailable for %s: %s", path, type(exc).__name__)
+                hub.split.release(session)
+                return None
+            except BaseException:
+                hub.split.release(session)
+                raise
+            stream.engine = ENGINE_SPLIT
+            transform = (
+                OllamaStream(
+                    str(parsed.get("model", "")),
+                    path,
+                    parsed.get("stream", True) is not False,
+                    upstream.status_code,
+                    (stream.queued_ms or 0) * 1_000_000,
+                )
+                if native
+                else None
+            )
+            return ProxyStreamResponse(upstream, stream, done, tap=tap if native else None, transform=transform)
+
         handed_off = False
         try:
             if inference:
@@ -208,6 +307,11 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     finish("rejected", 503)
                     return error(path, 503, "server busy, try again shortly", {"Retry-After": "10"})
                 stream.queued_ms = int((time.monotonic() - queued_at) * 1000)
+                if path in SPLIT_ENDPOINTS and hub.split.wants(stream.model):
+                    served = await serve_split(body)
+                    if served is not None:
+                        handed_off = isinstance(served, ProxyStreamResponse)
+                        return served
                 upstream_request = http.build_request(
                     method, target, content=body, headers=build_upstream_headers(request.headers)
                 )
@@ -230,7 +334,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 finally:
                     await upstream.aclose()
                 ok = upstream.status_code == 200 and len(raw) <= MAX_PS_BYTES
-                content = annotate_ps(raw, {}) if ok else raw
+                content = annotate_ps(raw, hub.split.ps_entries()) if ok else raw
                 stream.bytes_out = len(content)
                 finish("complete", upstream.status_code)
                 headers = response_headers(upstream)

@@ -20,7 +20,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 import httpx
 from starlette.responses import Response
@@ -60,6 +60,16 @@ TRAILER_TIMEOUT = 1.0
 # The tap only looks at lines up to this size. /api/generate's final chunk
 # carries the whole token context (~7 bytes per token), so allow for 128k+ tokens.
 MAX_TAP_LINE = 16 * 1024 * 1024
+
+
+class Transform(Protocol):
+    """Rewrites a response body on the way through (split mode's Ollama translation)."""
+
+    content_type: str
+
+    def feed(self, chunk: bytes) -> bytes: ...
+
+    def finish(self) -> bytes: ...
 
 
 class StreamKilled(Exception):
@@ -212,28 +222,38 @@ class ProxyStreamResponse(Response):
         stream: ActiveStream,
         on_done: Callable[[str, int], None],
         tap: GenerationTap | None = None,
+        transform: Transform | None = None,
     ) -> None:
         self.upstream = upstream
         self.stream = stream
         self.on_done = on_done
         self.tap = tap
+        self.transform = transform
         self.background = None
         self.status_code = upstream.status_code
-        self.content_type = upstream.headers.get("content-type", "")
+        self.content_type = transform.content_type if transform else upstream.headers.get("content-type", "")
 
     def _headers(self) -> list[tuple[bytes, bytes]]:
-        return [(k.encode("latin-1"), v.encode("latin-1")) for k, v in response_headers(self.upstream).items()]
+        headers = response_headers(self.upstream)
+        if self.transform is not None:
+            headers["content-type"] = self.content_type
+        return [(k.encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()]
+
+    async def _send_body(self, chunk: bytes, send: Send) -> None:
+        if not chunk:
+            return
+        if self.tap is not None:
+            self.tap.feed(chunk)
+        self.stream.bytes_out += len(chunk)
+        await send({"type": "http.response.body", "body": chunk, "more_body": True})
 
     async def _pump(self, send: Send) -> str:
         """Copy the body. Returns "complete" or "upstream_error"."""
         try:
             async for chunk in self.upstream.aiter_raw():
-                if not chunk:
-                    continue
-                if self.tap is not None:
-                    self.tap.feed(chunk)
-                self.stream.bytes_out += len(chunk)
-                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                await self._send_body(self.transform.feed(chunk) if self.transform else chunk, send)
+            if self.transform is not None:
+                await self._send_body(self.transform.finish(), send)
         except httpx.HTTPError as exc:
             log.warning("upstream stream error: %s", type(exc).__name__)
             await self._end_with_error("upstream error", send)

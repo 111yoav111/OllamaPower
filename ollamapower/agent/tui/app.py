@@ -220,7 +220,20 @@ class AgentTUI(App[None]):
         lend.add_column(style="bold")
         lend.add_column()
         lend.add_row("Lending", t("PAUSED" if s["paused"] else "on", "bold yellow" if s["paused"] else "bold green"))
-        lend.add_row("Lent right now", t(s["lent"] or "nothing", "bold" if s["lent"] else "dim"))
+        lent = s["lent"]
+        if lent:
+            what = f"{lent['device']} ({lent['cap_mib']} MiB) for {lent['model'] or 'a model'}"
+            what += f" · since {ago(lent['since'])}"
+        lend.add_row("Lent right now", t(what if lent else "nothing", "bold" if lent else "dim"))
+        lc = s.get("llama_cpp") or {}
+        if lc.get("status") == "ready":
+            engine = f"build {lc.get('build')} · " + (", ".join(d["name"] for d in lc.get("devices", [])) or "CPU only")
+        elif lc.get("progress"):
+            done, total = lc["progress"]
+            engine = f"downloading {done * 100 // max(total, 1)}% of {total // (1024 * 1024)} MB"
+        else:
+            engine = f"{lc.get('status', '?')} {lc.get('error', '')}".strip()
+        lend.add_row("llama.cpp", t(engine, "" if lc.get("status") == "ready" else "yellow"))
         caps = []
         if r["max_vram_gb"]:
             caps.append(f"{r['max_vram_gb']} GB")

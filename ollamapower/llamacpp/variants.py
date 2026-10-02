@@ -7,7 +7,7 @@ Backends, smallest download first (sizes for the pinned build, measured):
 * ``vulkan`` - 25-33 MB. Any GPU with a Vulkan driver (NVIDIA, AMD, Intel).
   The default for GPUs on Windows and Linux: small and vendor-neutral.
 * ``cuda12`` / ``cuda13`` - NVIDIA only, usually faster than Vulkan, but
-  600-850 MB with the CUDA runtime libraries. Opt in per machine.
+  580-770 MB with the CUDA runtime libraries. Opt in per machine.
 * ``rocm``   - AMD, ~250 MB; needs the ROCm runtime installed on Linux.
 
 Machines in one cluster may use different backends: the RPC protocol only

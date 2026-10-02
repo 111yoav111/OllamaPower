@@ -31,7 +31,7 @@ log = logging.getLogger("ollamapower.tui")
 
 REFRESH_INTERVAL = 1.0
 ALERT_EVENTS = {"auth_failed", "ip_banned", "node_incompatible", "node_kicked"}
-WARN_EVENTS = {"node_leave", "lend_state", "ollama_down", "node_paused"}
+WARN_EVENTS = {"node_leave", "lend_state", "ollama_down", "node_paused", "split_failed"}
 TOAST_EVENTS = {"node_join", "node_leave", "ip_banned", "node_incompatible"}
 
 
@@ -145,8 +145,8 @@ class HubTUI(App[None]):
             with TabPane("4 Models", id="models"):
                 yield Static(
                     Text(
-                        "Plans, benchmarks and split mode arrive in Phases 3-5; every model runs on local Ollama "
-                        "for now. 'Fits' is a rough estimate (file size + 20%).",
+                        "Plan 'split' spreads a model over helper GPUs (`ollamapower models plan <model> --split`); "
+                        "others run on local Ollama. 'Fits' is a rough estimate (file size + 20%).",
                         style="dim",
                     )
                 )
@@ -265,6 +265,13 @@ class HubTUI(App[None]):
                 f"port {c['port']}  ·  key {format_fingerprint(c['fingerprint'])[:47]}…" if c["enabled"] else "off",
             ),
         ]
+        session = (s.get("split") or {}).get("session")
+        if session:
+            plan = session.get("plan") or {}
+            where = " · ".join(f"{d['label']} {d['layers']}" for d in plan.get("devices", []))
+            if plan.get("cpu_layers"):
+                where += f" · hub CPU {plan['cpu_layers']}"
+            rows.append(("Split mode", f"{session['model']} {session['state']} · layers: {where or '-'}"))
         if c.get("bans"):
             rows.append(("Banned IPs", ", ".join(f"{ip} ({left}s)" for ip, left in c["bans"].items())))
         for label, value in rows:

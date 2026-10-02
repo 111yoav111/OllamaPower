@@ -39,10 +39,12 @@ cli = typer.Typer(add_completion=False, no_args_is_help=True, help="OllamaPower 
 nodes_cli = typer.Typer(no_args_is_help=True, help="Helpers known to the hub")
 models_cli = typer.Typer(no_args_is_help=True, help="Models and their plans")
 token_cli = typer.Typer(no_args_is_help=True, help="The cluster token helpers need")
+llamacpp_cli = typer.Typer(no_args_is_help=True, help="The pinned llama.cpp build split mode uses")
 cli.add_typer(agent_cli, name="agent")
 cli.add_typer(nodes_cli, name="nodes")
 cli.add_typer(models_cli, name="models")
 cli.add_typer(token_cli, name="token")
+cli.add_typer(llamacpp_cli, name="llamacpp")
 
 STATUS_ICON = {"lending": "🟢", "paused": "🟡", "yielding": "🟡", "offline": "🔴", "incompatible": "⚠ "}
 
@@ -348,6 +350,13 @@ def render_status(s: dict[str, Any]) -> Lines:
         ("Control", f"port {c['port']}" if c["enabled"] else "off (no cluster token? run `ollamapower init`)"),
         ("Hub key", format_fingerprint(c["fingerprint"]) if c["fingerprint"] else "-"),
     ]
+    session = (s.get("split") or {}).get("session")
+    if session:
+        plan = session.get("plan") or {}
+        where = ", ".join(f"{d['label']} {d['layers']}" for d in plan.get("devices", []))
+        if plan.get("cpu_layers"):
+            where += f", hub CPU {plan['cpu_layers']}"
+        rows.append(("Split", f"{session['model']} {session['state']} (layers: {where or '-'})"))
     for label, value in rows:
         lines.append((f"{label + ':':12} {safe(value)}", None))
     if o["models"]:
@@ -551,15 +560,18 @@ def render_models(models: list[dict[str, Any]]) -> Lines:
         fits = "?" if m["fits"] is None else ("yes" if m["fits"] else "no")
         loaded = f"{m['vram_percent']}%" if m["loaded"] else "-"
         tps = "-" if m["last_gen_tps"] is None else f"{m['last_gen_tps']:.1f}"
+        plan = m["plan"] + (" (on)" if m.get("running_split") else "")
         color = typer.colors.YELLOW if m["fits"] is False else None
         lines.append(
             (
                 f"{safe(m['name'])[:40]:40} {_human(m['size']):>10} {safe(m['parameters']):>7} "
-                f"{safe(m['quantization']):8} {loaded:8} {fits:6} {m['plan']:13} {tps}",
+                f"{safe(m['quantization']):8} {loaded:8} {fits:6} {plan:13} {tps}",
                 color,
             )
         )
-    lines.append(("Plans, benchmarks and pinning arrive with the planner (Phase 5). FITS is a rough estimate.", None))
+    lines.append(
+        ("FITS is a rough estimate. `ollamapower models plan <model> --split` spreads a model over helpers.", None)
+    )
     return lines
 
 
@@ -572,6 +584,123 @@ def models_list(
     """Installed models: size, whether they fit the hub's VRAM, plan, last speed."""
     config = load(config_path)
     show(lambda: call(config.config_dir, "models.list"), render_models, as_json, watch)
+
+
+@models_cli.command("plan")
+def models_plan(
+    model: str = typer.Argument(..., help="An installed Ollama model, e.g. llama3.1:70b"),
+    split: bool = typer.Option(False, "--split", help="Run it in split mode across helper GPUs"),
+    ctx: int | None = typer.Option(None, "--ctx", help="Context size for split mode (default: split.default_ctx)"),
+    config_path: Path | None = ConfigOption,
+    as_json: bool = typer.Option(False, "--json", help="Print JSON"),
+) -> None:
+    """Choose how a model runs. Today: --split (spread over helpers' GPUs via llama.cpp)."""
+    if not split:
+        typer.secho("Say how: --split (the only plan so far; `models unplan` goes back to Ollama).", fg="red", err=True)
+        raise typer.Exit(2)
+    config = load(config_path)
+    d = call(config.config_dir, "models.plan", model=model, ctx=ctx)
+    if as_json:
+        typer.echo(json.dumps(d, indent=2))
+        return
+    typer.echo(f"{safe(d['model'])} will run in split mode (context {d['ctx']}).")
+    typer.echo(
+        f"  Weights:    {_human(d['size'])}, {d['layers']} layers ({safe(d['architecture'])}), "
+        f"largest layer {_human(d['layer_bytes_max'])} + {_human(d['kv_per_layer'])} KV cache"
+    )
+    for h in d["helpers"]:
+        typer.echo(f"  Helper:     {safe(h['name'])} ({_human(h['lendable'])} lendable now)")
+    for reason in d["unavailable"]:
+        typer.secho(f"  Not used:   {safe(reason)}", fg=typer.colors.YELLOW)
+    for note in d["notes"]:
+        typer.secho(f"  Note:       {safe(note)}", fg=typer.colors.YELLOW)
+    typer.echo("The layers are placed when the model is first used; `ollamapower status` shows where they went.")
+
+
+@models_cli.command("unplan")
+def models_unplan(model: str, config_path: Path | None = ConfigOption) -> None:
+    """Remove a model's plan: Ollama serves it again."""
+    config = load(config_path)
+    d = call(config.config_dir, "models.unplan", model=model)
+    typer.echo(f"Removed the plan for {safe(d['model'])}{' and stopped its split session' if d['stopped'] else ''}.")
+
+
+# ----- llama.cpp -----------------------------------------------------------------------
+
+
+def _agent_or_hub_llamacpp(config_path: Path | None) -> tuple[Path, str, str]:
+    """(config dir, backend, custom path): a helper's agent.toml wins on a machine without a hub config."""
+    from .agent.config import load_agent_config
+
+    config = load(config_path)
+    hub_file = config.config_dir / "config.toml"
+    if config_path is None and not hub_file.exists() and (config.config_dir / "agent.toml").exists():
+        agent = load_agent_config(config.config_dir).llamacpp
+        return config.config_dir, agent.backend, agent.path
+    return config.config_dir, config.llamacpp.backend, config.llamacpp.path
+
+
+@llamacpp_cli.command("install")
+def llamacpp_install(
+    backend: str | None = typer.Option(None, "--backend", help="auto, cpu, metal, vulkan, cuda12, cuda13 or rocm"),
+    config_path: Path | None = ConfigOption,
+) -> None:
+    """Download and verify the pinned llama.cpp build for this machine (hub or helper)."""
+    from .llamacpp.install import Pins
+    from .llamacpp.manager import LlamaCppUnavailable, ensure
+    from .llamacpp.variants import BACKENDS
+    from .telemetry import Telemetry
+
+    base, configured, custom = _agent_or_hub_llamacpp(config_path)
+    backend = backend or configured
+    if backend not in BACKENDS:
+        typer.secho(f"--backend must be one of {', '.join(BACKENDS)}", fg="red", err=True)
+        raise typer.Exit(2)
+    vendors = [g.get("vendor", "") for g in Telemetry().static().get("gpus", []) if g.get("vendor")]
+    pins = Pins.load()
+    last = [0]
+
+    def progress(name: str, done: int, total: int) -> None:
+        pct = done * 100 // total if total else 100
+        if pct >= last[0] + 5 or done == total:
+            last[0] = pct
+            typer.echo(f"\r  {name}: {pct:3d}% of {_human(total)}", nl=done == total)
+
+    typer.echo(f"llama.cpp {pins.tag} ({backend}) -> {base / 'llamacpp'}")
+    try:
+        found = ensure(base, backend, custom, vendors, progress, pins)
+    except LlamaCppUnavailable as exc:
+        typer.secho(str(exc), fg="red", err=True)
+        raise typer.Exit(1) from None
+    typer.echo(f"Ready: build {found.build} in {found.root}")
+    for dev in found.devices:
+        typer.echo(f"  {safe(dev.name):10} {safe(dev.description)} ({dev.free_mib} of {dev.total_mib} MiB free)")
+    if not found.devices:
+        typer.echo("  No GPU visible to llama.cpp: only CPU can be used.")
+
+
+@llamacpp_cli.command("status")
+def llamacpp_status(config_path: Path | None = ConfigOption, as_json: bool = typer.Option(False, "--json")) -> None:
+    """Show the installed llama.cpp build and the devices it sees (installs nothing)."""
+    from .llamacpp.manager import LlamaCppUnavailable, ensure
+    from .telemetry import Telemetry
+
+    base, backend, custom = _agent_or_hub_llamacpp(config_path)
+    vendors = [g.get("vendor", "") for g in Telemetry().static().get("gpus", []) if g.get("vendor")]
+    try:
+        found = ensure(base, backend, custom, vendors, download=False)
+    except LlamaCppUnavailable as exc:
+        if as_json:
+            typer.echo(json.dumps({"installed": False, "error": str(exc)}))
+        else:
+            typer.secho(str(exc), fg=typer.colors.YELLOW)
+        raise typer.Exit(1) from None
+    if as_json:
+        typer.echo(json.dumps({"installed": True, "root": str(found.root), **found.summary()}))
+        return
+    typer.echo(f"llama.cpp build {found.build} in {found.root}")
+    for dev in found.devices:
+        typer.echo(f"  {safe(dev.name):10} {safe(dev.description)} ({dev.free_mib} of {dev.total_mib} MiB free)")
 
 
 # ----- doctor --------------------------------------------------------------------------

@@ -26,6 +26,7 @@ import logging
 import os
 import secrets
 import time
+from collections.abc import Callable
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -86,6 +87,8 @@ class ControlServer:
         self._tests: dict[str, _NetTest] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         self._pending = 0
+        # Split mode's handler for rpc_ready/rpc_error; called with None when a helper leaves.
+        self.on_rpc: Callable[[Node, dict[str, Any] | None], None] | None = None
 
     # ----- server lifecycle ----------------------------------------------------------------
 
@@ -255,6 +258,8 @@ class ControlServer:
             reason = "internal error"
         finally:
             self.registry.detach(node, channel, reason)
+            if self.on_rpc is not None and not node.connected:
+                self.on_rpc(node, None)  # gone: any split session using it is broken
 
     async def _on_message(self, node: Node, channel: Channel, m: dict[str, Any]) -> None:
         kind = m["type"]
@@ -272,6 +277,8 @@ class ControlServer:
             test = self._tests.get(m["test_id"])
             if test is not None and not test.result.done():
                 test.result.set_result(m["result"])
+        elif kind in ("rpc_ready", "rpc_error") and self.on_rpc is not None:
+            self.on_rpc(node, m)
         else:
             log.debug("ignoring %s from %s (not used yet)", kind, node.name)
 

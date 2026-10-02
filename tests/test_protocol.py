@@ -37,10 +37,19 @@ EXAMPLES: dict[str, tuple[str, dict]] = {
     "net_test_start": ("hub", {"test_id": "t1", "kind": "rtt", "count": 10, "size": 0}),
     "net_test_data": ("node", {"test_id": "t1", "seq": 1, "sent_at": 1.5, "data": b"\x00" * 10}),
     "net_test_result": ("node", {"test_id": "t1", "result": {"mbps": 940.0}}),
-    "rpc_start": ("hub", {"session_id": "s1", "device": "CUDA0", "vram_cap_mb": 8000, "cache": True, "tunnel": {}}),
-    "rpc_ready": ("node", {"session_id": "s1", "endpoint": {"port": 50052}}),
-    "rpc_error": ("node", {"session_id": "s1", "error": "out of memory"}),
-    "rpc_stop": ("hub", {"session_id": "s1"}),
+    "rpc_start": (
+        "hub",
+        {
+            "session_id": "session-1",
+            "device": "CUDA0",
+            "vram_cap_mb": 8000,
+            "cache": True,
+            "tunnel": {"mode": "direct"},
+        },
+    ),
+    "rpc_ready": ("node", {"session_id": "session-1", "endpoint": {"port": 50052}}),
+    "rpc_error": ("node", {"session_id": "session-1", "error": "out of memory"}),
+    "rpc_stop": ("hub", {"session_id": "session-1"}),
 }
 
 
@@ -87,8 +96,8 @@ def test_invalid_messages(message):
 
 
 def test_unknown_fields_are_dropped():
-    m = p.validate({"type": "rpc_stop", "session_id": "s", "future_field": 1}, "hub")
-    assert m == {"type": "rpc_stop", "session_id": "s"}
+    m = p.validate({"type": "rpc_stop", "session_id": "session-1", "future_field": 1}, "hub")
+    assert m == {"type": "rpc_stop", "session_id": "session-1"}
 
 
 def test_version_compatibility():
@@ -100,7 +109,7 @@ def test_non_message_packet_is_refused():
     from ollamapower.core.packets import build_task_packet
 
     with pytest.raises(p.ProtocolError):
-        p.decode(parse_packet(build_task_packet({"type": "rpc_stop", "session_id": "s"})), "hub")
+        p.decode(parse_packet(build_task_packet({"type": "rpc_stop", "session_id": "session-1"})), "hub")
 
 
 async def test_channel_round_trip_and_eof():
@@ -130,10 +139,10 @@ async def test_channel_round_trip_and_eof():
     node = Channel(b_reader, Pipe(a_reader), SessionCrypto(key, "node"))
     await node.send("heartbeat", seq=1, telemetry={"cpu_percent": 1.0})
     assert (await hub.recv())["seq"] == 1
-    await hub.send("rpc_stop", session_id="s")
+    await hub.send("rpc_stop", session_id="session-1")
     assert (await node.recv())["type"] == "rpc_stop"
     with pytest.raises(p.ProtocolError):
-        await node.send("rpc_stop", session_id="s")  # agents may not send rpc_stop
+        await node.send("rpc_stop", session_id="session-1")  # agents may not send rpc_stop
     await hub.close("kicked")
     assert (await node.recv()) == {"type": "bye", "reason": "kicked"}
     assert await node.recv() is None

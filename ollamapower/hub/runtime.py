@@ -29,6 +29,7 @@ from ..scheduling.request_queue import RequestGate
 from ..scheduling.task_pool import TaskPriority
 from ..state import StateStore
 from .control_server import ControlServer
+from .engines.split import SplitEngine
 from .nodes import NodeRegistry
 
 log = logging.getLogger("ollamapower.hub")
@@ -102,6 +103,7 @@ class Hub:
         self.fingerprint = ""
         self.local_static: dict[str, Any] = {}
         self.local_sample: dict[str, Any] = {}
+        self.split = SplitEngine(self)
 
     # ----- events ----------------------------------------------------------------------
 
@@ -118,6 +120,7 @@ class Hub:
 
         self.fingerprint = public_key_fingerprint(key.public_key())
         self.control = ControlServer(self.config.control, self.registry, key, token, self.event)
+        self.control.on_rpc = self.split.on_rpc
         await self.control.start(sock)
         self.event("control_start", port=self.control.port, fingerprint=self.fingerprint)
         return self.control
@@ -199,6 +202,7 @@ class Hub:
 
     def warnings(self) -> list[str]:
         warnings = list(self.extra_warnings)
+        warnings.extend(self.split.warnings())
         if self.state is not None:
             warnings.extend(self.state.warnings)
         if not is_loopback_host(self.config.hub.host):
@@ -213,11 +217,11 @@ class Hub:
         for node in self.registry.nodes.values():
             warnings.extend(node.warnings())
         for m in self.ollama.models:
-            if m.spilled:
+            if m.spilled and self.split.plan_for(m.name) is None:
                 warnings.append(
                     f"{m.name} is only {m.vram_percent}% in VRAM "
                     f"({human_bytes(m.size_vram)} of {human_bytes(m.size)}): the rest runs on the CPU. "
-                    "Split mode (Phase 3+) can move it to a helper GPU."
+                    f"Split mode can move it to helper GPUs: `ollamapower models plan {m.name} --split`."
                 )
         return warnings
 
@@ -248,8 +252,24 @@ class Hub:
                         else None,
                     }
                     for m in o.models
+                ]
+                + [
+                    {
+                        "name": e["name"],
+                        "size": e["size"],
+                        "size_vram": e["size_vram"],
+                        "vram_percent": 100 if not e["size"] else min(100, e["size_vram"] * 100 // e["size"]),
+                        "spilled": False,
+                        "engine": "split",
+                        "nodes": e["ollamapower"]["nodes"],
+                        "last_gen_tps": round(self.last_generation[model_key(e["name"])].gen_tps, 1)
+                        if model_key(e["name"]) in self.last_generation
+                        else None,
+                    }
+                    for e in self.split.ps_entries()
                 ],
             },
+            "split": self.split.snapshot(),
             "queue": {
                 "capacity": self.gate.capacity,
                 "active": self.gate.active,

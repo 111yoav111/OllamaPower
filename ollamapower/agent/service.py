@@ -24,7 +24,8 @@ def agent_snapshot(client: AgentClient) -> dict[str, Any]:
         "paused": s.paused,
         "connected_since": s.connected_since,
         "lending": client.lending_dict(),
-        "lent": None,  # what the hub uses right now: split sessions arrive in Phase 3
+        "lent": client.rpc.session.info() if client.rpc.session is not None else None,
+        "llama_cpp": client.rpc.summary(),
         "hardware": s.static,
         "telemetry": s.telemetry,
         "network": s.network,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from textual.widgets import Checkbox, Input
 
+from ollamapower.agent.rpc_manager import RpcSession
 from ollamapower.agent.tui.app import AgentTUI, RulesScreen
 from ollamapower.tui.widgets import ConfirmScreen
 
@@ -25,7 +26,12 @@ async def test_first_connect_asks_to_trust_the_key(tmp_path, hub_key):  # noqa: 
             assert await wait(pilot, lambda: agent.state.connection == "connected")
             assert await wait(pilot, lambda: "connected" in plain(app, "#connection"))
             assert "yes (known_hub)" in plain(app, "#connection")
+            assert await wait(pilot, lambda: "not installed" in plain(app, "#lending"))  # llama.cpp row
+            agent.rpc.session = RpcSession("session-1", "Vulkan0", 6000, "127.0.0.1", model="big:70b")
+            agent.state.version += 1
+            assert await wait(pilot, lambda: "Vulkan0 (6000 MiB) for big:70b" in plain(app, "#lending"))
             await shot(app, "agent")
+            agent.rpc.session = None
 
             await pilot.press("p")
             assert await wait(pilot, lambda: s.node("laptop").status == "paused")

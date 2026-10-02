@@ -1,0 +1,393 @@
+"""Split mode end to end, hermetically: hub + agent over localhost with fake llama.cpp programs.
+
+The real control plane, relay, planner, Ollama handoff and API translation
+run; only ``llama-server``/``ggml-rpc-server`` are small fakes (see
+``fake_llamacpp.py``) and Ollama is the usual fake. ``test_split_real.py``
+repeats the core of this with the real llama.cpp build.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import socket
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from ollamapower.admin.ipc import AdminError
+from ollamapower.admin.service import Admin
+from ollamapower.agent.client import AgentClient
+from ollamapower.agent.config import AgentConfig
+from ollamapower.core.auth import new_token
+from ollamapower.core.encrypt_layer import generate_rsa_keypair
+from ollamapower.eventlog import EventLog
+from ollamapower.hub.frontdoor.app import create_app
+from ollamapower.hub.frontdoor.server import build_server
+from ollamapower.hub.runtime import Hub
+from ollamapower.llamacpp.install import Pins
+from ollamapower.state import StateStore
+
+from .conftest import ThreadedServer, wait_for
+from .fake_llamacpp import install_fakes
+from .test_control import FakeTelemetry
+from .tiny_gguf import write_tiny_llama
+
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="the fake llama.cpp programs are POSIX scripts")
+
+TOKEN = new_token()
+AGENT_GPU = "FakeGPU0: Fake GPU (8192 MiB, 8000 MiB free)"
+
+
+@dataclass
+class Cluster:
+    url: str
+    hub: Hub
+    app: Any
+    rec: Any
+    hub_bin: Path
+    agent: AgentClient
+    agent_task: Any
+    model_path: Path
+
+    def run(self, coro: Any, timeout: float = 10) -> Any:
+        return asyncio.run_coroutine_threadsafe(coro, self.app.state.loop).result(timeout=timeout)
+
+    def call(self, fn: Any) -> Any:
+        async def run() -> Any:
+            return fn()
+
+        return self.run(run())
+
+    def admin(self, cmd: str, **args: Any) -> Any:
+        return self.run(Admin(self.hub).dispatch(cmd, args))
+
+    @property
+    def node(self) -> Any:
+        return next(iter(self.hub.registry.nodes.values()), None)
+
+    def server_args(self) -> list[str]:
+        return json.loads((self.hub_bin / "args.json").read_text())
+
+
+def make_cluster(
+    tmp_path: Path,
+    fake_ollama: Any,
+    make_config: Any,
+    hub_devices: list[str],
+    real_binaries: Path | None = None,
+    **lending: Any,
+) -> Any:
+    upstream, rec = fake_ollama
+    build = Pins.load().build
+    if real_binaries is not None:
+        hub_bin = agent_bin = real_binaries
+    else:
+        hub_bin = install_fakes(tmp_path / "hub-bin", hub_devices, build)
+        agent_bin = install_fakes(tmp_path / "agent-bin", [AGENT_GPU], build)
+    (tmp_path / "models" / "blobs").mkdir(parents=True)
+    model_path = write_tiny_llama(tmp_path / "models" / "blobs" / ("sha256-" + "ab" * 32))
+    rec.show_models["tiny:latest"] = str(model_path)
+
+    cfg = make_config(upstream.url, llamacpp__path=str(hub_bin))
+    cfg.split.keep_alive = 300
+    state = StateStore(tmp_path / "state.json")
+    hub = Hub(cfg, state, EventLog(cfg.logs_dir, cfg.logging.file_max_bytes, cfg.logging.file_backups))
+    app = create_app(hub)
+    server = ThreadedServer(server=build_server(hub, app, own_logging=False)).start()
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    key = generate_rsa_keypair()
+    loop = app.state.loop
+    asyncio.run_coroutine_threadsafe(hub.start_control(key, TOKEN, sock=sock), loop).result(5)
+
+    acfg = AgentConfig(config_dir=tmp_path / "agent")
+    acfg.agent.name = "desk"
+    acfg.llamacpp.path = str(agent_bin)
+    acfg.lending.allow_direct = True
+    for k, v in lending.items():
+        setattr(acfg.lending, k, v)
+
+    async def yes(addr: str, fp: str) -> bool:
+        return True
+
+    agent = AgentClient(acfg, TOKEN, "127.0.0.1", hub.control.port, confirm=yes, telemetry=FakeTelemetry())
+
+    async def start_agent() -> Any:
+        return asyncio.ensure_future(agent.run())
+
+    task = asyncio.run_coroutine_threadsafe(start_agent(), loop).result(5)
+    c = Cluster(server.url, hub, app, rec, hub_bin, agent, task, model_path)
+
+    def ready() -> bool:
+        node = c.node
+        return bool(node and node.connected and (node.capabilities.get("llama_cpp") or {}).get("status") == "ready")
+
+    assert wait_for(ready, 15), "the agent never reported a ready llama.cpp"
+    c.call(lambda: hub.registry.set_tunnel_mode(c.node, "direct"))
+
+    def close() -> None:
+        async def stop() -> None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await hub.stop_control()
+
+        asyncio.run_coroutine_threadsafe(stop(), loop).result(15)
+        server.stop()
+
+    return c, close
+
+
+@pytest.fixture
+def cluster(tmp_path, fake_ollama, make_config):
+    c, close = make_cluster(tmp_path, fake_ollama, make_config, hub_devices=[])
+    yield c
+    close()
+
+
+@pytest.fixture
+def client():
+    with httpx.Client(timeout=30, trust_env=False) as c:
+        yield c
+
+
+def chat(client: httpx.Client, c: Cluster, **body: Any) -> httpx.Response:
+    return client.post(
+        c.url + "/api/chat", json={"model": "tiny", "messages": [{"role": "user", "content": "hi"}], **body}
+    )
+
+
+def test_planned_model_runs_split_with_the_helper(cluster, client):
+    c = cluster
+    preview = c.admin("models.plan", model="tiny", ctx=512)
+    assert preview["layers"] == 4 and preview["helpers"][0]["name"] == "desk"
+
+    r = chat(client, c)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/x-ndjson")
+    lines = [json.loads(x) for x in r.text.splitlines()]
+    assert "".join(x["message"]["content"] for x in lines) == "Hello from split"
+    final = lines[-1]
+    assert final["done"] is True and final["done_reason"] == "stop"
+    assert final["eval_count"] == 3 and final["eval_duration"] == 150_000_000
+    assert final["prompt_eval_count"] == 7 and final["total_duration"] > 0
+
+    # llama-server got exactly the plan: everything on the helper (the hub has no GPU).
+    args = c.server_args()
+    assert args[args.index("--host") + 1] == "127.0.0.1"
+    assert args[args.index("--device") + 1] == "RPC0"
+    assert args[args.index("--tensor-split") + 1] == "5"  # 4 blocks + the output layer
+    assert args[args.index("-ngl") + 1] == "5"
+    assert args[args.index("-c") + 1] == "512"
+    assert args[args.index("--fit") + 1] == "off"
+    assert args[args.index("-m") + 1] == str(c.model_path)
+    rpc_host, rpc_port = args[args.index("--rpc") + 1].rsplit(":", 1)
+    assert rpc_host == "127.0.0.1"
+    assert int(rpc_port) == c.agent.rpc.session.relay_port  # the relay, never the rpc-server itself
+    assert c.agent.rpc.session.port != int(rpc_port)
+
+    # Ollama gave its GPU up first and never saw the chat.
+    assert c.rec.ps_models == []
+    assert not [x for x in c.rec.client_requests if x["path"] == "/api/chat"]
+    snap = c.call(c.hub.get_snapshot)
+    assert snap["split"]["session"]["state"] == "ready"
+    assert any(m["engine"] == "split" and m["name"] == "tiny:latest" for m in snap["ollama"]["models"])
+    assert snap["nodes"][0]["role"] == "split"
+    # The speed tap read the translated answer (recorded just after the last byte went out).
+    assert wait_for(lambda: "tiny:latest" in c.call(lambda: c.hub.last_generation))
+    assert c.call(lambda: c.hub.last_generation["tiny:latest"].gen_tokens) == 3
+    # llama-server allows any web origin, so it must refuse anyone without the hub's key.
+    port = c.call(lambda: c.hub.split.session.port)
+    assert client.post(f"http://127.0.0.1:{port}/v1/chat/completions", json={"messages": []}).status_code == 401
+    lent = c.agent.rpc.session.info()
+    assert lent["device"] == "FakeGPU0" and lent["model"] == "tiny:latest"
+
+
+def test_non_streaming_generate_tools_and_ps(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    r = chat(client, c, stream=False)
+    body = r.json()
+    assert r.headers["content-type"].startswith("application/json")
+    assert body["message"]["content"] == "Hello from split" and body["done"] is True
+
+    r = client.post(c.url + "/api/generate", json={"model": "tiny", "prompt": "hi", "system": "be brief"})
+    lines = [json.loads(x) for x in r.text.splitlines()]
+    assert "".join(x.get("response", "") for x in lines) == "Hello from split"
+    sent = json.loads((c.hub_bin / "last_request.json").read_text())
+    assert sent["path"] == "/v1/chat/completions"
+    assert [m["role"] for m in sent["body"]["messages"]] == ["system", "user"]
+
+    tools = [{"type": "function", "function": {"name": "get", "parameters": {"type": "object"}}}]
+    r = chat(client, c, stream=False, tools=tools, options={"temperature": 0.1, "num_predict": 9})
+    assert r.json()["message"]["tool_calls"] == [{"function": {"name": "get", "arguments": {"a": 1}}}]
+    sent = json.loads((c.hub_bin / "last_request.json").read_text())["body"]
+    assert sent["temperature"] == 0.1 and sent["max_tokens"] == 9 and sent["tools"] == tools
+
+    ps = client.get(c.url + "/api/ps").json()["models"]
+    assert [(m["name"], m["ollamapower"]["engine"]) for m in ps] == [("tiny:latest", "split")]
+
+
+def test_openai_requests_pass_through_to_llama_server(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    r = client.post(
+        c.url + "/v1/chat/completions", json={"model": "tiny", "messages": [{"role": "user", "content": "x"}]}
+    )
+    assert r.headers["content-type"].startswith("text/event-stream")
+    assert r.text.rstrip().endswith("data: [DONE]")
+    assert json.loads((c.hub_bin / "last_request.json").read_text())["body"]["model"] == "tiny"
+
+
+def test_images_and_upstream_errors_are_clear(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    r = chat(client, c, messages=[{"role": "user", "content": "x", "images": ["aGk="]}])
+    assert r.status_code == 400 and "images are not supported in split mode" in r.json()["error"]
+    r = chat(client, c, messages=[{"role": "user", "content": "fail"}])
+    assert r.status_code == 400 and r.json() == {"error": "bad request from fake"}
+
+
+def test_load_and_unload_requests(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    r = client.post(c.url + "/api/generate", json={"model": "tiny"})
+    assert r.json()["done_reason"] == "load"
+    assert c.call(lambda: c.hub.split.is_running("tiny"))
+    r = client.post(c.url + "/api/generate", json={"model": "tiny", "keep_alive": 0})
+    assert r.json()["done_reason"] == "unload"
+    assert not c.call(lambda: c.hub.split.is_running("tiny"))
+    assert wait_for(lambda: c.agent.rpc.session is None, 5)  # the helper was released
+
+
+def test_unplan_stops_the_session_and_ollama_serves_again(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    assert chat(client, c).status_code == 200
+    assert c.admin("models.unplan", model="tiny:latest")["stopped"] is True
+    assert wait_for(lambda: c.agent.rpc.session is None, 5)
+    assert c.node.split_model == ""
+    chat(client, c)
+    assert c.rec.last["path"] == "/api/chat"  # Ollama again
+    with pytest.raises(AdminError):
+        c.admin("models.unplan", model="tiny")
+
+
+def test_paused_helper_means_ollama_serves_with_a_warning(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    c.run(c.agent.set_paused(True))
+    assert wait_for(lambda: c.node.status == "paused", 5)
+    r = chat(client, c)
+    assert r.status_code == 200 and c.rec.last["path"] == "/api/chat"
+    warnings = c.call(c.hub.warnings)
+    assert any("split mode for tiny:latest failed" in w and "desk is paused" in w for w in warnings)
+    # Resting: the next request doesn't retry the failed start at once.
+    chat(client, c)
+    assert c.call(lambda: c.hub.split.wants("tiny")) is False
+
+
+def test_helper_owner_pausing_mid_session_ends_it(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    assert chat(client, c).status_code == 200
+    c.run(c.agent.set_paused(True))
+    assert wait_for(lambda: not c.call(lambda: c.hub.split.is_running("tiny")), 10)
+    assert c.agent.rpc.session is None
+    assert any("lending paused" in w for w in c.call(c.hub.warnings))
+
+
+def test_helper_leaving_mid_session_ends_it(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    assert chat(client, c).status_code == 200
+    c.run(c.hub.control.kick(c.node))
+    assert wait_for(lambda: not c.call(lambda: c.hub.split.is_running("tiny")), 10)
+    assert any("desk disconnected" in w for w in c.call(c.hub.warnings))
+
+
+def test_relay_only_accepts_the_hub(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    assert chat(client, c).status_code == 200
+    session = c.agent.rpc.session
+    session.hub_ip = "10.9.9.9"  # pretend the hub is elsewhere: a local connection must now be refused
+
+    async def probe() -> bytes:
+        reader, writer = await asyncio.open_connection("127.0.0.1", session.relay_port)
+        writer.write(b"ping")
+        try:
+            return await asyncio.wait_for(reader.read(4), 2)
+        except ConnectionResetError:
+            return b""
+        finally:
+            writer.close()
+
+    assert c.run(probe()) == b""
+
+
+def test_helper_without_direct_opt_in_is_not_used(tmp_path, fake_ollama, make_config, client):
+    c, close = make_cluster(tmp_path, fake_ollama, make_config, hub_devices=[], allow_direct=False)
+    try:
+        preview = c.admin("models.plan", model="tiny", ctx=512)
+        assert not preview["helpers"] and "direct mode" in preview["unavailable"][0]
+        chat(client, c)
+        assert c.rec.last["path"] == "/api/chat"
+    finally:
+        close()
+
+
+def test_model_that_fits_on_the_hub_stays_with_ollama(tmp_path, fake_ollama, make_config, client):
+    c, close = make_cluster(
+        tmp_path, fake_ollama, make_config, hub_devices=["Vulkan0: Big GPU (24576 MiB, 24000 MiB free)"]
+    )
+    try:
+        c.admin("models.plan", model="tiny", ctx=512)
+        chat(client, c)
+        assert c.rec.last["path"] == "/api/chat"
+        assert any("fits on the hub's GPU alone" in w for w in c.call(c.hub.warnings))
+        assert c.agent.rpc.session is None  # no helper was even asked
+    finally:
+        close()
+
+
+def test_failed_llama_server_start_falls_back_and_releases_helpers(cluster, client):
+    c = cluster
+    (c.hub_bin / "fail_start").write_text("1")
+    c.admin("models.plan", model="tiny", ctx=512)
+    r = chat(client, c)
+    assert r.status_code == 200 and c.rec.last["path"] == "/api/chat"
+    assert any("llama-server exited with code 3" in w for w in c.call(c.hub.warnings))
+    assert wait_for(lambda: c.agent.rpc.session is None, 5)
+
+
+def test_plan_refuses_unknown_and_bad_input(cluster):
+    with pytest.raises(AdminError, match="not installed"):
+        cluster.admin("models.plan", model="missing", ctx=512)
+    with pytest.raises(AdminError, match="--ctx"):
+        cluster.admin("models.plan", model="tiny", ctx=10)
+
+
+def test_idle_session_stops_after_keep_alive(cluster, client, monkeypatch):
+    from ollamapower.hub.engines import split as split_mod
+
+    c = cluster
+    c.hub.config.split.keep_alive = 0.2
+    monkeypatch.setattr(split_mod, "IDLE_CHECK", 0.1)
+    # The idle loop started before the patch; restart it so it picks up the short interval.
+    c.admin("models.plan", model="tiny", ctx=512)
+    assert chat(client, c).status_code == 200
+
+    async def kick_idle_loop() -> None:
+        asyncio.ensure_future(c.hub.split.run())
+
+    c.run(kick_idle_loop())
+    assert wait_for(lambda: not c.call(lambda: c.hub.split.is_running("tiny")), 5)
+    assert wait_for(lambda: c.agent.rpc.session is None, 5)
+    time.sleep(0.05)

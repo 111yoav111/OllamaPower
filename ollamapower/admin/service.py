@@ -7,12 +7,17 @@ Commands are dotted ``noun.verb`` strings, like OllamaGate's.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from ..hub.control_server import NetTestError
 from ..hub.nodes import TUNNEL_MODES, Node
-from ..hub.runtime import Hub
+from ..hub.planner import MIB, Device, fits_on_hub
+from ..hub.runtime import Hub, model_key
+from ..ollama.blobs import ModelUnavailable, resolve
 from .ipc import AdminError
+
+MAX_CTX = 1 << 20
 
 # Estimated overhead over the model file when deciding whether it fits in VRAM
 # (KV cache and buffers). Phase 5 replaces this with a real estimate from GGUF metadata.
@@ -50,11 +55,59 @@ class Admin:
                     "loaded": live is not None,
                     "vram_percent": live.vram_percent if live else None,
                     "fits": None if not hub_vram else needed <= hub_vram,
-                    "plan": "local-ollama",
+                    "plan": "split" if self.hub.split.plan_for(m.name) else "local-ollama",
+                    "running_split": self.hub.split.is_running(m.name),
                     "last_gen_tps": round(gen.gen_tps, 1) if gen else None,
                 }
             )
         return out
+
+    async def plan_split(self, model: Any, ctx: Any) -> dict[str, Any]:
+        """Check that ``model`` can run split, save the plan and preview it."""
+        hub, split = self.hub, self.hub.split
+        if not isinstance(model, str) or not model or len(model) > 200:
+            raise AdminError("give a model name, e.g. llama3.1:70b")
+        if ctx is not None and (not isinstance(ctx, int) or isinstance(ctx, bool) or not 256 <= ctx <= MAX_CTX):
+            raise AdminError(f"--ctx must be between 256 and {MAX_CTX}")
+        if hub.state is None or split.http is None:
+            raise AdminError("the hub is not fully running")
+        try:
+            files = await resolve(split.http, model)
+        except ModelUnavailable as exc:
+            raise AdminError(str(exc)) from None
+        info = files.gguf
+        assert info is not None
+        ctx = ctx or hub.config.split.default_ctx
+        key = model_key(model)
+        hub.state.set_plan(key, {"mode": "split", "ctx": ctx, "created": time.time()})
+        hub.event("plan_set", model=key, mode="split", ctx=ctx)
+        hub_gpus = [
+            Device(f"hub {g.get('name', 'GPU')}", int(g.get("vram_total", 0)))
+            for g in hub.local_static.get("gpus", [])
+            if isinstance(g, dict)
+        ]
+        helpers, reasons = split.candidates()
+        notes = []
+        if hub_gpus and fits_on_hub(info, ctx, hub_gpus):
+            notes.append("it fits on the hub's GPU alone, so Ollama keeps serving it (split mode would be slower)")
+        if files.vision:
+            notes.append("images won't work while it runs in split mode (text only)")
+        if not helpers:
+            notes.append("no helper can take part right now; Ollama serves it until one can")
+        return {
+            "model": key,
+            "ctx": ctx,
+            "path": str(files.path),
+            "size": info.file_size,
+            "layers": info.block_count,
+            "architecture": info.architecture,
+            "kv_per_layer": info.kv_bytes_per_layer(ctx),
+            "layer_bytes_max": max(info.layer_bytes, default=0),
+            "helpers": [{"name": n.name, "lendable": n.lendable_vram()} for n in helpers],
+            "unavailable": reasons,
+            "notes": notes,
+            "hub_vram": sum(d.free for d in hub_gpus) // MIB * MIB,
+        }
 
     # ----- dispatch --------------------------------------------------------------------
 
@@ -105,6 +158,20 @@ class Admin:
             return {"lifted": args.get("ip")}
         if cmd == "models.list":
             return self.models()
+        if cmd == "models.plan":
+            return await self.plan_split(args.get("model"), args.get("ctx"))
+        if cmd == "models.unplan":
+            model = args.get("model")
+            key = model_key(str(model or ""))
+            if hub.state is None or key not in hub.state.data.get("plans", {}):
+                raise AdminError(f"{model!r} has no plan")
+            del hub.state.data["plans"][key]
+            hub.state.save_soon()
+            hub.event("plan_removed", model=key)
+            stopped = await hub.split.stop(key, "plan removed")
+            return {"model": key, "stopped": stopped}
+        if cmd == "split.stop":
+            return {"stopped": await hub.split.stop(reason="stopped by the owner")}
         if cmd == "events.list":
             limit = args.get("limit", 100)
             return list(hub.recent_events)[-int(limit) :] if isinstance(limit, int) and limit > 0 else []

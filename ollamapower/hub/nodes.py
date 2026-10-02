@@ -116,8 +116,34 @@ def clean_lending(value: Any) -> dict[str, Any]:
     }
 
 
+def clean_llama_cpp(value: Any) -> dict[str, Any] | None:
+    """The agent's llama.cpp report: status, build and the devices it can lend."""
+    if not isinstance(value, dict):
+        return None
+    build = value.get("build")
+    devices = []
+    for d in value.get("devices") if isinstance(value.get("devices"), list) else []:
+        if isinstance(d, dict) and isinstance(d.get("name"), str):
+            devices.append(
+                {
+                    "name": safe_text(d["name"], 40),
+                    "description": safe_text(str(d.get("description", "")), 80),
+                    "total_mib": max(0, int(_num(d.get("total_mib")))),
+                    "free_mib": max(0, int(_num(d.get("free_mib")))),
+                }
+            )
+    return {
+        "status": safe_text(str(value.get("status", "")), 20),
+        "error": safe_text(str(value.get("error", "")), 300),
+        "build": build if isinstance(build, int) and not isinstance(build, bool) and build >= 0 else None,
+        "devices": devices[:16],
+    }
+
+
 def clean_capabilities(value: Any) -> dict[str, Any]:
+    llama_cpp = clean_llama_cpp(value.get("llama_cpp") if isinstance(value, dict) else None)
     caps = sanitize(value if isinstance(value, dict) else {}) or {}
+    caps["llama_cpp"] = llama_cpp
     caps["gpus"] = clean_gpus(caps.get("gpus"))
     if not isinstance(caps.get("network"), dict):
         caps["network"] = {}
@@ -155,6 +181,7 @@ class Node:
     )
     net_tests: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=NET_TEST_HISTORY))
     channel: Channel | None = None
+    split_model: str = ""  # the split-mode model this helper serves right now
 
     @property
     def connected(self) -> bool:
@@ -258,7 +285,9 @@ class Node:
             "hub_paused": self.hub_paused,
             "tunnel_mode": self.tunnel_mode,
             "tunnel_effective": self.tunnel_effective,
-            "role": "idle",  # "split" once split mode arrives (Phase 3)
+            "role": "split" if self.split_model else "idle",
+            "split_model": self.split_model,
+            "llama_cpp": self.capabilities.get("llama_cpp"),
             "first_seen": self.first_seen,
             "last_seen": self.last_seen if not self.connected else time.time(),
             "connected_at": self.connected_at,

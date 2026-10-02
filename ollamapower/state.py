@@ -1,6 +1,6 @@
 """``state.json``: the hub's only persistent state (spec Section 16).
 
-Nodes seen, benchmark results and chosen plans live in one small JSON file.
+Nodes seen, benchmark results and chosen plans (keyed by model name) live in one small JSON file.
 **Nothing else reads or writes it** - keeping all access here makes a later
 move into OllamaGate's database a contained job.
 
@@ -167,8 +167,8 @@ class StateStore:
             del benchmarks[i]
         self.save_soon()
 
-    def set_plan(self, model_digest: str, plan: dict[str, Any]) -> None:
-        self.data["plans"][model_digest] = plan
+    def set_plan(self, model: str, plan: dict[str, Any]) -> None:
+        self.data["plans"][model] = plan
         self.save_soon()
 
 

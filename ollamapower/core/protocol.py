@@ -104,6 +104,7 @@ SCHEMAS: dict[str, tuple[Direction, dict[str, Field]]] = {
             "vram_cap_mb": (INT, True),
             "cache": (BOOL, True),
             "tunnel": (DICT, True),
+            "model": (STR, False),
         },
     ),
     "rpc_ready": (Direction.TO_HUB, {"session_id": (STR, True), "endpoint": (DICT, False)}),
@@ -113,6 +114,7 @@ SCHEMAS: dict[str, tuple[Direction, dict[str, Field]]] = {
 
 LEND_STATES = ("lending", "paused", "yielding")
 NET_TEST_KINDS = ("request", "rtt", "down", "up")
+TUNNEL_MODES = ("secure", "direct")
 REJECT_CODES = ("bad_token", "protocol", "banned", "not_allowed", "duplicate", "full", "malformed")
 
 # Messages hub -> agent and agent -> hub, for direction checks.
@@ -166,6 +168,13 @@ def _check_values(m: dict[str, Any]) -> None:
         raise ProtocolError("hello: invalid node_id")
     if kind in ("heartbeat", "net_test_data") and m["seq"] < 0:
         raise ProtocolError(f"{kind}: negative seq")
+    if kind.startswith("rpc_") and not valid_node_id(m["session_id"]):
+        raise ProtocolError(f"{kind}: invalid session_id")
+    if kind == "rpc_start":
+        if not 0 <= m["vram_cap_mb"] <= 16 * 1024 * 1024 or len(m["device"]) > 64:
+            raise ProtocolError("rpc_start: vram_cap_mb or device out of range")
+        if m["tunnel"].get("mode") not in TUNNEL_MODES:
+            raise ProtocolError("rpc_start: unknown tunnel mode")
 
 
 def valid_node_id(value: str) -> bool:
