@@ -62,6 +62,28 @@ class Admin:
             )
         return out
 
+    async def tunnel_test(self, node: Node) -> dict[str, Any]:
+        """Measure the split-mode path to ``node``: secure always, direct too if its owner allows it."""
+        from ..core.protocol import protocol_minor
+        from ..hub.engines.split import SplitUnavailable
+
+        if protocol_minor(node.protocol) < 1:
+            raise AdminError(f"{node.name} runs an older agent without tunnel tests; update OllamaPower there")
+        modes = ["secure"] + (["direct"] if node.lending.get("allow_direct") else [])
+        results = {}
+        try:
+            for mode in modes:
+                results[mode] = await self.hub.split.bench(node, mode)
+        except SplitUnavailable as exc:
+            raise AdminError(str(exc)) from None
+        out: dict[str, Any] = {"ts": time.time(), "node": node.name, **results}
+        secure, direct = results.get("secure"), results.get("direct")
+        if secure and direct and direct["mbps"] > 0:
+            out["overhead_pct"] = round((1 - secure["mbps"] / direct["mbps"]) * 100, 1)
+            out["rtt_overhead_ms"] = round(secure["rtt_ms"] - direct["rtt_ms"], 3)
+        self.hub.registry.record_tunnel_test(node, out)
+        return out
+
     async def plan_split(self, model: Any, ctx: Any) -> dict[str, Any]:
         """Check that ``model`` can run split, save the plan and preview it."""
         hub, split = self.hub, self.hub.split
@@ -144,6 +166,8 @@ class Admin:
                 raise AdminError(f"tunnel mode must be {' or '.join(TUNNEL_MODES)}")
             registry.set_tunnel_mode(node, mode)
             return node.summary()
+        if cmd == "nodes.tunnel_test":
+            return await self.tunnel_test(self._node(args.get("ref")))
         if cmd == "nodes.forget":
             node = self._node(args.get("ref"))
             try:

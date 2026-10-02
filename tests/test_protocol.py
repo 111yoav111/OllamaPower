@@ -159,3 +159,30 @@ async def test_pre_auth_frame_limit():
     hub.limit_frames(64 * 1024)
     with pytest.raises(CryptoError):
         await hub.recv()
+
+
+@pytest.mark.parametrize("purpose,ok", [("rpc", True), ("bench", True), ("shell", False)])
+def test_rpc_start_purpose(purpose, ok):
+    m = {
+        "type": "rpc_start",
+        "session_id": "session-1",
+        "device": "",
+        "vram_cap_mb": 0,
+        "cache": False,
+        "tunnel": {"mode": "secure", "cert": "x"},
+        "purpose": purpose,
+    }
+    if ok:
+        assert p.validate(m, "hub")["purpose"] == purpose
+    else:
+        with pytest.raises(p.ProtocolError):
+            p.validate(m, "hub")
+
+
+def test_protocol_minor():
+    assert (p.protocol_minor("1.1"), p.protocol_minor("1.0"), p.protocol_minor("2"), p.protocol_minor("x.y")) == (
+        1,
+        0,
+        -1,
+        -1,
+    )

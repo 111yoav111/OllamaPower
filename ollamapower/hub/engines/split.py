@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from ...core.tunnel import TunnelError, TunnelIdentity, check_cert_pem
 from ...llamacpp.binaries import LlamaCpp
 from ...llamacpp.install import Pins
 from ...llamacpp.manager import LlamaCppUnavailable, ensure
@@ -50,6 +51,7 @@ from ...ollama.blobs import ModelFiles, ModelUnavailable, resolve
 from ...ollama.client import PROBE_HEADERS, human_bytes, parse_ps
 from ...textsafe import safe_text
 from ..planner import MIB, Device, PlanError, SplitPlan, fits_on_hub, plan_split
+from ..tunnel import BULK_BYTES, HubRelay, TunnelClient, measure
 
 if TYPE_CHECKING:
     from ..nodes import Node
@@ -74,10 +76,16 @@ class SplitUnavailable(Exception):
 class HelperLease:
     node: Node
     session_id: str
+    mode: str = "secure"
+    identity: TunnelIdentity | None = field(default=None, repr=False)
     endpoint: dict[str, Any] = field(default_factory=dict)
+    relay: HubRelay | None = None
 
     @property
     def address(self) -> str:
+        """What llama-server's ``--rpc`` gets: the hub's local relay (secure) or the helper's relay (direct)."""
+        if self.relay is not None:
+            return f"127.0.0.1:{self.relay.port}"
         host = self.node.ip
         return f"[{host}]:{self.endpoint['port']}" if ":" in host else f"{host}:{self.endpoint['port']}"
 
@@ -117,7 +125,7 @@ class SplitSession:
             "idle_s": round(time.monotonic() - self.last_used, 1) if not self.active else 0.0,
             "size": self.files.gguf.file_size if self.files and self.files.gguf else 0,
             "plan": self.plan.summary() if self.plan else None,
-            "helpers": [{"node": x.node.node_id, "name": x.node.name} for x in self.leases],
+            "helpers": [{"node": x.node.node_id, "name": x.node.name, "tunnel": x.mode} for x in self.leases],
             "error": self.error,
         }
 
@@ -337,11 +345,6 @@ class SplitEngine:
                 reasons.append(f"{node.name}: llama.cpp {lc.get('status') or 'unknown'} {lc.get('error', '')}".strip())
             elif lc.get("build") != pins.build:
                 reasons.append(f"{node.name} has llama.cpp build {lc.get('build')}, needs {pins.build}")
-            elif node.tunnel_effective != "direct":
-                reasons.append(
-                    f"{node.name} needs direct mode until the encrypted tunnel arrives (Phase 4): "
-                    f"`ollamapower nodes tunnel {node.name} direct` and allow_direct on the helper"
-                )
             elif node.link.get("kind") == "wifi":
                 reasons.append(f"{node.name} is on Wi-Fi (too slow for split mode)")
             else:
@@ -378,7 +381,11 @@ class SplitEngine:
         raise SplitUnavailable("Ollama did not unload its models in time")
 
     async def _lease(self, helpers: list[Node], model: str) -> list[HelperLease]:
-        leases = [HelperLease(node=n, session_id=secrets.token_hex(12)) for n in helpers]
+        leases = []
+        for n in helpers:
+            mode = n.tunnel_effective
+            identity = TunnelIdentity.generate("hub") if mode == "secure" else None
+            leases.append(HelperLease(node=n, session_id=secrets.token_hex(12), mode=mode, identity=identity))
         loop = asyncio.get_running_loop()
         for lease in leases:
             self._pending[lease.session_id] = loop.create_future()
@@ -390,7 +397,7 @@ class SplitEngine:
                     device="",
                     vram_cap_mb=0,
                     cache=True,
-                    tunnel={"mode": lease.node.tunnel_effective},
+                    tunnel={"mode": lease.mode, **({"cert": lease.identity.cert_pem} if lease.identity else {})},
                     model=model,
                 )
             except Exception:  # noqa: BLE001 - that helper just left
@@ -405,14 +412,22 @@ class SplitEngine:
             if fut in done and not fut.cancelled() and fut.result().get("type") == "rpc_ready":
                 endpoint = fut.result().get("endpoint") or {}
                 port, free = endpoint.get("port"), endpoint.get("free_mib")
-                if _count(port) and port < 65536 and _count(free):
+                if _count(port) and port < 65536 and _count(free) and endpoint.get("mode") == lease.mode:
                     lease.endpoint = {
                         "port": port,
                         "free_mib": min(free, 1 << 24),
                         "device": safe_text(str(endpoint.get("device", "")), 40),
                     }
-                    ready.append(lease)
-                    continue
+                    try:
+                        if lease.identity is not None:
+                            lease.endpoint["cert"] = check_cert_pem(endpoint.get("cert"))
+                            client = TunnelClient(lease.node.ip, port, lease.identity, lease.endpoint["cert"])
+                            lease.relay = HubRelay(client)
+                            await lease.relay.start()
+                        ready.append(lease)
+                        continue
+                    except TunnelError as exc:
+                        self._warnings.append((time.monotonic(), f"{lease.node.name}: secure tunnel: {exc}"))
             elif fut in done and not fut.cancelled():
                 err = safe_text(str(fut.result().get("error", "")), 300)
                 self._warnings.append((time.monotonic(), f"{lease.node.name} refused split mode: {err}"))
@@ -491,6 +506,49 @@ class SplitEngine:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    # ----- tunnel test -------------------------------------------------------------------
+
+    async def bench(self, node: Node, mode: str, bulk_bytes: int = BULK_BYTES) -> dict[str, Any]:
+        """Time the real tunnel path to ``node`` in ``mode`` (the helper relays to an echo server)."""
+        channel = node.channel
+        if channel is None or channel.closed:
+            raise SplitUnavailable(f"{node.name} is not connected")
+        lease = HelperLease(node=node, session_id=secrets.token_hex(12), mode=mode)
+        if mode == "secure":
+            lease.identity = TunnelIdentity.generate("hub")
+        fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending[lease.session_id] = fut
+        try:
+            await channel.send(
+                "rpc_start",
+                session_id=lease.session_id,
+                device="",
+                vram_cap_mb=0,
+                cache=False,
+                tunnel={"mode": mode, **({"cert": lease.identity.cert_pem} if lease.identity else {})},
+                purpose="bench",
+            )
+            reply = await asyncio.wait_for(fut, RPC_READY_TIMEOUT)
+        except TimeoutError:
+            raise SplitUnavailable(f"{node.name} did not answer the tunnel test") from None
+        finally:
+            self._pending.pop(lease.session_id, None)
+        try:
+            if reply["type"] != "rpc_ready":
+                raise SplitUnavailable(f"{node.name}: {safe_text(str(reply.get('error', '')), 300)}")
+            endpoint = reply.get("endpoint") or {}
+            port = endpoint.get("port")
+            if not _count(port) or port >= 65536 or endpoint.get("mode") != mode:
+                raise SplitUnavailable(f"{node.name} sent an unusable tunnel endpoint")
+            try:
+                cert = check_cert_pem(endpoint.get("cert")) if lease.identity else ""
+                client = TunnelClient(node.ip, port, lease.identity, cert)
+                return await measure(client, bulk_bytes)
+            except (OSError, TimeoutError, TunnelError, asyncio.IncompleteReadError) as exc:
+                raise SplitUnavailable(f"tunnel test to {node.name} failed ({type(exc).__name__})") from None
+        finally:
+            await self._send_stop(lease)
+
     # ----- helper events -----------------------------------------------------------------
 
     def on_rpc(self, node: Node, message: dict[str, Any] | None) -> None:
@@ -522,6 +580,8 @@ class SplitEngine:
     # ----- stop --------------------------------------------------------------------------
 
     async def _send_stop(self, lease: HelperLease) -> None:
+        if lease.relay is not None:
+            lease.relay.close()
         channel = lease.node.channel
         if channel is not None and not channel.closed:
             with contextlib.suppress(Exception):

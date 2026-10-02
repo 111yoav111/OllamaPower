@@ -24,6 +24,7 @@ from textual.widgets import DataTable, Footer, Header, Input, Sparkline, Static,
 from ...admin.ipc import AdminError
 from ...admin.service import Admin
 from ...agent.pinning import format_fingerprint
+from ...cli_common import tunnel_test_lines
 from ...textsafe import safe
 from ...tui.widgets import STATUS_DOT, ConfirmScreen, ago, bar, duration, gib, human_bytes, t, ts
 
@@ -68,7 +69,7 @@ class NodeTable(DataTable):
 
 
 # Actions only offered on some tabs (hidden from the footer elsewhere).
-NODE_ACTIONS = {"node_pause", "node_kick", "node_net_test", "node_tunnel", "node_forget"}
+NODE_ACTIONS = {"node_pause", "node_kick", "node_net_test", "node_tunnel", "node_tunnel_test", "node_forget"}
 MODEL_ACTIONS = {"phase5"}
 
 
@@ -86,6 +87,7 @@ class HubTUI(App[None]):
         Binding("k", "node_kick", "Kick"),
         Binding("n", "node_net_test", "Net test"),
         Binding("t", "node_tunnel", "Tunnel"),
+        Binding("m", "node_tunnel_test", "Tunnel test"),
         Binding("x", "node_forget", "Forget"),
         Binding("b", "phase5('benchmark')", "Benchmark"),
         Binding("l", "phase5('pin a plan')", "Pin plan"),
@@ -433,11 +435,17 @@ class HubTUI(App[None]):
                 f"{r.get('up_mbps', '-')} Mbps",
                 t(r.get("link")),
             )
-        self.query_one("#detail-net", Static).update(
+        parts = [
             Group(Text("Network tests (N to run one)", style="bold"), net)
             if d["net_tests"]
             else Text("No network test yet - press N", style="dim")
-        )
+        ]
+        if d.get("tunnel_test"):
+            parts.append(Text("\nSplit-mode tunnel (M to measure again)", style="bold"))
+            parts.extend(t(line) for line in tunnel_test_lines(d["tunnel_test"]))
+        else:
+            parts.append(Text("\nNo tunnel test yet - press M", style="dim"))
+        self.query_one("#detail-net", Static).update(Group(*parts))
 
     def _update_models(self) -> None:
         table = self.query_one("#model-table", DataTable)
@@ -600,6 +608,22 @@ class HubTUI(App[None]):
                 )
 
         self.run_worker(run(), group="net-test")
+
+    def action_node_tunnel_test(self) -> None:
+        node_id = self._target()
+        if node_id is None:
+            return
+        name = self.hub.registry.nodes[node_id].name
+        self.say(f"Measuring the split-mode tunnel to {name}…", timeout=4)
+
+        async def run() -> None:
+            r = await self._admin("nodes.tunnel_test", ref=node_id)
+            if r is not None:
+                secure = r["secure"]
+                extra = f" · encryption costs {r['overhead_pct']}%" if r.get("overhead_pct") is not None else ""
+                self.say(f"{name}: secure {secure['mbps']} Mbps, RTT {secure['rtt_ms']} ms{extra}", timeout=10)
+
+        self.run_worker(run(), group="tunnel-test")
 
     def action_node_tunnel(self) -> None:
         node_id = self._target()

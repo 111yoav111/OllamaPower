@@ -180,6 +180,7 @@ class Node:
         default_factory=lambda: deque(maxlen=HISTORY_SAMPLES)
     )
     net_tests: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=NET_TEST_HISTORY))
+    tunnel_test: dict[str, Any] | None = None  # the last secure/direct tunnel measurement
     channel: Channel | None = None
     split_model: str = ""  # the split-mode model this helper serves right now
 
@@ -300,6 +301,7 @@ class Node:
             "capabilities": self.capabilities,
             "history": [list(h) for h in self.history],
             "net_tests": list(self.net_tests),
+            "tunnel_test": self.tunnel_test,
         }
 
 
@@ -328,6 +330,8 @@ class NodeRegistry:
             node.last_seen = _num(d.get("last_seen")) or None
             if isinstance(d.get("last_net_test"), dict):
                 node.net_tests.append(sanitize(d["last_net_test"]))
+            if isinstance(d.get("last_tunnel_test"), dict):
+                node.tunnel_test = sanitize(d["last_tunnel_test"])
             self.nodes[node_id] = node
 
     def _save(self, node: Node) -> None:
@@ -344,6 +348,7 @@ class NodeRegistry:
             hub_paused=node.hub_paused,
             tunnel_mode=node.tunnel_mode,
             last_net_test=node.net_tests[-1] if node.net_tests else None,
+            last_tunnel_test=node.tunnel_test,
         )
 
     # ----- lookup --------------------------------------------------------------------------
@@ -460,6 +465,11 @@ class NodeRegistry:
             name=node.name,
             **{k: result.get(k) for k in ("rtt_ms", "down_mbps", "up_mbps")},
         )
+
+    def record_tunnel_test(self, node: Node, result: dict[str, Any]) -> None:
+        node.tunnel_test = sanitize(result)
+        self._save(node)
+        self.emit("tunnel_test", node=node.node_id, name=node.name, overhead_pct=result.get("overhead_pct"))
 
     def forget(self, node: Node) -> None:
         if node.connected:

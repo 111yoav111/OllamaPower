@@ -2,14 +2,20 @@
 
 ``rpc-server`` executes whatever a connected client asks for and has no
 authentication, so it is only ever bound to ``127.0.0.1``. The hub reaches it
-through a relay owned by this agent:
+through this agent's relay (``tunnel.py``), which accepts only the hub's
+address and only while a session is active:
 
-* **direct mode** (Phase 3; both owners opted in): a plain TCP relay on the
-  interface the hub connects from, accepting connections **only from the
-  hub's address** and only while a session is active. Traffic is unencrypted.
-* **secure mode** (the default): a mutually authenticated TLS tunnel, which
-  arrives in Phase 4. Until then a secure-mode request is refused, so nothing
-  ever falls back to plaintext on its own.
+* **secure mode** (the default): TLS 1.3 with per-session certificates. The
+  hub sends its certificate in ``rpc_start``; the agent makes its own key and
+  answers with its certificate in ``rpc_ready``. Each side trusts only the
+  other's certificate for that session.
+* **direct mode** (both owners opted in): plain TCP, unencrypted. A request
+  for direct mode is refused unless this helper's owner allowed it, so
+  nothing ever falls back to plaintext on its own.
+
+A tunnel test (``purpose: "bench"``) runs the same relay in front of a small
+echo server instead of ``rpc-server``, so the hub can measure the path's
+latency and throughput, and the cost of encryption, without llama.cpp.
 
 The helper's owner stays in charge: the agent checks every ``rpc_start``
 against the lending rules itself (pause, GPU allow-list, CPU, direct mode,
@@ -23,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ipaddress
 import logging
 import os
 import socket
@@ -34,17 +39,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..core.tunnel import TunnelError, TunnelIdentity, cert_fingerprint, check_cert_pem
 from ..llamacpp.binaries import Device, LlamaCpp
 from ..llamacpp.manager import LlamaCppUnavailable, ensure
 from ..textsafe import safe_text
 from .config import AgentConfig, LendingRules
+from .tunnel import EchoTarget, HelperRelay
 
 log = logging.getLogger("ollamapower.agent.rpc")
 
 READY_TIMEOUT = 30.0  # seconds for rpc-server to accept connections
 STOP_GRACE = 5.0
-MAX_RELAY_CONNECTIONS = 8
-RELAY_CHUNK = 256 * 1024
+BENCH_TTL = 120.0  # a tunnel test's relay closes after this long, even if the hub never says stop
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 # When lending CPU/RAM, keep this much RAM for the helper's owner.
@@ -65,9 +71,7 @@ class RpcSession:
     started: float = field(default_factory=time.time)
     process: asyncio.subprocess.Process | None = None
     port: int = 0
-    relay: asyncio.Server | None = None
-    relay_port: int = 0
-    connections: set[asyncio.StreamWriter] = field(default_factory=set)
+    relay: HelperRelay | None = None
     output: deque[str] = field(default_factory=lambda: deque(maxlen=40))
     stopping: bool = False
     watcher: asyncio.Task[Any] | None = None
@@ -79,24 +83,19 @@ class RpcSession:
             "cap_mib": self.cap_mib,
             "model": self.model,
             "since": self.started,
-            "connections": len(self.connections),
+            "connections": len(self.relay.connections) if self.relay else 0,
+            "tunnel": self.relay.mode if self.relay else "",
         }
+
+    @property
+    def relay_port(self) -> int:
+        return self.relay.port if self.relay else 0
 
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
-
-
-def _same_ip(a: str, b: str) -> bool:
-    try:
-        x, y = ipaddress.ip_address(a), ipaddress.ip_address(b)
-    except ValueError:
-        return False
-    x = x.ipv4_mapped or x if isinstance(x, ipaddress.IPv6Address) else x
-    y = y.ipv4_mapped or y if isinstance(y, ipaddress.IPv6Address) else y
-    return x == y
 
 
 def device_cap_mib(device: Device, index: int, rules: LendingRules) -> int | None:
@@ -139,6 +138,7 @@ class RpcManager:
         self.error = ""
         self.progress: tuple[int, int] | None = None
         self.session: RpcSession | None = None
+        self.benches: dict[str, tuple[HelperRelay, EchoTarget, asyncio.TimerHandle]] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -232,16 +232,7 @@ class RpcManager:
                 )
             if paused:
                 raise RpcRefused("lending is paused by the helper's owner")
-            mode = message.get("tunnel", {}).get("mode", "secure")
-            if mode == "direct":
-                if not rules.allow_direct:
-                    raise RpcRefused("the helper's owner has not allowed direct (unencrypted) mode")
-            elif mode == "secure":
-                raise RpcRefused(
-                    "the encrypted tunnel arrives in Phase 4; for now both owners must opt in to direct mode"
-                )
-            else:
-                raise RpcRefused(f"unknown tunnel mode {safe_text(str(mode), 20)}")
+            tunnel = _Tunnel.from_message(message, rules)
             if self.session is not None:
                 await self._stop(self.session, "replaced by a new session")
             device, cap_mib, total_mib = await self._choose(message.get("device", ""), rules)
@@ -257,16 +248,18 @@ class RpcManager:
             cache = bool(message.get("cache")) and rules.disk_cache
             try:
                 await self._launch(session, cache)
-                await self._open_relay(session, bind_ip)
+                session.relay = tunnel.relay(session.port, hub_ip)
+                await session.relay.start(bind_ip)
             except BaseException:
                 await self._stop(session, "failed to start")
                 raise
             self.session = session
             self.note(
                 f"lending {device} ({cap_mib} MiB) to the hub for {session.model or 'a model'} "
-                f"(direct mode{', disk cache' if cache else ''})"
+                f"({tunnel.mode} tunnel{', disk cache' if cache else ''})"
             )
             return {
+                **tunnel.endpoint(),
                 "port": session.relay_port,
                 "device": device,
                 "free_mib": cap_mib,
@@ -344,40 +337,39 @@ class RpcManager:
         if self.on_failure is not None:
             await self.on_failure(session.session_id, error)
 
-    # ----- relay -------------------------------------------------------------------------
+    # ----- tunnel test -------------------------------------------------------------------
 
-    async def _open_relay(self, session: RpcSession, bind_ip: str) -> None:
-        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            peer = writer.get_extra_info("peername")
-            if (
-                not peer
-                or not _same_ip(peer[0], session.hub_ip)
-                or session.stopping
-                or len(session.connections) >= MAX_RELAY_CONNECTIONS
-            ):
-                log.warning("relay: refused a connection from %s", peer[0] if peer else "?")
-                writer.close()
-                return
-            try:
-                up_reader, up_writer = await asyncio.open_connection("127.0.0.1", session.port)
-            except OSError:
-                writer.close()
-                return
-            for w in (writer, up_writer):
-                sock = w.get_extra_info("socket")
-                if sock is not None:
-                    with contextlib.suppress(OSError):
-                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            session.connections.update((writer, up_writer))
-            try:
-                await asyncio.gather(_pipe(reader, up_writer), _pipe(up_reader, writer))
-            finally:
-                session.connections.difference_update((writer, up_writer))
-                for w in (writer, up_writer):
-                    w.close()
+    async def start_bench(
+        self, message: dict[str, Any], hub_ip: str, bind_ip: str, rules: LendingRules, paused: bool
+    ) -> dict[str, Any]:
+        """A relay in front of an echo server, so the hub can time the tunnel itself."""
+        if paused:
+            raise RpcRefused("lending is paused by the helper's owner")
+        tunnel = _Tunnel.from_message(message, rules)
+        session_id = message["session_id"]
+        if len(self.benches) >= 2:
+            raise RpcRefused("a tunnel test is already running")
+        target = EchoTarget()
+        await target.start()
+        relay = tunnel.relay(target.port, hub_ip)
+        try:
+            await relay.start(bind_ip)
+        except BaseException:
+            target.close()
+            raise
+        expiry = asyncio.get_running_loop().call_later(BENCH_TTL, self.stop_bench, session_id)
+        self.benches[session_id] = (relay, target, expiry)
+        return {**tunnel.endpoint(), "port": relay.port}
 
-        session.relay = await asyncio.start_server(handle, host=bind_ip, port=0)
-        session.relay_port = session.relay.sockets[0].getsockname()[1]
+    def stop_bench(self, session_id: str) -> bool:
+        bench = self.benches.pop(session_id, None)
+        if bench is None:
+            return False
+        relay, target, expiry = bench
+        expiry.cancel()
+        relay.close()
+        target.close()
+        return True
 
     # ----- stop --------------------------------------------------------------------------
 
@@ -396,8 +388,6 @@ class RpcManager:
         session.stopping = True
         if session.relay is not None:
             session.relay.close()
-        for w in list(session.connections):
-            w.close()
         proc = session.process
         if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
@@ -415,14 +405,37 @@ class RpcManager:
         log.info("rpc session %s stopped: %s", session.session_id[:8], reason)
 
 
-async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    try:
-        while data := await reader.read(RELAY_CHUNK):
-            writer.write(data)
-            await writer.drain()
-    except (OSError, asyncio.IncompleteReadError):
-        pass
-    finally:
-        with contextlib.suppress(OSError):
-            if writer.can_write_eof():
-                writer.write_eof()
+class _Tunnel:
+    """The tunnel an ``rpc_start`` asks for, checked against this helper's rules."""
+
+    def __init__(self, mode: str, hub_cert: str = "") -> None:
+        self.mode = mode
+        self.hub_cert = hub_cert
+        self.identity = TunnelIdentity.generate("helper") if mode == "secure" else None
+
+    @classmethod
+    def from_message(cls, message: dict[str, Any], rules: LendingRules) -> _Tunnel:
+        tunnel = message.get("tunnel") or {}
+        mode = tunnel.get("mode", "secure")
+        if mode == "direct":
+            if not rules.allow_direct:
+                raise RpcRefused("the helper's owner has not allowed direct (unencrypted) mode")
+            return cls("direct")
+        if mode == "secure":
+            try:
+                return cls("secure", check_cert_pem(tunnel.get("cert")))
+            except TunnelError as exc:
+                raise RpcRefused(f"secure tunnel: {exc}") from None
+        raise RpcRefused(f"unknown tunnel mode {safe_text(str(mode), 20)}")
+
+    def relay(self, target_port: int, hub_ip: str) -> HelperRelay:
+        if self.identity is None:
+            return HelperRelay(target_port, hub_ip)
+        tls = self.identity.context(server=True, peer_cert_pem=self.hub_cert)
+        return HelperRelay(target_port, hub_ip, tls, cert_fingerprint(self.hub_cert))
+
+    def endpoint(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"mode": self.mode}
+        if self.identity is not None:
+            out["cert"] = self.identity.cert_pem
+        return out

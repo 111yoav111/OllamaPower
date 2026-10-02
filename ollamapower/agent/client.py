@@ -293,7 +293,8 @@ class AgentClient:
         elif kind == "rpc_start":
             self._spawn(self._rpc_start(channel, m))  # starting takes a while; keep reading
         elif kind == "rpc_stop":
-            await self.rpc.stop(m["session_id"], "stopped by the hub")
+            if not self.rpc.stop_bench(m["session_id"]):
+                await self.rpc.stop(m["session_id"], "stopped by the hub")
             self.state.version += 1
 
     def _spawn(self, coro: Any) -> None:
@@ -317,7 +318,8 @@ class AgentClient:
         try:
             if peer is None or local is None:
                 raise RpcRefused("the connection to the hub is gone")
-            endpoint = await self.rpc.start(m, peer[0], local[0], self.config.lending, self.state.paused)
+            start = self.rpc.start_bench if m.get("purpose") == "bench" else self.rpc.start
+            endpoint = await start(m, peer[0], local[0], self.config.lending, self.state.paused)
         except RpcRefused as exc:
             self.state.note(f"split session refused: {exc}")
             with contextlib.suppress(Exception):

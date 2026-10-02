@@ -81,6 +81,7 @@ def make_cluster(
     make_config: Any,
     hub_devices: list[str],
     real_binaries: Path | None = None,
+    tunnel: str = "secure",
     **lending: Any,
 ) -> Any:
     upstream, rec = fake_ollama
@@ -130,7 +131,8 @@ def make_cluster(
         return bool(node and node.connected and (node.capabilities.get("llama_cpp") or {}).get("status") == "ready")
 
     assert wait_for(ready, 15), "the agent never reported a ready llama.cpp"
-    c.call(lambda: hub.registry.set_tunnel_mode(c.node, "direct"))
+    if tunnel == "direct":
+        c.call(lambda: hub.registry.set_tunnel_mode(c.node, "direct"))
 
     def close() -> None:
         async def stop() -> None:
@@ -187,10 +189,14 @@ def test_planned_model_runs_split_with_the_helper(cluster, client):
     assert args[args.index("-c") + 1] == "512"
     assert args[args.index("--fit") + 1] == "off"
     assert args[args.index("-m") + 1] == str(c.model_path)
+    # Secure by default: llama-server talks to the hub's local relay, which speaks TLS to the helper's relay.
     rpc_host, rpc_port = args[args.index("--rpc") + 1].rsplit(":", 1)
-    assert rpc_host == "127.0.0.1"
-    assert int(rpc_port) == c.agent.rpc.session.relay_port  # the relay, never the rpc-server itself
-    assert c.agent.rpc.session.port != int(rpc_port)
+    lease = c.call(lambda: c.hub.split.session.leases[0])
+    assert rpc_host == "127.0.0.1" and int(rpc_port) == lease.relay.port
+    assert lease.mode == "secure" and lease.relay.client.ctx is not None
+    assert lease.relay.client.port == c.agent.rpc.session.relay_port  # the helper's relay, never rpc-server
+    assert c.agent.rpc.session.relay.mode == "secure"
+    assert c.agent.rpc.session.port != c.agent.rpc.session.relay_port
 
     # Ollama gave its GPU up first and never saw the chat.
     assert c.rec.ps_models == []
@@ -317,7 +323,7 @@ def test_relay_only_accepts_the_hub(cluster, client):
     c.admin("models.plan", model="tiny", ctx=512)
     assert chat(client, c).status_code == 200
     session = c.agent.rpc.session
-    session.hub_ip = "10.9.9.9"  # pretend the hub is elsewhere: a local connection must now be refused
+    session.relay.hub_ip = "10.9.9.9"  # pretend the hub is elsewhere: a local connection must now be refused
 
     async def probe() -> bytes:
         reader, writer = await asyncio.open_connection("127.0.0.1", session.relay_port)
@@ -332,13 +338,85 @@ def test_relay_only_accepts_the_hub(cluster, client):
     assert c.run(probe()) == b""
 
 
-def test_helper_without_direct_opt_in_is_not_used(tmp_path, fake_ollama, make_config, client):
+def test_secure_relay_refuses_a_wrong_certificate_and_plain_tcp(cluster, client):
+    from ollamapower.core.tunnel import TunnelIdentity
+    from ollamapower.hub.tunnel import TunnelClient
+
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    assert chat(client, c).status_code == 200
+    session = c.agent.rpc.session
+    helper_cert_pem = c.call(lambda: c.hub.split.session.leases[0].endpoint["cert"])
+
+    async def impostor() -> bytes:
+        # Right address, a certificate the hub never sent: the helper must not relay anything.
+        evil = TunnelClient("127.0.0.1", session.relay_port, TunnelIdentity.generate("evil"), helper_cert_pem)
+        reader, writer = await evil.open()
+        writer.write(b"ping")
+        try:
+            return await asyncio.wait_for(reader.read(4), 2)
+        except (ConnectionResetError, OSError):
+            return b""
+        finally:
+            writer.close()
+
+    async def plaintext() -> bytes:
+        reader, writer = await asyncio.open_connection("127.0.0.1", session.relay_port)
+        writer.write(b"ping")
+        try:
+            return await asyncio.wait_for(reader.read(4), 3)
+        except (ConnectionResetError, OSError, TimeoutError):
+            return b""
+        finally:
+            writer.close()
+
+    assert c.run(impostor()) == b""
+    assert c.run(plaintext()) != b"ping"
+    assert chat(client, c).status_code == 200  # the real hub still gets through
+
+
+def test_direct_mode_needs_both_owners(tmp_path, fake_ollama, make_config, client):
+    c, close = make_cluster(tmp_path, fake_ollama, make_config, hub_devices=[], tunnel="direct", allow_direct=False)
+    try:
+        c.admin("models.plan", model="tiny", ctx=512)
+        assert chat(client, c).status_code == 200
+        assert (
+            c.agent.rpc.session.relay.mode == "secure"
+        )  # the hub asked for direct; the helper's owner didn't allow it
+        assert any("direct mode requested" in w for w in c.call(c.hub.warnings))
+    finally:
+        close()
+
+
+def test_direct_mode_end_to_end(tmp_path, fake_ollama, make_config, client):
+    c, close = make_cluster(tmp_path, fake_ollama, make_config, hub_devices=[], tunnel="direct")
+    try:
+        c.admin("models.plan", model="tiny", ctx=512)
+        assert chat(client, c).status_code == 200
+        lease = c.call(lambda: c.hub.split.session.leases[0])
+        assert lease.mode == "direct" and lease.relay is None
+        rpc = c.server_args()[c.server_args().index("--rpc") + 1]
+        assert rpc == f"127.0.0.1:{c.agent.rpc.session.relay_port}"  # straight to the helper's relay
+        assert c.agent.rpc.session.relay.mode == "direct"
+        assert any("unencrypted" in w for w in c.call(c.hub.warnings))
+    finally:
+        close()
+
+
+def test_tunnel_test_measures_both_modes(cluster):
+    c = cluster
+    r = c.admin("nodes.tunnel_test", ref="desk")
+    assert r["secure"]["mode"] == "secure" and r["secure"]["mbps"] > 0 and r["secure"]["rtt_ms"] > 0
+    assert r["direct"]["mode"] == "direct" and "overhead_pct" in r
+    assert c.node.tunnel_test["secure"]["mbps"] == r["secure"]["mbps"]
+    assert wait_for(lambda: not c.agent.rpc.benches, 5)  # the helper closed the test relay
+
+
+def test_tunnel_test_without_direct_permission_measures_secure_only(tmp_path, fake_ollama, make_config):
     c, close = make_cluster(tmp_path, fake_ollama, make_config, hub_devices=[], allow_direct=False)
     try:
-        preview = c.admin("models.plan", model="tiny", ctx=512)
-        assert not preview["helpers"] and "direct mode" in preview["unavailable"][0]
-        chat(client, c)
-        assert c.rec.last["path"] == "/api/chat"
+        r = c.admin("nodes.tunnel_test", ref="desk")
+        assert "secure" in r and "direct" not in r and "overhead_pct" not in r
     finally:
         close()
 
@@ -391,3 +469,10 @@ def test_idle_session_stops_after_keep_alive(cluster, client, monkeypatch):
     assert wait_for(lambda: not c.call(lambda: c.hub.split.is_running("tiny")), 5)
     assert wait_for(lambda: c.agent.rpc.session is None, 5)
     time.sleep(0.05)
+
+
+def test_tunnel_test_refuses_an_older_agent(cluster):
+    c = cluster
+    c.node.protocol = "1.0"
+    with pytest.raises(AdminError, match="older agent"):
+        c.admin("nodes.tunnel_test", ref="desk")

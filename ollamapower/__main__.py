@@ -32,6 +32,7 @@ from .cli_common import (
     refuse_root,
     show,
     ts,
+    tunnel_test_lines,
 )
 from .textsafe import safe
 
@@ -453,6 +454,9 @@ def render_node(d: dict[str, Any]) -> Lines:
                 None,
             )
         )
+    if d.get("tunnel_test"):
+        for line in tunnel_test_lines(d["tunnel_test"]):
+            lines.append((f"{'Tunnel:':12} {safe(line)}", None))
     lines.extend((f"⚠ {safe(w)}", typer.colors.YELLOW) for w in d["warnings"])
     return lines
 
@@ -496,6 +500,21 @@ def nodes_kick(
     typer.echo(f"Disconnected {safe(d['name'])}.")
 
 
+@nodes_cli.command("tunnel-test")
+def nodes_tunnel_test(
+    node: str, config_path: Path | None = ConfigOption, as_json: bool = typer.Option(False, "--json")
+) -> None:
+    """Measure the split-mode tunnel to a helper: secure (TLS), and direct if its owner allows it."""
+    r = call(load(config_path).config_dir, "nodes.tunnel_test", ref=node, timeout=180)
+    if as_json:
+        typer.echo(json.dumps(r, indent=2))
+        return
+    for line in tunnel_test_lines(r):
+        typer.echo(line)
+    if r.get("direct") is None:
+        typer.echo("(direct mode not measured: the helper's owner hasn't allowed it)")
+
+
 @nodes_cli.command("net-test")
 def nodes_net_test(
     node: str, config_path: Path | None = ConfigOption, as_json: bool = typer.Option(False, "--json")
@@ -520,7 +539,7 @@ def nodes_tunnel(
     config_path: Path | None = ConfigOption,
     yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation"),
 ) -> None:
-    """Choose how split-mode traffic to a helper travels (used from Phase 4)."""
+    """Choose how split-mode traffic to a helper travels: secure (TLS, default) or direct."""
     if mode == "direct" and not yes:
         typer.secho(
             "Direct mode sends split-mode traffic (weights, activations) UNENCRYPTED over your LAN. Only use it on a "

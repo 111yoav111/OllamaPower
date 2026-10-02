@@ -31,6 +31,21 @@ ConfigDirOption = typer.Option(
 )
 
 
+def _lent_text(lent: dict[str, Any] | None) -> str:
+    if not lent:
+        return "nothing"
+    return (
+        f"{lent['device']} ({lent['cap_mib']} MiB) for {lent['model'] or 'a model'}, "
+        f"{lent.get('tunnel') or '?'} tunnel, since {ts(lent['since'])}"
+    )
+
+
+def _llama_text(lc: dict[str, Any]) -> str:
+    if lc.get("status") == "ready":
+        return f"build {lc.get('build')}, " + (", ".join(d["name"] for d in lc.get("devices", [])) or "CPU only")
+    return f"{lc.get('status', '?')} {lc.get('error', '')}".strip()
+
+
 def _config_dir(value: Path | None) -> Path:
     import os
 
@@ -177,7 +192,8 @@ def render_agent(s: dict[str, Any]) -> Lines:
         ),
         ("Helper", f"{s['name']} ({s['node_id']})"),
         ("Lending", "PAUSED" if s["paused"] else "on"),
-        ("Lent now", "nothing (split mode arrives in Phase 3)"),
+        ("Lent now", _lent_text(s.get("lent"))),
+        ("llama.cpp", _llama_text(s.get("llama_cpp") or {})),
         ("Rules", json.dumps({k: v for k, v in r.items() if k != "paused"})),
         ("Link", f"{s['network'].get('kind', '?')} via {s['network'].get('interface', '?')}"),
     ]

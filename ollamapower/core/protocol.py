@@ -24,7 +24,7 @@ from typing import Any
 
 from .packets import PACKET_FLAGS, PayloadKind, TaskPacket
 
-PROTOCOL_VERSION = "1.0"
+PROTOCOL_VERSION = "1.1"
 MAX_STRING = 4096
 MAX_TOKEN = 512
 
@@ -43,6 +43,13 @@ def protocol_major(version: str) -> int:
     try:
         return int(str(version).split(".", 1)[0])
     except ValueError:
+        return -1
+
+
+def protocol_minor(version: str) -> int:
+    try:
+        return int(str(version).split(".", 1)[1])
+    except (IndexError, ValueError):
         return -1
 
 
@@ -105,6 +112,7 @@ SCHEMAS: dict[str, tuple[Direction, dict[str, Field]]] = {
             "cache": (BOOL, True),
             "tunnel": (DICT, True),
             "model": (STR, False),
+            "purpose": (STR, False),  # "rpc" (default) or "bench" (a tunnel test; added in 1.1)
         },
     ),
     "rpc_ready": (Direction.TO_HUB, {"session_id": (STR, True), "endpoint": (DICT, False)}),
@@ -175,6 +183,8 @@ def _check_values(m: dict[str, Any]) -> None:
             raise ProtocolError("rpc_start: vram_cap_mb or device out of range")
         if m["tunnel"].get("mode") not in TUNNEL_MODES:
             raise ProtocolError("rpc_start: unknown tunnel mode")
+        if m.get("purpose", "rpc") not in ("rpc", "bench"):
+            raise ProtocolError("rpc_start: unknown purpose")
 
 
 def valid_node_id(value: str) -> bool:

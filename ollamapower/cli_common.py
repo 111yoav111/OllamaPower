@@ -128,3 +128,17 @@ def show(fetch: Callable[[], Any], render: Callable[[Any], Lines], as_json: bool
             time.sleep(WATCH_INTERVAL)
     except KeyboardInterrupt:
         pass
+
+
+def tunnel_test_lines(r: dict[str, Any]) -> list[str]:
+    lines = []
+    for mode in ("secure", "direct"):
+        m = r.get(mode)
+        if isinstance(m, dict):
+            lines.append(
+                f"{mode:7} RTT {m.get('rtt_ms')} ms (p95 {m.get('rtt_p95_ms')}), {m.get('mbps')} Mbps, "
+                f"connect {m.get('connect_ms')} ms"
+            )
+    if r.get("overhead_pct") is not None:
+        lines.append(f"Encryption costs {r['overhead_pct']}% throughput and {r['rtt_overhead_ms']} ms per round trip.")
+    return lines

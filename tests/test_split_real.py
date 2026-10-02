@@ -2,8 +2,9 @@
 
 Runs only when ``OLLAMAPOWER_TEST_LLAMACPP`` points to an unpacked build of the
 pinned release (CI doesn't download it). Everything is real except Ollama:
-the hub starts ``llama-server`` with ``--rpc`` through the helper's relay to a
-real ``ggml-rpc-server``, and the layers are computed on the helper.
+the hub starts ``llama-server`` with ``--rpc`` through the tunnel (TLS, or
+direct) and the helper's relay to a real ``ggml-rpc-server``, and the layers
+are computed on the helper.
 """
 
 from __future__ import annotations
@@ -24,9 +25,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_real_llama_cpp_split_over_the_relay(tmp_path, fake_ollama, make_config):
+@pytest.mark.parametrize("tunnel", ["secure", "direct"])
+def test_real_llama_cpp_split_over_the_relay(tmp_path, fake_ollama, make_config, tunnel):
     c, close = make_cluster(
-        tmp_path, fake_ollama, make_config, hub_devices=[], real_binaries=Path(BUILD_DIR), allow_cpu=True
+        tmp_path,
+        fake_ollama,
+        make_config,
+        hub_devices=[],
+        real_binaries=Path(BUILD_DIR),
+        tunnel=tunnel,
+        allow_cpu=True,
     )
     try:
         c.admin("models.plan", model="tiny", ctx=256)
@@ -50,7 +58,7 @@ def test_real_llama_cpp_split_over_the_relay(tmp_path, fake_ollama, make_config)
         assert plan.cpu_layers == 0 and [p.device.device for p in plan.placements] == ["CPU"]
         assert plan.placements[0].layers == 5  # every layer on the helper
         rpc = c.agent.rpc.session
-        assert rpc.device == "CPU"
+        assert rpc.device == "CPU" and rpc.relay.mode == tunnel
         assert any("Accepted client connection" in line for line in rpc.output)  # llama-server really used it
         assert c.admin("models.unplan", model="tiny")["stopped"]
         assert wait_for(lambda: c.agent.rpc.session is None, 10)
