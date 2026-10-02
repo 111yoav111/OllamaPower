@@ -6,13 +6,13 @@ the Hub exactly as they talk to Ollama today; the Hub decides, per model, whethe
 a helper can make it faster or let it run a model that doesn't fit, and only
 uses a helper when a benchmark proves it wins.
 
-> **Status: Phase 3 (split mode MVP).** The hub runs in front of your Ollama
+> **Status: Phase 4 (secure tunnel).** The hub runs in front of your Ollama
 > with a priority queue and a terminal UI; helpers join and report their GPUs,
 > and a model you plan for split mode runs across the hub's GPU and the
-> helpers' GPUs with llama.cpp. For now split mode needs **direct mode**
-> (plain TCP on a trusted, wired LAN, opted in by both owners); the encrypted
-> tunnel arrives in Phase 4, and automatic plans with benchmarks in Phase 5.
-> Everything else is served by your local Ollama, exactly as before.
+> helpers' GPUs with llama.cpp. Split-mode traffic is encrypted by default
+> (mutually authenticated TLS 1.3); unencrypted direct mode is an opt-in by
+> both owners. Automatic plans with benchmarks arrive in Phase 5. Everything
+> else is served by your local Ollama, exactly as before.
 
 ## What it can and can't do
 
@@ -69,14 +69,14 @@ listen on anything but loopback (remote access is OllamaGate's job).
 
 | Tab | Shows |
 |---|---|
-| **1 Overview** | front door, Ollama, queue, requests, helpers and lendable VRAM, control-plane port and key fingerprint, the hub's GPU/VRAM bars, loaded models (VRAM %, last tok/s, spill warning), active requests, recent events, warnings |
+| **1 Overview** | front door, Ollama, queue, the running split session (layers per device), requests, helpers and lendable VRAM, control-plane port and key fingerprint, the hub's GPU/VRAM bars, loaded models (VRAM %, last tok/s, spill warning), active requests, recent events, warnings |
 | **2 Nodes** | every helper: status (🟢 lending · 🟡 paused · 🔴 offline · ⚠ incompatible), name, IP, GPU, VRAM total/free/lendable, GPU %, CPU/RAM, link (RTT, Mbps, wired/Wi-Fi), role, tunnel mode |
-| **3 Node detail** | full capabilities, GPU/VRAM/CPU sparklines, network-test history |
+| **3 Node detail** | full capabilities, GPU/VRAM/CPU sparklines, network-test history, last tunnel test (secure vs direct) |
 | **4 Models** | installed models: size, quantisation, loaded VRAM %, whether they fit the hub's VRAM, plan, last tok/s |
 | **5 Log** | filterable event feed: joins, leaves, pauses, bans, failed logins, net tests |
 
 Keys: `1`–`5` tabs · `Enter` helper details · `P` pause/resume a helper (the
-hub stops using it) · `K` kick · `N` network test · `T` tunnel mode · `X`
+hub stops using it) · `K` kick · `N` network test · `T` tunnel mode · `M` tunnel test · `X`
 forget an offline helper · `/` filter · `Q` quit. Destructive actions ask
 first. `B`/`L`/`F` (benchmark, pin plan, force local) arrive with the planner.
 
@@ -182,6 +182,7 @@ ollamapower nodes pause|resume <name|id>      # the hub stops/starts using it
 ollamapower nodes kick <name|id>              # disconnect now (it reconnects after a minute)
 ollamapower nodes net-test <name|id>          # round-trip time and throughput both ways
 ollamapower nodes tunnel <name|id> secure|direct
+ollamapower nodes tunnel-test <name|id>       # split-mode tunnel speed: secure, and direct if allowed
 ollamapower nodes forget <name|id>            # an offline helper and its settings
 ollamapower models list [--json]
 ```
@@ -189,13 +190,30 @@ ollamapower models list [--json]
 ### Tunnel modes (how split-mode traffic travels)
 
 - **secure** (default): mutually authenticated TLS 1.3 between the hub and
-  the helper. **Arrives in Phase 4**; until then a helper in secure mode is
-  simply not used for split mode (it never falls back to plaintext on its own).
+  the helper. For every split session both sides make a fresh key and
+  certificate and exchange only the certificates, over the already
+  authenticated control channel; each side then trusts exactly the other's
+  certificate for that session. `llama-server` on the hub talks to a local
+  relay, which carries the traffic through TLS to the helper's relay, which
+  hands it to `rpc-server` on the helper's loopback.
 - **direct**: plain TCP on a trusted, wired LAN, a bit faster. It is used only
   if **both** owners opt in - the hub's owner with `nodes tunnel <helper>
-  direct` (or `T`), the helper's owner with `allow_direct`. While it is on,
-  the TUI and `status` show a warning. The helper's relay accepts connections
-  only from the hub's address and only while a session runs.
+  direct` (or `T`), the helper's owner with `allow_direct`; if only one did,
+  secure is used. While it is on, the TUI and `status` show a warning.
+
+In both modes the helper's relay listens only while a session runs, and
+drops any connection that doesn't come from the hub's address before reading
+a byte (so strangers can't even start a TLS handshake).
+
+**What does encryption cost?** `ollamapower nodes tunnel-test <helper>` (or
+`M` on the Nodes tab) sends traffic through the real path - the helper's
+relay to a small echo server - and reports round-trip time and throughput for
+secure mode, and for direct mode too if the helper's owner allows it, plus the
+difference. The result is kept and shown in `nodes show`. On our test machine
+(loopback, 4 CPUs) the Python TLS relay carried about 1.8-2 Gbit/s and added
+about 0.03 ms per round trip: more than a gigabit LAN can carry, and under 1 %
+of a typical token's time for real models. Measure your own LAN; see
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## Split mode
 
@@ -288,16 +306,16 @@ env var). On disk, all owner-only: `config.toml`, `.env`, `hub_key.pem`,
 ```
 clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
               ├─ local-ollama → Ollama on 127.0.0.1:11435
-              └─ split        → llama-server --rpc → helpers' rpc-server (direct relay; mTLS tunnel in Phase 4)
+              └─ split        → llama-server --rpc → local relay ══ TLS 1.3 ══► helper relay → rpc-server (127.0.0.1)
 ```
 
 - **Ollama doesn't do multi-machine inference.** Split mode uses llama.cpp's RPC
   backend (`rpc-server` on helpers, `llama-server --rpc` on the Hub), loading the
   GGUF blob Ollama already has on disk, so there is no second copy of the model.
 - llama.cpp RPC has no authentication or encryption, so `rpc-server` only ever
-  listens on the helper's loopback. The Hub reaches it through the agent's
-  relay: plain TCP limited to the hub's address in direct mode, a mutually
-  authenticated TLS 1.3 tunnel from Phase 4.
+  listens on the helper's loopback. The Hub reaches it through a mutually
+  authenticated TLS 1.3 tunnel (or, if both owners opt in, plain TCP limited
+  to the hub's address).
 - No GUI, ever: a terminal UI (Textual) plus a full CLI, and a headless mode.
 
 ## Roadmap
@@ -307,8 +325,8 @@ clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
 | 0 Bootstrap (done) | Style notes, DCP reuse map, DCP networking/crypto/auth/scheduling ported with tests, lint + test + audit CI |
 | 1 Front door (done) | Ollama-compatible passthrough with true streaming, priority queue, `/ollamapower/status`, `doctor` port migration |
 | 2 Agents & telemetry (done) | Control plane with protocol version and Hub key pinning, GPU telemetry, net tests, Hub and agent TUIs, CLI |
-| **3 Split MVP** (done) | llama.cpp pin/download/verify, Ollama blob resolver, `rpc-server`/`llama-server` lifecycle, layer placement under the lending caps, API translation, direct-mode relay |
-| 4 Secure tunnel | mTLS relays, IP allowlist, opt-in trusted-LAN direct mode, overhead measured |
+| 3 Split MVP (done) | llama.cpp pin/download/verify, Ollama blob resolver, `rpc-server`/`llama-server` lifecycle, layer placement under the lending caps, API translation, direct-mode relay |
+| **4 Secure tunnel** (done) | Per-session pinned TLS 1.3 relays, hub-address allowlist checked before TLS, two-owner direct mode, `nodes tunnel-test` overhead measurement |
 | 5 Planner | Memory estimate, spill detection, benchmarks, automatic "never slower" plan choice, fault tolerance |
 | 6 Lending & polish | Schedules, auto-yield, real benchmark numbers, start scripts |
 
@@ -334,7 +352,7 @@ OLLAMAPOWER_TEST_LLAMACPP=/path/to/llama-b11347 .venv/bin/python -m pytest -q te
 Lock files are generated with
 `uv pip compile pyproject.toml [--extra dev] --universal --generate-hashes --python-version 3.11`.
 
-Project docs: [`docs/STYLE_NOTES.md`](docs/STYLE_NOTES.md) (conventions shared
+Project docs: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) (real measurements), [`docs/STYLE_NOTES.md`](docs/STYLE_NOTES.md) (conventions shared
 with OllamaGate), [`docs/DCP_REUSE.md`](docs/DCP_REUSE.md) (what came from DCP
 and why), [`SECURITY.md`](SECURITY.md).
 
