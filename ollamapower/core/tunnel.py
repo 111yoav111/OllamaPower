@@ -30,6 +30,7 @@ import socket
 import ssl
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from cryptography import x509
@@ -189,10 +190,14 @@ def nodelay(writer: asyncio.StreamWriter) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
-async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
+async def pipe(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, count: Callable[[int], None] | None = None
+) -> bool:
     """Copy until EOF; True if the EOF could be passed on (half-close), so the other way may go on."""
     try:
         while data := await reader.read(RELAY_CHUNK):
+            if count is not None:
+                count(len(data))
             writer.write(data)
             await writer.drain()
     except (OSError, asyncio.IncompleteReadError, ssl.SSLError):
@@ -207,7 +212,9 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bo
 
 
 async def splice(
-    a: tuple[asyncio.StreamReader, asyncio.StreamWriter], b: tuple[asyncio.StreamReader, asyncio.StreamWriter]
+    a: tuple[asyncio.StreamReader, asyncio.StreamWriter],
+    b: tuple[asyncio.StreamReader, asyncio.StreamWriter],
+    count_a_to_b: Callable[[int], None] | None = None,
 ) -> None:
     """Relay two connections into each other until both directions are done, then close both.
 
@@ -216,7 +223,7 @@ async def splice(
     """
     for _, w in (a, b):
         nodelay(w)
-    tasks = {asyncio.ensure_future(pipe(a[0], b[1])), asyncio.ensure_future(pipe(b[0], a[1]))}
+    tasks = {asyncio.ensure_future(pipe(a[0], b[1], count_a_to_b)), asyncio.ensure_future(pipe(b[0], a[1]))}
     try:
         while tasks:
             done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

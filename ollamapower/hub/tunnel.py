@@ -93,6 +93,7 @@ class HubRelay:
         self.connections: set[asyncio.StreamWriter] = set()
         self.failures = 0
         self.refused = 0
+        self.bytes_out = 0  # hub -> helper: mostly model weights while loading
         self.last_error = ""
 
     async def start(self) -> int:
@@ -113,7 +114,7 @@ class HubRelay:
         try:
             r_reader, remote = await self.client.open()
             self.connections.add(remote)
-            await splice((reader, writer), (r_reader, remote))
+            await splice((reader, writer), (r_reader, remote), self._count)
         except (OSError, TimeoutError, ssl.SSLError, TunnelError) as exc:
             self.failures += 1
             self.last_error = type(exc).__name__
@@ -123,6 +124,9 @@ class HubRelay:
                 if w is not None:
                     self.connections.discard(w)
                     w.close()
+
+    def _count(self, n: int) -> None:
+        self.bytes_out += n
 
     def close(self) -> None:
         if self.server is not None:

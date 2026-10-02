@@ -569,28 +569,36 @@ def nodes_forget(
 # ----- models --------------------------------------------------------------------------
 
 
+def _tps(value: Any) -> str:
+    return "-" if value is None else f"{value:.1f}"
+
+
 def render_models(models: list[dict[str, Any]]) -> Lines:
     if not models:
         return [("No models (is Ollama reachable?)", None)]
     lines: Lines = [
-        (f"{'MODEL':40} {'SIZE':>10} {'PARAMS':>7} {'QUANT':8} {'LOADED':8} {'FITS':6} {'PLAN':13} TOK/S", None)
+        (
+            f"{'MODEL':34} {'SIZE':>10} {'QUANT':8} {'LOADED':7} {'FITS':5} {'ENGINE':13} {'MODE':6} "
+            f"{'LOCAL':>6} {'SPLIT':>6} WHY",
+            None,
+        )
     ]
     for m in models:
         fits = "?" if m["fits"] is None else ("yes" if m["fits"] else "no")
+        if not m.get("fits_estimated") and m["fits"] is not None:
+            fits += "~"
         loaded = f"{m['vram_percent']}%" if m["loaded"] else "-"
-        tps = "-" if m["last_gen_tps"] is None else f"{m['last_gen_tps']:.1f}"
-        plan = m["plan"] + (" (on)" if m.get("running_split") else "")
-        color = typer.colors.YELLOW if m["fits"] is False else None
+        engine = m["plan"] + (" ●" if m.get("running_split") else "")
+        color = typer.colors.YELLOW if m.get("plan_degraded") or m.get("spilled") else None
         lines.append(
             (
-                f"{safe(m['name'])[:40]:40} {_human(m['size']):>10} {safe(m['parameters']):>7} "
-                f"{safe(m['quantization']):8} {loaded:8} {fits:6} {plan:13} {tps}",
+                f"{safe(m['name'])[:34]:34} {_human(m['size']):>10} {safe(m['quantization']):8} {loaded:7} {fits:5} "
+                f"{engine:13} {m['plan_mode']:6} {_tps(m['plan_local_tps']):>6} {_tps(m['plan_split_tps']):>6} "
+                f"{safe(m['plan_why'])[:70]}",
                 color,
             )
         )
-    lines.append(
-        ("FITS is a rough estimate. `ollamapower models plan <model> --split` spreads a model over helpers.", None)
-    )
+    lines.append(("LOCAL/SPLIT: generation tok/s from the last benchmark. FITS ~ = rough (size + 20 %).", None))
     return lines
 
 
@@ -605,6 +613,109 @@ def models_list(
     show(lambda: call(config.config_dir, "models.list"), render_models, as_json, watch)
 
 
+@models_cli.command("show")
+def models_show(
+    model: str, config_path: Path | None = ConfigOption, as_json: bool = typer.Option(False, "--json")
+) -> None:
+    """A model's plan, why it runs where it runs, its memory estimate and benchmark history."""
+    d = call(load(config_path).config_dir, "models.show", model=model, timeout=60)
+    if as_json:
+        typer.echo(json.dumps(d, indent=2))
+        return
+    f = d["facts"]
+    typer.echo(f"{safe(d['model'])}: served by {d['engine']} ({d['mode']}) - {safe(d['why'])}")
+    if f.get("splittable"):
+        verdict = "fits" if f["fits"] else "does NOT fit" if f["fits"] is False else "?"
+        typer.echo(
+            f"  Memory:     {_human(f['needed'])} needed at context {d['ctx']} (weights + KV cache + margin); "
+            f"hub VRAM {_human(f['hub_vram'])}: {verdict}" + (" · Ollama spilled it to the CPU" if f["spilled"] else "")
+        )
+        typer.echo(f"  Model:      {f['layers']} layers, {safe(f['architecture'])}")
+    else:
+        typer.echo(f"  Split mode: not possible ({safe(f.get('reason', ''))})")
+    typer.echo(f"  Helpers now: {', '.join(safe(h) for h in d['helpers_now']) or 'none eligible'}")
+    if d["record"]["exclude"]:
+        typer.echo(f"  Excluded:   {', '.join(x[:8] for x in d['record']['exclude'])}")
+    if d["benchmarks"]:
+        typer.echo(
+            f"\n  {'WHEN':19} {'ENGINE':6} {'GEN TOK/S':>9} {'PROMPT':>8} {'TTFT':>8} {'LOAD':>7}  HELPERS / ERROR"
+        )
+        for b in d["benchmarks"]:
+            helpers = ", ".join(f"{h['name']} ({h['tunnel']})" for h in b.get("helpers") or [])
+            detail = helpers if b.get("ok") else f"failed: {b.get('error', '')}"
+            typer.echo(
+                f"  {ts(b['ts'])} {b['engine']:6} {_tps(b.get('gen_tps')):>9} {_tps(b.get('prompt_tps')):>8} "
+                f"{(str(b.get('ttft_ms')) + ' ms') if b.get('ttft_ms') is not None else '-':>8} "
+                f"{(str(b.get('load_s')) + ' s') if b.get('load_s') is not None else '-':>7}  {safe(detail)}"
+            )
+
+
+@models_cli.command("benchmark")
+def models_benchmark(
+    model: str,
+    ctx: int | None = typer.Option(None, "--ctx", help="Context size (default: the plan's, else split.default_ctx)"),
+    config_path: Path | None = ConfigOption,
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Benchmark a model on plain Ollama and with helpers, then pick the faster (never slower)."""
+    config = load(config_path)
+    typer.echo(f"Benchmarking {model}: Ollama first, then split mode. Loading can take minutes the first time…")
+    d = call(config.config_dir, "models.benchmark", model=model, ctx=ctx, timeout=config.split.load_timeout * 4 + 600)
+    if as_json:
+        typer.echo(json.dumps(d, indent=2))
+        return
+    for r in [d["local"], *d["splits"]]:
+        name = (
+            "Ollama" if r["engine"] == "local" else "split (" + ", ".join(h["name"] for h in r.get("helpers", [])) + ")"
+        )
+        if r["ok"]:
+            typer.echo(
+                f"  {safe(name):40} {r['gen_tps']:7.1f} tok/s · prompt {_tps(r.get('prompt_tps'))} tok/s · "
+                f"first token {r['ttft_ms']} ms · load {r['load_s']} s"
+            )
+        else:
+            typer.secho(f"  {safe(name):40} failed: {safe(r['error'])}", fg=typer.colors.YELLOW)
+    typer.echo(f"Result: {d.get('choice') or '-'} - {safe(d.get('reason', ''))}")
+
+
+@models_cli.command("pin")
+def models_pin(
+    model: str,
+    engine: str = typer.Argument(..., help="split or local"),
+    ctx: int | None = typer.Option(None, "--ctx", help="Context size for split mode"),
+    config_path: Path | None = ConfigOption,
+) -> None:
+    """Always use one engine for a model (overrides the benchmark; `unpin` goes back to automatic)."""
+    d = call(load(config_path).config_dir, "models.pin", model=model, engine=engine, ctx=ctx, timeout=60)
+    typer.echo(f"{safe(d['model'])}: pinned to {engine} - now served by {d['engine']}.")
+
+
+@models_cli.command("unpin")
+def models_unpin(model: str, config_path: Path | None = ConfigOption) -> None:
+    """Let the benchmark decide again (automatic mode)."""
+    d = call(load(config_path).config_dir, "models.unpin", model=model)
+    typer.echo(f"{safe(d['model'])}: automatic - served by {d['engine']} ({safe(d['why'])}).")
+
+
+@models_cli.command("force-local")
+def models_force_local(model: str, config_path: Path | None = ConfigOption) -> None:
+    """Always serve a model with plain Ollama, whatever the benchmark says."""
+    d = call(load(config_path).config_dir, "models.force_local", model=model)
+    typer.echo(f"{safe(d['model'])}: forced to local Ollama.")
+
+
+@models_cli.command("exclude")
+def models_exclude(
+    model: str,
+    helper: str,
+    undo: bool = typer.Option(False, "--undo", help="Allow the helper again"),
+    config_path: Path | None = ConfigOption,
+) -> None:
+    """Don't use a helper for a model (--undo allows it again)."""
+    d = call(load(config_path).config_dir, "models.exclude", model=model, node=helper, exclude=not undo)
+    typer.echo(f"{safe(d['model'])}: {len(d['exclude'])} helper(s) excluded.")
+
+
 @models_cli.command("plan")
 def models_plan(
     model: str = typer.Argument(..., help="An installed Ollama model, e.g. llama3.1:70b"),
@@ -613,7 +724,7 @@ def models_plan(
     config_path: Path | None = ConfigOption,
     as_json: bool = typer.Option(False, "--json", help="Print JSON"),
 ) -> None:
-    """Choose how a model runs. Today: --split (spread over helpers' GPUs via llama.cpp)."""
+    """Pin a model to split mode (same as `models pin <model> split`, with a preview)."""
     if not split:
         typer.secho("Say how: --split (the only plan so far; `models unplan` goes back to Ollama).", fg="red", err=True)
         raise typer.Exit(2)
@@ -638,7 +749,7 @@ def models_plan(
 
 @models_cli.command("unplan")
 def models_unplan(model: str, config_path: Path | None = ConfigOption) -> None:
-    """Remove a model's plan: Ollama serves it again."""
+    """Forget a model's plan and benchmark decision (automatic mode, nothing decided yet)."""
     config = load(config_path)
     d = call(config.config_dir, "models.unplan", model=model)
     typer.echo(f"Removed the plan for {safe(d['model'])}{' and stopped its split session' if d['stopped'] else ''}.")

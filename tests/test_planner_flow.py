@@ -1,0 +1,340 @@
+"""The planner: the never-slower decision, routing under a benchmark key, benchmarks, fault tolerance."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+import pytest
+
+from ollamapower.config import Config
+from ollamapower.hub import plans as plans_mod
+from ollamapower.hub.benchmark import make_prompt
+from ollamapower.hub.runtime import Hub
+from ollamapower.ollama.client import InstalledModel
+from ollamapower.state import StateStore
+
+from .conftest import wait_for
+from .test_split import chat, make_cluster
+
+# ----- the decision rule and routing (no network) ----------------------------------------
+
+
+@dataclass
+class StubNode:
+    node_id: str
+    name: str
+    tunnel_effective: str = "secure"
+
+    def lendable_vram(self) -> int:
+        return 8 << 30
+
+
+@pytest.fixture
+def book(tmp_path):
+    cfg = Config()
+    cfg.config_dir = tmp_path
+    hub = Hub(cfg, StateStore(tmp_path / "state.json"))
+    helpers = [StubNode("node-aaaa", "desk"), StubNode("node-bbbb", "attic")]
+    hub.split.candidates = lambda: (list(helpers), [])  # type: ignore[method-assign]
+    hub.ollama.installed = [InstalledModel(name="big:70b", size=40 << 30, digest="d1")]
+    return hub.plans, hub, helpers
+
+
+def run(tps: float, ok: bool = True, helpers: list[StubNode] | None = None, ctx: int = 4096) -> dict[str, Any]:
+    r: dict[str, Any] = {"ok": ok, "gen_tps": tps, "error": "" if ok else "boom"}
+    if helpers is not None:
+        r["key"] = {
+            "digest": "d1",
+            "ctx": ctx,
+            "build": plans_mod.Pins.load().build,
+            "helpers": [{"id": n.node_id, "name": n.name, "tunnel": n.tunnel_effective} for n in helpers],
+        }
+    return r
+
+
+@pytest.mark.parametrize(
+    "local,split,choice",
+    [
+        (10.0, 10.99, "local"),  # +9.9 %: not enough (min_gain 10 %)
+        (10.0, 11.0, "split"),  # +10 %: enough
+        (10.0, 30.0, "split"),
+        (30.0, 10.0, "local"),
+    ],
+)
+def test_split_only_when_it_wins_by_min_gain(book, local, split, choice):
+    plans, _, helpers = book
+    rec = plans.decide("big:70b", run(local), [run(split, helpers=helpers)])
+    assert rec["choice"] == choice
+
+
+def test_local_failure_lets_split_run_models_ollama_cannot(book):
+    plans, _, helpers = book
+    assert plans.decide("big:70b", run(0, ok=False), [run(5.0, helpers=helpers)])["choice"] == "split"
+    assert plans.decide("big:70b", run(5.0), [run(0, ok=False)])["choice"] == "local"
+
+
+def test_best_candidate_wins_and_its_helpers_are_the_plan(book):
+    plans, _, helpers = book
+    plans.decide("big:70b", run(10.0), [run(12.0, helpers=helpers[:1]), run(20.0, helpers=helpers)])
+    spec = plans.route("big:70b")
+    assert spec is not None and spec.helpers == ("node-aaaa", "node-bbbb") and spec.ctx == 4096
+
+
+def test_route_requires_the_benchmark_key_to_still_hold(book):
+    plans, hub, helpers = book
+    plans.decide("big:70b", run(10.0), [run(20.0, helpers=helpers)])
+    assert plans.route("big:70b") is not None
+    helpers[1].tunnel_effective = "direct"
+    assert plans.route("big:70b") is None and "tunnel mode changed" in plans.describe("big:70b")["why"]
+    helpers[1].tunnel_effective = "secure"
+    gone = helpers.pop()
+    assert plans.route("big:70b") is None and "attic is not available" in plans.describe("big:70b")["why"]
+    helpers.append(gone)
+    hub.ollama.installed[0].digest = "d2"
+    assert plans.route("big:70b") is None  # the model was re-pulled: benchmark again
+    hub.ollama.installed[0].digest = "d1"
+    plans.pin("big:70b", None, ctx=8192)
+    assert plans.route("big:70b") is None  # another context size
+    plans.pin("big:70b", None, ctx=4096)
+    assert plans.route("big:70b") is not None
+
+
+def test_pins_and_exclusions(book):
+    plans, _, helpers = book
+    plans.decide("big:70b", run(10.0), [run(20.0, helpers=helpers)])
+    plans.pin("big:70b", "local")
+    assert plans.route("big:70b") is None and plans.describe("big:70b")["why"] == "forced local by the owner"
+    plans.pin("big:70b", None)
+    assert plans.route("big:70b") is not None
+    plans.set_excluded("big:70b", "node-bbbb", True)
+    assert plans.route("big:70b") is None  # the benchmarked set needs the excluded helper
+    plans.pin("big:70b", "split")
+    spec = plans.route("big:70b")
+    assert spec is not None and spec.helpers is None and spec.exclude == ("node-bbbb",)
+    with pytest.raises(ValueError):
+        plans.pin("big:70b", "turbo")
+
+
+def test_degraded_until_retry_after_and_helpers_back(book):
+    plans, hub, helpers = book
+    hub.config.planner.retry_after = 0.2
+    plans.decide("big:70b", run(10.0), [run(20.0, helpers=helpers)])
+    plans.fail("big:70b", "desk disconnected", ["line 1", "GGML_ASSERT x"])
+    assert plans.route("big:70b") is None
+    assert any("split mode for big:70b failed" in w for w in plans.warnings())
+    event = [e for e in hub.recent_events if e["kind"] == "split_failed"][-1]
+    assert event["tail"][-1] == "GGML_ASSERT x"
+    gone = helpers.pop(0)
+    time.sleep(0.25)
+    assert plans.route("big:70b") is None  # cooled down, but desk is still missing
+    helpers.insert(0, gone)
+    assert plans.route("big:70b") is not None  # recovered: split again
+    assert plans.record("big:70b")["degraded"] is None
+
+
+def test_phase3_plans_still_mean_split(book):
+    plans, hub, _ = book
+    hub.state.data["plans"]["old:latest"] = {"mode": "split", "ctx": 2048}
+    spec = plans.route("old")
+    assert spec is not None and spec.ctx == 2048 and spec.helpers is None
+
+
+def test_benchmark_prompt_is_unique_and_sized():
+    a, b = make_prompt(512), make_prompt(512)
+    assert a != b and 300 < len(a.split()) < 450
+
+
+# ----- end to end, on the hermetic cluster -----------------------------------------------
+
+pytestmark_e2e = pytest.mark.skipif(sys.platform == "win32", reason="fake llama.cpp programs are POSIX scripts")
+
+
+@pytest.fixture
+def cluster(tmp_path, fake_ollama, make_config):
+    c, close = make_cluster(tmp_path, fake_ollama, make_config, hub_devices=[])
+    c.hub.config.planner.auto_benchmark = False
+    yield c
+    close()
+
+
+@pytest.fixture
+def client():
+    with httpx.Client(timeout=30, trust_env=False) as cl:
+        yield cl
+
+
+def split_speed(c, tps: float) -> None:
+    """Make the fake llama-server report ``tps`` generation tokens/s (fake Ollama does 20)."""
+    (c.hub_bin / "timings.json").write_text(json.dumps({"predicted_n": 3, "predicted_ms": 3000 / tps}))
+
+
+@pytestmark_e2e
+def test_benchmark_picks_split_when_it_is_faster_and_routes_to_it(cluster, client):
+    c = cluster
+    split_speed(c, 30.0)
+    r = c.admin("models.benchmark", model="tiny")
+    assert r["local"]["ok"], r
+    assert r["local"]["gen_tps"] == pytest.approx(20.0, rel=0.01)
+    assert r["splits"][0]["ok"] and r["splits"][0]["gen_tps"] == pytest.approx(30.0, rel=0.01)
+    assert r["choice"] == "split" and "+50 %" in r["reason"]
+    assert r["splits"][0]["helpers"][0]["name"] == "desk"
+    stored = c.call(lambda: c.hub.plans.benchmarks_for("tiny"))
+    assert {b["engine"] for b in stored} == {"local", "split"} and all(b["ttft_ms"] >= 0 for b in stored)
+
+    # Automatic mode now sends the model to split, no manual plan needed.
+    assert chat(client, c).status_code == 200
+    assert c.call(lambda: c.hub.split.is_running("tiny"))
+    assert not [x for x in c.rec.client_requests if x["path"] == "/api/chat"]
+    shown = c.admin("models.show", model="tiny")
+    assert shown["engine"] == "split" and shown["mode"] == "auto" and shown["split_tps"] == pytest.approx(30.0, 0.01)
+
+    # The helper leaves: the benchmark no longer applies, Ollama serves.
+    c.run(c.hub.control.kick(c.node))
+    assert wait_for(lambda: c.call(lambda: c.hub.plans.route("tiny")) is None, 10)
+
+
+@pytestmark_e2e
+def test_benchmark_keeps_ollama_when_split_is_not_faster_enough(cluster, client):
+    c = cluster
+    split_speed(c, 21.0)  # +5 %
+    r = c.admin("models.benchmark", model="tiny")
+    assert r["choice"] == "local" and "isn't at least 10 % faster" in r["reason"]
+    assert c.call(lambda: c.hub.split.session) is None  # the benchmark cleaned up after itself
+    chat(client, c)
+    assert c.rec.last["path"] == "/api/chat"
+
+
+@pytestmark_e2e
+def test_pinned_model_keeps_its_pin_after_a_benchmark(cluster):
+    c = cluster
+    split_speed(c, 30.0)
+    c.admin("models.force_local", model="tiny")
+    r = c.admin("models.benchmark", model="tiny")
+    assert r["decided"] is False and "pinned to local" in r["reason"]
+    assert c.call(lambda: c.hub.plans.route("tiny")) is None
+
+
+@pytestmark_e2e
+def test_automatic_benchmark_runs_when_idle(cluster, client, monkeypatch):
+    c = cluster
+    split_speed(c, 40.0)
+    chat(client, c)  # a request marks the model as used (Ollama serves it: nothing decided yet)
+    assert c.rec.last["path"] == "/api/chat"
+    c.hub.config.planner.auto_benchmark = True
+    c.hub.config.planner.idle_seconds = 0.1
+    monkeypatch.setattr(plans_mod, "AUTO_CHECK", 0.1)
+
+    async def start() -> None:
+        asyncio.ensure_future(c.hub.plans.run())
+
+    c.run(start())
+    assert wait_for(lambda: c.call(lambda: c.hub.plans.record("tiny")["choice"]) == "split", 20)
+    events = [e["kind"] for e in c.call(lambda: list(c.hub.recent_events))]
+    assert "benchmark_start" in events and "plan_chosen" in events
+
+
+@pytestmark_e2e
+def test_client_request_preempts_an_automatic_benchmark(cluster, client):
+    c = cluster
+
+    async def slow_bench() -> None:
+        c.hub.plans.auto_task = asyncio.ensure_future(asyncio.sleep(60))
+
+    c.run(slow_bench())
+    chat(client, c)
+    assert wait_for(lambda: c.call(lambda: c.hub.plans.auto_task.cancelled()), 5)
+
+
+@pytestmark_e2e
+def test_failure_before_the_first_token_falls_back_transparently(cluster, client):
+    c = cluster
+    c.hub.config.split.stall_timeout = 1.0
+    c.admin("models.pin", model="tiny", engine="split")
+    assert chat(client, c).status_code == 200  # split works
+    r = chat(client, c, messages=[{"role": "user", "content": "hang"}])
+    assert r.status_code == 200 and c.rec.last["path"] == "/api/chat"  # Ollama answered instead
+    assert "tok0" in r.text
+    assert c.call(lambda: c.hub.plans.record("tiny")["degraded"]) is not None
+    chat(client, c)
+    assert c.rec.last["path"] == "/api/chat"  # still local while degraded
+
+
+@pytestmark_e2e
+def test_crash_mid_stream_ends_with_an_error_and_degrades(cluster, client):
+    c = cluster
+    c.hub.config.planner.retry_after = 0.5
+    c.admin("models.pin", model="tiny", engine="split")
+    r = chat(client, c, messages=[{"role": "user", "content": "die"}])
+    lines = [json.loads(x) for x in r.text.splitlines()]
+    assert lines[0]["message"]["content"] == "Hello" and "error" in lines[-1]
+    assert wait_for(lambda: c.call(lambda: c.hub.plans.record("tiny")["degraded"]) is not None, 10)
+    events = c.call(lambda: [e for e in c.hub.recent_events if e["kind"] == "split_failed"])
+    assert any("GGML_ASSERT failed: fake crash" in line for e in events for line in e.get("tail", []))
+    chat(client, c)
+    assert c.rec.last["path"] == "/api/chat"
+    time.sleep(0.6)
+    assert chat(client, c).status_code == 200  # cooled down, helper still there: split again
+    assert c.call(lambda: c.hub.split.is_running("tiny"))
+
+
+@pytestmark_e2e
+@pytest.mark.parametrize("secret", [None, "wrong"])
+def test_clients_cannot_force_an_engine(cluster, client, secret):
+    c = cluster
+    headers = {"x-ollamapower-engine": "split", "x-ollamapower-ctx": "512"}
+    if secret:
+        headers["x-ollamapower-bench"] = secret
+    r = client.post(
+        c.url + "/api/chat",
+        json={"model": "tiny", "messages": [{"role": "user", "content": "x"}]},
+        headers=headers,
+    )
+    assert r.status_code == 200 and c.rec.last["path"] == "/api/chat"
+    assert c.call(lambda: c.hub.split.session) is None
+    assert "x-ollamapower-engine" not in c.rec.last["headers"]
+
+
+@pytestmark_e2e
+def test_benchmark_refuses_models_split_mode_cannot_run(cluster):
+    from ollamapower.admin.ipc import AdminError
+
+    with pytest.raises(AdminError, match="could not find|not installed"):
+        cluster.admin("models.benchmark", model="small:1b")
+
+
+@pytestmark_e2e
+def test_models_list_shows_engine_mode_and_speeds(cluster):
+    from ollamapower.__main__ import render_models
+
+    c = cluster
+    split_speed(c, 30.0)
+    c.admin("models.benchmark", model="tiny")
+    c.rec.ps_models[:] = []
+    c.call(lambda: c.hub.ollama.installed.append(InstalledModel(name="tiny:latest", size=1 << 20, digest="")))
+    rows = {m["name"]: m for m in c.admin("models.list")}
+    assert rows["tiny:latest"]["plan"] == "split" and rows["tiny:latest"]["plan_split_tps"] == pytest.approx(30, 0.01)
+    text = "\n".join(line for line, _ in render_models(list(rows.values())))
+    assert "tiny:latest" in text and "auto" in text
+
+
+@pytestmark_e2e
+def test_benchmark_waits_for_a_busy_split_session(cluster, monkeypatch):
+    from ollamapower.admin.ipc import AdminError
+    from ollamapower.hub import benchmark as bench_mod
+
+    c = cluster
+    monkeypatch.setattr(bench_mod, "IDLE_WAIT", 0.3)
+    c.admin("models.pin", model="tiny", engine="split")
+    with httpx.Client(timeout=30, trust_env=False) as cl:
+        assert chat(cl, c).status_code == 200
+    session = c.call(lambda: c.hub.split.session)
+    c.call(lambda: setattr(session, "active", 1) or session.idle.clear())  # a request is streaming
+    with pytest.raises(AdminError, match="busy"):
+        c.admin("models.benchmark", model="tiny")
+    assert c.call(lambda: c.hub.split.is_running("tiny"))  # nobody's answer was cut off

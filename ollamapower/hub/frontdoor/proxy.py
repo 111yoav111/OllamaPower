@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol, TypeVar
 
 import httpx
@@ -223,12 +223,16 @@ class ProxyStreamResponse(Response):
         on_done: Callable[[str, int], None],
         tap: GenerationTap | None = None,
         transform: Transform | None = None,
+        first: bytes = b"",
+        chunks: AsyncIterator[bytes] | None = None,
     ) -> None:
         self.upstream = upstream
         self.stream = stream
         self.on_done = on_done
         self.tap = tap
         self.transform = transform
+        self.first = first  # already read from upstream (split mode waits for it before answering)
+        self.chunks = chunks
         self.background = None
         self.status_code = upstream.status_code
         self.content_type = transform.content_type if transform else upstream.headers.get("content-type", "")
@@ -250,7 +254,10 @@ class ProxyStreamResponse(Response):
     async def _pump(self, send: Send) -> str:
         """Copy the body. Returns "complete" or "upstream_error"."""
         try:
-            async for chunk in self.upstream.aiter_raw():
+            source = self.chunks if self.chunks is not None else self.upstream.aiter_raw()
+            if self.first:
+                await self._send_body(self.transform.feed(self.first) if self.transform else self.first, send)
+            async for chunk in source:
                 await self._send_body(self.transform.feed(chunk) if self.transform else chunk, send)
             if self.transform is not None:
                 await self._send_body(self.transform.finish(), send)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import secrets
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from ..state import StateStore
 from .control_server import ControlServer
 from .engines.split import SplitEngine
 from .nodes import NodeRegistry
+from .plans import PlanBook
 
 log = logging.getLogger("ollamapower.hub")
 
@@ -104,6 +106,9 @@ class Hub:
         self.local_static: dict[str, Any] = {}
         self.local_sample: dict[str, Any] = {}
         self.split = SplitEngine(self)
+        self.plans = PlanBook(self)
+        # Lets the benchmark's own requests choose an engine (X-OllamaPower-Bench); unguessable, per run.
+        self.bench_secret = secrets.token_hex(16)
 
     # ----- events ----------------------------------------------------------------------
 
@@ -203,6 +208,7 @@ class Hub:
     def warnings(self) -> list[str]:
         warnings = list(self.extra_warnings)
         warnings.extend(self.split.warnings())
+        warnings.extend(self.plans.warnings())
         if self.state is not None:
             warnings.extend(self.state.warnings)
         if not is_loopback_host(self.config.hub.host):
@@ -217,11 +223,15 @@ class Hub:
         for node in self.registry.nodes.values():
             warnings.extend(node.warnings())
         for m in self.ollama.models:
-            if m.spilled and self.split.plan_for(m.name) is None:
+            if m.spilled and self.plans.route(m.name) is None and self.plans.record(m.name)["pin"] != "local":
+                hint = (
+                    "it will be benchmarked with helpers while the hub is idle"
+                    if self.config.planner.auto_benchmark
+                    else f"`ollamapower models benchmark {m.name}` checks whether helpers make it faster"
+                )
                 warnings.append(
                     f"{m.name} is only {m.vram_percent}% in VRAM "
-                    f"({human_bytes(m.size_vram)} of {human_bytes(m.size)}): the rest runs on the CPU. "
-                    f"Split mode can move it to helper GPUs: `ollamapower models plan {m.name} --split`."
+                    f"({human_bytes(m.size_vram)} of {human_bytes(m.size)}): the rest runs on the CPU; {hint}."
                 )
         return warnings
 
@@ -270,6 +280,7 @@ class Hub:
                 ],
             },
             "split": self.split.snapshot(),
+            "plans": self.plans.snapshot(),
             "queue": {
                 "capacity": self.gate.capacity,
                 "active": self.gate.active,

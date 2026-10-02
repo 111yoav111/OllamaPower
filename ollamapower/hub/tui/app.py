@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from typing import Any
 
@@ -70,7 +71,7 @@ class NodeTable(DataTable):
 
 # Actions only offered on some tabs (hidden from the footer elsewhere).
 NODE_ACTIONS = {"node_pause", "node_kick", "node_net_test", "node_tunnel", "node_tunnel_test", "node_forget"}
-MODEL_ACTIONS = {"phase5"}
+MODEL_ACTIONS = {"model_benchmark", "model_pin_split", "model_force_local", "model_unpin"}
 
 
 class HubTUI(App[None]):
@@ -89,9 +90,10 @@ class HubTUI(App[None]):
         Binding("t", "node_tunnel", "Tunnel"),
         Binding("m", "node_tunnel_test", "Tunnel test"),
         Binding("x", "node_forget", "Forget"),
-        Binding("b", "phase5('benchmark')", "Benchmark"),
-        Binding("l", "phase5('pin a plan')", "Pin plan"),
-        Binding("f", "phase5('force local')", "Force local"),
+        Binding("b", "model_benchmark", "Benchmark"),
+        Binding("l", "model_pin_split", "Pin split"),
+        Binding("f", "model_force_local", "Force local"),
+        Binding("u", "model_unpin", "Automatic"),
         Binding("/", "filter", "Filter"),
         Binding("q", "quit_hub", "Quit"),
         Binding("ctrl+q", "quit_hub", "Quit", show=False, priority=True),
@@ -145,10 +147,12 @@ class HubTUI(App[None]):
                     yield Sparkline([], id="spark-cpu")
                     yield Static(id="detail-net", classes="panel")
             with TabPane("4 Models", id="models"):
+                yield Static(id="model-progress", classes="panel")
                 yield Static(
                     Text(
-                        "Plan 'split' spreads a model over helper GPUs (`ollamapower models plan <model> --split`); "
-                        "others run on local Ollama. 'Fits' is a rough estimate (file size + 20%).",
+                        "Automatic: a model that doesn't fit the hub runs split only if a benchmark shows it at least "
+                        "planner.min_gain faster than Ollama. B benchmark · L pin split · F force local · U automatic. "
+                        "Fits '~' = rough (size + 20 %).",
                         style="dim",
                     )
                 )
@@ -168,7 +172,7 @@ class HubTUI(App[None]):
             "", "Name", "IP", "Status", "GPU", "VRAM tot/free/lend GB", "GPU %", "CPU/RAM", "Link", "Role", "Tunnel"
         )
         self.query_one("#model-table", DataTable).add_columns(
-            "Model", "Size", "Params", "Quant", "Loaded", "Fits locally", "Plan", "Last tok/s"
+            "Model", "Size", "Quant", "Loaded", "Fits locally", "Engine", "Mode", "Ollama tok/s", "Split tok/s", "Why"
         )
         self.query_one("#log-table", DataTable).add_columns("Time", "Event", "Detail")
         self.set_interval(REFRESH_INTERVAL, self.refresh_visible)
@@ -453,20 +457,26 @@ class HubTUI(App[None]):
         table.clear()
         for m in self.admin.models():
             fits = "?" if m["fits"] is None else ("yes" if m["fits"] else "no → helpers")
+            if m["fits"] is not None and not m["fits_estimated"]:
+                fits += " ~"
+            engine = m["plan"] + (" ●" if m["running_split"] else "")
             table.add_row(
                 t(m["name"]),
                 human_bytes(m["size"]),
-                t(m["parameters"]),
                 t(m["quantization"]),
                 t(
                     f"{m['vram_percent']}% VRAM" if m["loaded"] else "-",
                     "yellow" if m["loaded"] and m["vram_percent"] < 100 else "",
                 ),
                 t(fits, "yellow" if m["fits"] is False else ""),
-                t(m["plan"]),
-                t("-" if m["last_gen_tps"] is None else f"{m['last_gen_tps']:.1f}"),
+                t(engine, "bold green" if m["plan"] == "split" else ""),
+                t(m["plan_mode"]),
+                t("-" if m["plan_local_tps"] is None else f"{m['plan_local_tps']:.1f}"),
+                t("-" if m["plan_split_tps"] is None else f"{m['plan_split_tps']:.1f}"),
+                t(m["plan_why"], "yellow" if m["plan_degraded"] else "dim"),
                 key=m["name"],
             )
+        self.query_one("#model-progress", Static).update(self._progress_text())
         if selected is not None:
             try:
                 table.move_cursor(row=table.get_row_index(selected), scroll=False)
@@ -659,8 +669,89 @@ class HubTUI(App[None]):
 
         self.push_screen(ConfirmScreen(f"Forget {safe(name)} (its settings and history)?"), done)
 
-    def action_phase5(self, what: str) -> None:
-        self.say(f"'{what}' arrives with the planner (Phase 5).", severity="warning")
+    def _progress_text(self) -> Text:
+        """What the planner and split mode are doing right now (benchmark, first weight transfer)."""
+        parts = []
+        bench = self.hub.plans.benchmarking
+        if bench:
+            parts.append(
+                f"Benchmarking {bench['model']} ({'automatic' if bench.get('automatic') else 'by you'}): "
+                f"{bench['stage']} · {duration(time.time() - bench['started'])}"
+            )
+        session = self.hub.split.session
+        transfer = session.transfer() if session is not None else None
+        if transfer and transfer["loading"] and transfer["expected"]:
+            done = min(1.0, transfer["sent"] / transfer["expected"])
+            elapsed = time.time() - session.started
+            eta = f" · about {duration(elapsed / done - elapsed)} left" if 0.02 < done < 1 else ""
+            parts.append(
+                f"Sending {session.model} to the helpers: {bar(done, 1.0, 30).plain} "
+                f"{human_bytes(transfer['sent'])} of {human_bytes(transfer['expected'])}{eta}"
+            )
+        elif session is not None and session.state == "starting":
+            parts.append(f"Loading {session.model} in split mode…")
+        return Text(
+            "\n".join(parts) if parts else "No benchmark or split load running.", style="bold" if parts else "dim"
+        )
+
+    def _model_target(self) -> str | None:
+        key = self._cursor_key(self.query_one("#model-table", DataTable))
+        if key is None:
+            self.say("Select a model first", severity="warning")
+        return key
+
+    def action_model_benchmark(self) -> None:
+        model = self._model_target()
+        if model is None:
+            return
+
+        async def run() -> None:
+            self.say(f"Benchmarking {model}: Ollama, then split mode. This can take minutes…", timeout=6)
+            r = await self._admin("models.benchmark", model=model)
+            if r is not None:
+                self.say(f"{model}: {r.get('choice') or '-'} - {r.get('reason', '')}", timeout=15)
+
+        self.run_worker(run(), group="benchmark")
+
+    def action_model_pin_split(self) -> None:
+        model = self._model_target()
+        if model is None:
+            return
+
+        async def done(yes: bool | None) -> None:
+            if yes and await self._admin("models.pin", model=model, engine="split") is not None:
+                self.say(f"{model}: pinned to split mode")
+
+        self.push_screen(
+            ConfirmScreen(
+                f"Always run {safe(model)} in split mode, even if a benchmark says Ollama is faster?\n\n"
+                "U returns to automatic (benchmark decides)."
+            ),
+            done,
+        )
+
+    def action_model_force_local(self) -> None:
+        model = self._model_target()
+        if model is None:
+            return
+
+        async def run() -> None:
+            if await self._admin("models.force_local", model=model) is not None:
+                self.say(f"{model}: always local Ollama")
+
+        self.run_worker(run())
+
+    def action_model_unpin(self) -> None:
+        model = self._model_target()
+        if model is None:
+            return
+
+        async def run() -> None:
+            r = await self._admin("models.unpin", model=model)
+            if r is not None:
+                self.say(f"{model}: automatic - {r['why']}")
+
+        self.run_worker(run())
 
     def action_quit_hub(self) -> None:
         def done(yes: bool | None) -> None:

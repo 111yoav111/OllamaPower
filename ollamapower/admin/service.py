@@ -37,14 +37,20 @@ class Admin:
     # ----- views -----------------------------------------------------------------------
 
     def models(self) -> list[dict[str, Any]]:
-        """Installed models with a rough "fits in the hub's VRAM?" verdict."""
+        """Installed models: size, whether they fit the hub's VRAM, the engine that serves them and why."""
         hub_vram = sum(g.get("vram_total", 0) for g in self.hub.local_static.get("gpus", []))
-        loaded = {m.name: m for m in self.hub.ollama.models}
+        loaded = {model_key(m.name): m for m in self.hub.ollama.models}
+        plans = self.hub.plans
         out = []
         for m in self.hub.ollama.installed:
-            needed = int(m.size * FIT_MARGIN)
-            live = loaded.get(m.name)
-            gen = self.hub.last_generation.get(m.name)
+            key = model_key(m.name)
+            live = loaded.get(key)
+            gen = self.hub.last_generation.get(key)
+            facts = plans.facts_cache.get(m.digest)
+            if facts is not None:
+                fits = plans._with_vram(facts, key)["fits"]
+            else:
+                fits = None if not hub_vram else int(m.size * FIT_MARGIN) <= hub_vram
             out.append(
                 {
                     "name": m.name,
@@ -54,13 +60,37 @@ class Admin:
                     "digest": m.digest,
                     "loaded": live is not None,
                     "vram_percent": live.vram_percent if live else None,
-                    "fits": None if not hub_vram else needed <= hub_vram,
-                    "plan": "split" if self.hub.split.plan_for(m.name) else "local-ollama",
-                    "running_split": self.hub.split.is_running(m.name),
+                    "spilled": bool(live and live.spilled),
+                    "fits": fits,
+                    "fits_estimated": facts is not None,
+                    **{f"plan_{k}": v for k, v in plans.describe(key).items()},
+                    "plan": plans.describe(key)["engine"],
+                    "running_split": self.hub.split.is_running(key),
                     "last_gen_tps": round(gen.gen_tps, 1) if gen else None,
                 }
             )
         return out
+
+    def _model(self, value: Any) -> str:
+        if not isinstance(value, str) or not value or len(value) > 200:
+            raise AdminError("give a model name, e.g. llama3.1:70b")
+        return model_key(value)
+
+    def _ctx(self, value: Any) -> int | None:
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or not 256 <= value <= MAX_CTX):
+            raise AdminError(f"--ctx must be between 256 and {MAX_CTX}")
+        return value
+
+    async def show_model(self, model: str) -> dict[str, Any]:
+        plans = self.hub.plans
+        return {
+            "model": model,
+            **plans.describe(model),
+            "record": plans.record(model),
+            "facts": await plans.facts(model),
+            "benchmarks": plans.benchmarks_for(model)[-10:],
+            "helpers_now": [n.name for n in plans.current_helpers(model)],
+        }
 
     async def tunnel_test(self, node: Node) -> dict[str, Any]:
         """Measure the split-mode path to ``node``: secure always, direct too if its owner allows it."""
@@ -101,8 +131,7 @@ class Admin:
         assert info is not None
         ctx = ctx or hub.config.split.default_ctx
         key = model_key(model)
-        hub.state.set_plan(key, {"mode": "split", "ctx": ctx, "created": time.time()})
-        hub.event("plan_set", model=key, mode="split", ctx=ctx)
+        hub.plans.pin(key, "split", ctx)
         hub_gpus = [
             Device(f"hub {g.get('name', 'GPU')}", int(g.get("vram_total", 0)))
             for g in hub.local_static.get("gpus", [])
@@ -185,15 +214,42 @@ class Admin:
         if cmd == "models.plan":
             return await self.plan_split(args.get("model"), args.get("ctx"))
         if cmd == "models.unplan":
-            model = args.get("model")
-            key = model_key(str(model or ""))
-            if hub.state is None or key not in hub.state.data.get("plans", {}):
-                raise AdminError(f"{model!r} has no plan")
-            del hub.state.data["plans"][key]
-            hub.state.save_soon()
-            hub.event("plan_removed", model=key)
+            key = self._model(args.get("model"))
+            if not hub.plans.remove(key):
+                raise AdminError(f"{key!r} has no plan")
             stopped = await hub.split.stop(key, "plan removed")
             return {"model": key, "stopped": stopped}
+        if cmd in ("models.pin", "models.unpin", "models.force_local"):
+            key = self._model(args.get("model"))
+            engine = {"models.unpin": None, "models.force_local": "local"}.get(cmd, args.get("engine"))
+            if cmd == "models.pin" and engine not in ("split", "local"):
+                raise AdminError("pin to split or local")
+            ctx = self._ctx(args.get("ctx"))
+            if engine == "split":
+                await self.plan_split(key, ctx)  # checks the model can run split at all
+            else:
+                hub.plans.pin(key, engine, ctx)
+            stopped = False
+            if hub.plans.route(key) is None:
+                stopped = await hub.split.stop(key, "Ollama serves this model now")
+            return {"model": key, **hub.plans.describe(key), "stopped": stopped}
+        if cmd == "models.benchmark":
+            from ..hub.benchmark import BenchmarkError, benchmark_model
+
+            key = self._model(args.get("model"))
+            if hub.plans.bench_lock.locked():
+                raise AdminError("a benchmark is already running")
+            try:
+                return await benchmark_model(hub, key, self._ctx(args.get("ctx")))
+            except BenchmarkError as exc:
+                raise AdminError(str(exc)) from None
+        if cmd == "models.exclude":
+            key = self._model(args.get("model"))
+            node = self._node(args.get("node"))
+            hub.plans.set_excluded(key, node.node_id, args.get("exclude") is not False)
+            return {"model": key, **hub.plans.describe(key)}
+        if cmd == "models.show":
+            return await self.show_model(self._model(args.get("model")))
         if cmd == "split.stop":
             return {"stopped": await hub.split.stop(reason="stopped by the owner")}
         if cmd == "events.list":

@@ -64,3 +64,22 @@ def test_real_llama_cpp_split_over_the_relay(tmp_path, fake_ollama, make_config,
         assert wait_for(lambda: c.agent.rpc.session is None, 10)
     finally:
         close()
+
+
+def test_real_benchmark_measures_split_and_decides(tmp_path, fake_ollama, make_config):
+    c, close = make_cluster(
+        tmp_path, fake_ollama, make_config, hub_devices=[], real_binaries=Path(BUILD_DIR), allow_cpu=True
+    )
+    try:
+        c.hub.config.planner.auto_benchmark = False
+        c.hub.config.planner.prompt_tokens, c.hub.config.planner.gen_tokens = 64, 16
+        r = c.admin("models.benchmark", model="tiny", ctx=512)
+        split = r["splits"][0]
+        assert split["ok"], split
+        assert split["gen_tokens"] == 16 and split["prompt_tokens"] > 40 and split["load_s"] > 0
+        assert split["helpers"][0]["tunnel"] == "secure" and split["helpers"][0]["device"] == "CPU"
+        # The fake Ollama "generates" 20 tok/s; the real tiny model is far faster, so split wins.
+        assert r["choice"] == "split" and split["gen_tps"] > 20
+        assert c.call(lambda: c.hub.plans.route("tiny")) is not None
+    finally:
+        close()

@@ -122,3 +122,28 @@ async def test_quit_asks_and_models_tab_explains(tmp_path, hub_key):  # noqa: F8
         await pilot.press("y")
         await pilot.pause()
     assert app.quit_confirmed
+
+
+async def test_models_tab_pins_and_shows_why(tmp_path, hub_key):  # noqa: F811
+    from ollamapower.ollama.client import InstalledModel
+
+    s = Setup(tmp_path, hub_key)
+    await s.start()
+    s.hub.ollama.installed = [InstalledModel(name="big:70b", size=40 << 30, digest="d1", quantization="Q4_K_M")]
+    app = HubTUI(Admin(s.hub))
+    try:
+        async with app.run_test(size=(200, 50)) as pilot:
+            await pilot.press("4")
+            table = app.query_one("#model-table", DataTable)
+            assert await wait(pilot, lambda: table.row_count == 1)
+            assert table.get_row_at(0)[6].plain == "auto" and "no benchmark yet" in table.get_row_at(0)[9].plain
+            table.focus()
+            await pilot.press("f")
+            assert await wait(pilot, lambda: s.hub.plans.record("big:70b")["pin"] == "local")
+            assert await wait(pilot, lambda: "forced local" in table.get_row_at(0)[9].plain)
+            await pilot.press("u")
+            assert await wait(pilot, lambda: s.hub.plans.record("big:70b")["pin"] is None)
+            assert "No benchmark" in plain(app, "#model-progress")
+            await shot(app, "models")
+    finally:
+        await s.close()

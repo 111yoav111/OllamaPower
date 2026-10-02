@@ -73,17 +73,25 @@ class H(BaseHTTPRequestHandler):
         if body.get("messages") and body["messages"][-1].get("content") == "fail":
             self.send_response(400); self.send_header("content-type", "application/json"); self.end_headers()
             self.wfile.write(json.dumps({"error": {"code": 400, "message": "bad request from fake"}}).encode()); return
+        last = body["messages"][-1].get("content") if body.get("messages") else ""
+        if last == "hang":
+            time.sleep(3600)  # never answers: the hub's stall timeout must notice
         self.send_response(200); self.send_header("content-type", "text/event-stream"); self.end_headers()
         def ev(obj): self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n"); self.wfile.flush()
         for word in ["Hello", " from", " split"]:
             ev({"choices": [{"index": 0, "delta": {"content": word}, "finish_reason": None}]})
+            if last == "die":
+                print("GGML_ASSERT failed: fake crash", flush=True)
+                os._exit(1)
             time.sleep(float(body.get("fake_delay", 0)))
         if body.get("tools"):
             for fn in ({"name": "get", "arguments": '{"a":'}, {"arguments": ' 1}'}):
                 ev({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": fn}]}}]})
         ev({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
-        ev({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3},
-            "timings": {"prompt_n": 7, "prompt_ms": 70.0, "predicted_n": 3, "predicted_ms": 150.0}})
+        timings = {"prompt_n": 7, "prompt_ms": 70.0, "predicted_n": 3, "predicted_ms": 150.0}
+        if (HERE / "timings.json").exists():  # tests set how fast "split" is
+            timings.update(json.loads((HERE / "timings.json").read_text()))
+        ev({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3}, "timings": timings})
         self.wfile.write(b"data: [DONE]\n\n")
 
 print("listening", flush=True)

@@ -120,6 +120,27 @@ class SplitConfig:
 
 
 @dataclass
+class PlannerConfig:
+    """When the hub uses split mode by itself (Golden rule: never slower than plain Ollama)."""
+
+    # Split mode is chosen only if its generation speed beats plain Ollama by this much (0.10 = 10 %).
+    min_gain: float = 0.10
+    # Added to weights + KV cache when estimating whether a model fits the hub's VRAM.
+    memory_margin: float = 0.10
+    # Benchmark models that would benefit, by itself, while the hub is idle. A benchmark
+    # unloads Ollama's models and is abandoned as soon as a request arrives.
+    auto_benchmark: bool = True
+    # Seconds without any request before an automatic benchmark may start.
+    idle_seconds: float = 300.0
+    # After a split failure, Ollama serves the model for at least this long, then split
+    # mode is tried again once all of the plan's helpers are back.
+    retry_after: float = 120.0
+    # The benchmark workload (same for every engine): prompt size and tokens generated.
+    prompt_tokens: int = 512
+    gen_tokens: int = 128
+
+
+@dataclass
 class LoggingConfig:
     level: str = "info"  # debug | info | warning | error
     # Rotating JSON-lines files in <config dir>/logs: size of each file, files kept.
@@ -134,6 +155,7 @@ class Config:
     control: ControlConfig = field(default_factory=ControlConfig)
     llamacpp: LlamaCppConfig = field(default_factory=LlamaCppConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
+    planner: PlannerConfig = field(default_factory=PlannerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     config_dir: Path = field(default_factory=default_config_dir)
 
@@ -196,6 +218,17 @@ class Config:
                 raise ConfigError(f"split.{name} must be a positive number")
         if not 256 <= sp.default_ctx <= 1_048_576:
             raise ConfigError("split.default_ctx must be between 256 and 1048576")
+        pl = self.planner
+        if not (math.isfinite(pl.min_gain) and 0 <= pl.min_gain <= 10):
+            raise ConfigError("planner.min_gain must be between 0 and 10 (0.10 = 10 %)")
+        if not (math.isfinite(pl.memory_margin) and 0 <= pl.memory_margin <= 2):
+            raise ConfigError("planner.memory_margin must be between 0 and 2")
+        for name in ("idle_seconds", "retry_after"):
+            value = getattr(pl, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ConfigError(f"planner.{name} must be a positive number")
+        if not 16 <= pl.prompt_tokens <= 32768 or not 8 <= pl.gen_tokens <= 4096:
+            raise ConfigError("planner.prompt_tokens must be 16-32768 and planner.gen_tokens 8-4096")
         if self.logging.level not in ("debug", "info", "warning", "error"):
             raise ConfigError("logging.level must be debug, info, warning or error")
         if self.logging.file_max_bytes < 64 * 1024 or self.logging.file_backups < 1:
@@ -284,7 +317,7 @@ def _apply(section_obj: typing.Any, data: dict, section: str) -> None:
         setattr(section_obj, key, _coerce(value, hints[key], f"{section}.{key}"))
 
 
-SECTIONS = ("hub", "ollama", "control", "llamacpp", "split", "logging")
+SECTIONS = ("hub", "ollama", "control", "llamacpp", "split", "planner", "logging")
 # Env vars with the prefix that are not config overrides.
 NON_CONFIG_ENV = {"OLLAMAPOWER_TOKEN", "OLLAMAPOWER_CONFIG_DIR"}
 

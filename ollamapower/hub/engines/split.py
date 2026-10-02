@@ -1,7 +1,7 @@
 """Split mode: one model across the hub's GPU and the helpers' GPUs (llama.cpp RPC).
 
-For a model the owner planned with ``ollamapower models plan <model> --split``
-the first request starts a split session:
+When the plan book (``hub/plans.py``) routes a model here, the first request
+starts a split session with the given ``SplitSpec`` (context, helpers):
 
 1. Find the model's GGUF in Ollama's store (no second copy) and read its layer sizes.
 2. Make sure the hub has the pinned llama.cpp (downloaded once, hash-checked).
@@ -24,8 +24,9 @@ the plan; then llama-server stops, the helpers are released and Ollama gets
 the GPU back on its next request.
 
 If anything fails, the request is served by Ollama as before (never worse
-than without OllamaPower) and split mode rests for ``RETRY_AFTER`` seconds for
-that model; the reason is shown as a warning.
+than without OllamaPower) and the plan book marks the model degraded; the
+reason is shown as a warning and logged with the tail of llama-server's
+output.
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ from ...ollama.blobs import ModelFiles, ModelUnavailable, resolve
 from ...ollama.client import PROBE_HEADERS, human_bytes, parse_ps
 from ...textsafe import safe_text
 from ..planner import MIB, Device, PlanError, SplitPlan, fits_on_hub, plan_split
+from ..plans import SplitSpec
 from ..tunnel import BULK_BYTES, HubRelay, TunnelClient, measure
 
 if TYPE_CHECKING:
@@ -59,7 +61,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("ollamapower.split")
 
-RETRY_AFTER = 60.0  # seconds split mode rests for a model after a failed start
 RPC_READY_TIMEOUT = 60.0
 OLLAMA_RELEASE_TIMEOUT = 30.0
 STOP_GRACE = 10.0
@@ -94,6 +95,7 @@ class HelperLease:
 class SplitSession:
     model: str
     ctx: int
+    spec: SplitSpec = field(default_factory=lambda: SplitSpec(ctx=0))
     state: str = "starting"  # starting · ready · stopping · failed
     files: ModelFiles | None = None
     plan: SplitPlan | None = None
@@ -109,6 +111,15 @@ class SplitSession:
     idle: asyncio.Event = field(default_factory=asyncio.Event)
     output: deque[str] = field(default_factory=lambda: deque(maxlen=60))
     error: str = ""
+
+    def transfer(self) -> dict[str, Any] | None:
+        """Model weights sent to the helpers so far (secure mode counts them), for a progress bar."""
+        relays = [x.relay for x in self.leases if x.relay is not None]
+        if not relays or self.plan is None or self.files is None or self.files.gguf is None:
+            return None
+        kv = self.files.gguf.kv_bytes_per_layer(self.ctx)
+        expected = sum(max(0, p.bytes - kv * p.layers) for p in self.plan.helpers)
+        return {"sent": sum(r.bytes_out for r in relays), "expected": expected, "loading": self.state == "starting"}
 
     def alive(self) -> bool:
         return self.state == "ready" and self.process is not None and self.process.returncode is None
@@ -126,6 +137,7 @@ class SplitSession:
             "size": self.files.gguf.file_size if self.files and self.files.gguf else 0,
             "plan": self.plan.summary() if self.plan else None,
             "helpers": [{"node": x.node.node_id, "name": x.node.name, "tunnel": x.mode} for x in self.leases],
+            "transfer": self.transfer(),
             "error": self.error,
         }
 
@@ -151,30 +163,8 @@ class SplitEngine:
         self.pins: Pins | None = None
         self._lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
-        self._rest_until: dict[str, float] = {}
         self._warnings: deque[tuple[float, str]] = deque(maxlen=20)
         self._tasks: set[asyncio.Task[Any]] = set()
-
-    # ----- plans -------------------------------------------------------------------------
-
-    def plans(self) -> dict[str, dict[str, Any]]:
-        if self.hub.state is None:
-            return {}
-        return {k: v for k, v in self.hub.state.data.get("plans", {}).items() if isinstance(v, dict)}
-
-    def plan_for(self, model: str) -> dict[str, Any] | None:
-        from ..runtime import model_key
-
-        plan = self.plans().get(model_key(model))
-        return plan if plan is not None and plan.get("mode") == "split" else None
-
-    def wants(self, model: str) -> bool:
-        """Should this model's next request try split mode?"""
-        from ..runtime import model_key
-
-        if not model or self.plan_for(model) is None:
-            return False
-        return time.monotonic() >= self._rest_until.get(model_key(model), 0.0)
 
     def is_running(self, model: str) -> bool:
         from ..runtime import model_key
@@ -183,9 +173,9 @@ class SplitEngine:
 
     # ----- acquire / release -------------------------------------------------------------
 
-    async def acquire(self, model: str) -> SplitSession:
-        """A ready session for ``model`` (started if needed); pair with ``release``."""
-        task = asyncio.ensure_future(self._acquire(model))
+    async def acquire(self, model: str, spec: SplitSpec) -> SplitSession:
+        """A ready session for ``model`` started with ``spec`` (started if needed); pair with ``release``."""
+        task = asyncio.ensure_future(self._acquire(model, spec))
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -197,13 +187,13 @@ class SplitEngine:
             task.add_done_callback(done)
             raise
 
-    async def _acquire(self, model: str) -> SplitSession:
+    async def _acquire(self, model: str, spec: SplitSpec) -> SplitSession:
         from ..runtime import model_key
 
         key = model_key(model)
         async with self._lock:
             current = self.session
-            if current is not None and current.model == key and current.alive():
+            if current is not None and current.model == key and current.alive() and current.spec == spec:
                 current.active += 1
                 current.idle.clear()
                 return current
@@ -211,9 +201,7 @@ class SplitEngine:
                 if current.model != key and current.active:
                     await current.idle.wait()  # let running requests of the other model finish
                 await self._stop(current, f"switching to {key}" if current.model != key else "restarting")
-            plan = self.plan_for(key) or {}
-            ctx = int(plan.get("ctx") or self.config.split.default_ctx)
-            session = SplitSession(model=key, ctx=ctx)
+            session = SplitSession(model=key, ctx=spec.ctx, spec=spec)
             self.session = session
             try:
                 await asyncio.wait_for(self._start(session), self.config.split.load_timeout)
@@ -230,8 +218,9 @@ class SplitEngine:
                 if not isinstance(exc, (SplitUnavailable, TimeoutError, asyncio.CancelledError)):
                     log.exception("split start failed")
                 session.error = reason
+                tail = list(session.output)
                 await self._stop(session, reason, failed=True)
-                self._rest(key, reason)
+                self.hub.plans.fail(key, reason, tail)
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 raise SplitUnavailable(reason) from None
@@ -243,13 +232,6 @@ class SplitEngine:
         session.last_used = time.monotonic()
         if session.active == 0:
             session.idle.set()
-
-    def _rest(self, model: str, reason: str) -> None:
-        self._rest_until[model] = time.monotonic() + RETRY_AFTER
-        message = f"split mode for {model} failed: {reason}; Ollama serves it (retrying in {int(RETRY_AFTER)} s)"
-        self._warnings.append((time.monotonic(), message))
-        self.hub.event("split_failed", model=model, reason=reason)
-        log.warning("%s", message)
 
     # ----- start -------------------------------------------------------------------------
 
@@ -269,6 +251,14 @@ class SplitEngine:
             raise SplitUnavailable(f"{s.model} fits on the hub's GPU alone, so Ollama runs it faster without helpers")
 
         helpers, reasons = self.candidates()
+        helpers = [n for n in helpers if n.node_id not in s.spec.exclude]
+        if s.spec.helpers is not None:
+            # A benchmarked plan: exactly those helpers, in that order, or not at all.
+            by_id = {n.node_id: n for n in helpers}
+            missing = [h for h in s.spec.helpers if h not in by_id]
+            if missing:
+                raise SplitUnavailable(f"a helper of the plan is not available ({', '.join(m[:8] for m in missing)})")
+            helpers = [by_id[h] for h in s.spec.helpers]
         if not helpers:
             raise SplitUnavailable("no helper can take part" + (f" ({'; '.join(reasons)})" if reasons else ""))
 
@@ -335,7 +325,7 @@ class SplitEngine:
 
     def candidates(self) -> tuple[list[Node], list[str]]:
         """Helpers that may take part now (best first), and why the others can't."""
-        pins = self.pins or Pins.load()
+        pins = self.pins or self.hub.plans.pins  # cached: this runs on every routed request
         ok, reasons = [], []
         for node in self.hub.registry.connected:
             lc = node.capabilities.get("llama_cpp") or {}
@@ -568,9 +558,22 @@ class SplitEngine:
             reason = f"{node.name} disconnected"
         else:
             reason = f"{node.name}: {safe_text(str(message.get('error', '')), 200)}"
+        self.report_failure(s, reason)
+
+    def report_failure(self, s: SplitSession, reason: str) -> asyncio.Task[Any] | None:
+        """A running session broke (helper gone, stalled, crashed): stop it, Ollama takes over.
+
+        Returns the stopping task, so a caller about to hand the model to Ollama can wait
+        until llama-server has given the GPU back.
+        """
+        if s.state not in ("ready", "starting") or s.error:
+            return None
         s.error = reason
-        self._rest(s.model, reason)
-        self._spawn(self._stop_and_cut(s, reason))
+        self.hub.plans.fail(s.model, reason, list(s.output))
+        task = asyncio.ensure_future(self._stop_and_cut(s, reason))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     async def _stop_and_cut(self, s: SplitSession, reason: str) -> None:
         async with self._lock:
@@ -639,10 +642,7 @@ class SplitEngine:
                 if s is None or s.state != "ready":
                     continue
                 if s.process is not None and s.process.returncode is not None:
-                    reason = f"llama-server exited with code {s.process.returncode}"
-                    s.error = reason
-                    self._rest(s.model, reason)
-                    await self._stop_and_cut(s, reason)
+                    self.report_failure(s, f"llama-server exited with code {s.process.returncode}")
                 elif not s.active and time.monotonic() - s.last_used > self.config.split.keep_alive:
                     await self.stop(s.model, "idle")
         finally:
@@ -660,7 +660,6 @@ class SplitEngine:
         s = self.session
         return {
             "session": s.snapshot() if s is not None else None,
-            "plans": self.plans(),
             "llama_cpp": self.binaries.summary() if self.binaries is not None else None,
         }
 

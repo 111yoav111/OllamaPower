@@ -67,6 +67,22 @@ load_timeout = 900.0
 # No new token for this long counts as a failure.
 stall_timeout = 120.0
 
+[planner]
+# When the hub uses split mode by itself. Golden rule: never slower than plain Ollama.
+# Split mode is chosen only if it generates this much faster than Ollama (0.10 = 10 %).
+min_gain = 0.10
+# Added to weights + KV cache when estimating whether a model fits the hub's VRAM.
+memory_margin = 0.10
+# Benchmark models that would benefit while the hub is idle (it unloads Ollama's
+# models; abandoned as soon as a request arrives). Off: only `models benchmark`.
+auto_benchmark = true
+idle_seconds = 300.0
+# After a split failure Ollama serves the model at least this long (seconds).
+retry_after = 120.0
+# The benchmark workload: prompt tokens and generated tokens.
+prompt_tokens = 512
+gen_tokens = 128
+
 [logging]
 level = "info"   # debug | info | warning | error
 # logs/events.jsonl and logs/requests.jsonl rotate at this size; this many old files are kept.

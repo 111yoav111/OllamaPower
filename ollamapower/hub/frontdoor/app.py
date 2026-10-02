@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import time
@@ -44,6 +45,7 @@ from starlette.requests import ClientDisconnect
 from ...scheduling.request_queue import QueueFull, Ticket
 from ...scheduling.task_pool import TaskPriority
 from ...textsafe import safe_text
+from ..benchmark import BENCH_HEADER, CTX_HEADER, ENGINE_HEADER, HELPERS_HEADER
 from ..engines.split import ENGINE_SPLIT, SplitUnavailable
 from ..engines.translate import (
     OllamaStream,
@@ -53,6 +55,7 @@ from ..engines.translate import (
     is_load_request,
     load_reply,
 )
+from ..plans import SplitSpec
 from ..runtime import ENGINE_LOCAL, Hub
 from .hostcheck import LocalHostOnlyMiddleware
 from .proxy import (
@@ -135,6 +138,19 @@ def annotate_ps(raw: bytes, extra: list[dict[str, Any]] | None = None) -> bytes:
     return json.dumps(data).encode()
 
 
+SPLIT_STOPPED = "split mode stopped"
+
+
+def bench_spec(headers: Any) -> SplitSpec:
+    """The split session a benchmark request asks for (only honoured with the hub's bench secret)."""
+    try:
+        ctx = int(headers.get(CTX_HEADER, ""))
+    except ValueError:
+        ctx = 0
+    helpers = tuple(h for h in headers.get(HELPERS_HEADER, "").split(",") if h)
+    return SplitSpec(ctx=ctx if 256 <= ctx <= 1 << 20 else 4096, helpers=helpers or None)
+
+
 def keep_alive_zero(value: Any) -> bool:
     """Ollama's "unload now": ``keep_alive`` of 0, "0", "0s", "0m", ..."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -165,6 +181,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
             asyncio.ensure_future(hub.poll_ollama(client)),
             asyncio.ensure_future(hub.poll_local()),
             asyncio.ensure_future(hub.split.run()),
+            asyncio.ensure_future(hub.plans.run()),
         ]
         try:
             yield
@@ -191,6 +208,8 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
         if request.url.query:
             target += "?" + request.url.query
         priority = TaskPriority.from_header(request.headers.get(PRIORITY_HEADER))
+        bench = hmac.compare_digest(request.headers.get(BENCH_HEADER, "").encode(), hub.bench_secret.encode())
+        forced = request.headers.get(ENGINE_HEADER) if bench else None
         stream = hub.register_stream(method, path, priority)
         ticket = Ticket(priority)
         http: httpx.AsyncClient = request.app.state.http
@@ -205,8 +224,15 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     hub.record_generation(stream.model, stats)
             hub.finish_stream(stream, status, outcome)
 
-        async def serve_split(body: bytes) -> Response | None:
-            """Serve from the split engine; None means "let Ollama serve it"."""
+        async def serve_split(body: bytes, spec: SplitSpec, strict: bool) -> Response | None:
+            """Serve from the split engine. None means "let Ollama serve it" (never for a benchmark: ``strict``)."""
+
+            def unavailable(reason: str) -> Response | None:
+                if not strict:
+                    return None
+                finish("rejected", 503)
+                return error(path, 503, f"split mode unavailable: {reason}")
+
             try:
                 parsed = (
                     json.loads(body) if len(body) <= INLINE_PARSE_BYTES else await asyncio.to_thread(json.loads, body)
@@ -222,9 +248,10 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     await hub.split.stop(stream.model, "unloaded by a client")
                 else:
                     try:
-                        hub.split.release(await race_kill(hub.split.acquire(stream.model), stream, request.receive))
-                    except SplitUnavailable:
-                        return None
+                        session = await race_kill(hub.split.acquire(stream.model, spec), stream, request.receive)
+                    except SplitUnavailable as exc:
+                        return unavailable(str(exc))
+                    hub.split.release(session)
                 finish("complete", 200)
                 return JSONResponse(load_reply(path, str(parsed.get("model", "")), unload))
             try:
@@ -235,18 +262,29 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 finish("rejected", 400)
                 return error(path, 400, str(exc))
             try:
-                session = await race_kill(hub.split.acquire(stream.model), stream, request.receive)
-            except SplitUnavailable:
-                return None
+                session = await race_kill(hub.split.acquire(stream.model, spec), stream, request.receive)
+            except SplitUnavailable as exc:
+                return unavailable(str(exc))
+            stream.engine = ENGINE_SPLIT
             released = False
 
-            def done(outcome: str, status: int) -> None:
+            def release() -> None:
                 nonlocal released
                 if not released:
                     released = True
                     hub.split.release(session)
+
+            def done(outcome: str, status: int) -> None:
+                release()
+                cut_off = transform is not None and transform.truncated
+                if (outcome == "upstream_error" or cut_off) and not strict:
+                    # llama-server stopped answering mid-stream (stalled past split.stall_timeout, or died).
+                    hub.split.report_failure(session, "llama-server stopped answering mid-answer")
                 finish(outcome, status)
 
+            # Send the request and wait for the first bytes of the answer. Until then nothing has
+            # reached the client, so if split mode breaks now, Ollama answers instead - transparently.
+            upstream = None
             try:
                 assert session.client is not None
                 upstream_request = session.client.build_request(
@@ -256,14 +294,40 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     headers={"content-type": "application/json", "accept-encoding": "identity"},
                 )
                 upstream = await race_kill(session.client.send(upstream_request, stream=True), stream, request.receive)
-            except httpx.HTTPError as exc:
-                log.warning("split engine unavailable for %s: %s", path, type(exc).__name__)
-                hub.split.release(session)
-                return None
+                chunks = upstream.aiter_raw()
+                try:
+                    first = await race_kill(
+                        asyncio.wait_for(anext(chunks), config.split.stall_timeout), stream, request.receive
+                    )
+                except StopAsyncIteration:
+                    first = b""
+            except (httpx.HTTPError, TimeoutError, StreamKilled) as exc:
+                if upstream is not None:
+                    await upstream.aclose()
+                release()
+                if isinstance(exc, StreamKilled) and not exc.reason.startswith(SPLIT_STOPPED):
+                    raise  # e.g. the hub is shutting down: don't retry anywhere
+                reason = (
+                    exc.reason
+                    if isinstance(exc, StreamKilled)
+                    else f"no answer from llama-server ({type(exc).__name__})"
+                )
+                if not strict:
+                    stopping = hub.split.report_failure(session, reason)
+                    if stopping is not None:
+                        # Let llama-server give the GPU back before Ollama loads the model.
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(asyncio.shield(stopping), 30)
+                    stream.killed.clear()
+                    stream.kill_reason = ""
+                    stream.engine = ENGINE_LOCAL
+                    log.warning("split mode failed before the first token for %s; retrying on Ollama", stream.model)
+                return unavailable(reason)
             except BaseException:
-                hub.split.release(session)
+                if upstream is not None:
+                    await upstream.aclose()
+                release()
                 raise
-            stream.engine = ENGINE_SPLIT
             transform = (
                 OllamaStream(
                     str(parsed.get("model", "")),
@@ -275,7 +339,9 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 if native
                 else None
             )
-            return ProxyStreamResponse(upstream, stream, done, tap=tap if native else None, transform=transform)
+            return ProxyStreamResponse(
+                upstream, stream, done, tap=tap if native else None, transform=transform, first=first, chunks=chunks
+            )
 
         handed_off = False
         try:
@@ -293,6 +359,8 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     stream.model = await asyncio.to_thread(requested_model, body)
                 else:
                     stream.model = requested_model(body)
+                if not bench:
+                    hub.plans.note_request(stream.model)  # also makes an automatic benchmark give way
 
                 # 2. Wait for a slot, highest priority first, giving up if the client leaves.
                 queued_at = time.monotonic()
@@ -307,11 +375,21 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     finish("rejected", 503)
                     return error(path, 503, "server busy, try again shortly", {"Retry-After": "10"})
                 stream.queued_ms = int((time.monotonic() - queued_at) * 1000)
-                if path in SPLIT_ENDPOINTS and hub.split.wants(stream.model):
-                    served = await serve_split(body)
-                    if served is not None:
-                        handed_off = isinstance(served, ProxyStreamResponse)
-                        return served
+                if path in SPLIT_ENDPOINTS:
+                    if forced == "local":
+                        spec = None
+                    elif forced == "split":
+                        spec = bench_spec(request.headers)
+                    else:
+                        spec = hub.plans.route(stream.model)
+                    if spec is not None:
+                        served = await serve_split(body, spec, strict=bench)
+                        if served is not None:
+                            handed_off = isinstance(served, ProxyStreamResponse)
+                            return served
+                    if hub.split.is_running(stream.model):
+                        # Ollama serves this model now: llama-server must give the GPU back first.
+                        await hub.split.stop(stream.model, "Ollama serves this model now")
                 upstream_request = http.build_request(
                     method, target, content=body, headers=build_upstream_headers(request.headers)
                 )

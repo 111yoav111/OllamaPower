@@ -124,3 +124,12 @@ def test_garbage_lines_are_ignored():
     out = t.feed(b": keep-alive\n\ndata: {not json\n\ndata: [1,2]\n\n" + sse(delta(content="ok"), FINAL)) + t.finish()
     lines = [json.loads(x) for x in out.splitlines()]
     assert lines[0]["message"]["content"] == "ok" and lines[-1]["done"] is True
+
+
+def test_an_answer_cut_off_is_never_reported_as_done():
+    t = OllamaStream("m", "/api/chat", stream=True)
+    raw = b"".join(b"data: " + json.dumps(delta(content=w)).encode() + b"\n\n" for w in ("a", "b"))
+    out = t.feed(raw) + t.finish()  # no finish_reason, no [DONE]: the connection just ended
+    lines = [json.loads(x) for x in out.splitlines()]
+    assert all(not x.get("done") for x in lines) and "stopped in the middle" in lines[-1]["error"]
+    assert t.truncated

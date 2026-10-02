@@ -177,6 +177,8 @@ class OllamaStream:
         self._timings: dict[str, Any] = {}
         self._usage: dict[str, Any] = {}
         self._error: str | None = None
+        self._finished = False  # llama-server said the answer is complete (finish_reason or [DONE])
+        self.truncated = False  # the answer ended without that: llama-server died mid-answer
         self._raw: list[bytes] = []  # error bodies only
 
     @property
@@ -204,7 +206,10 @@ class OllamaStream:
         if not line.startswith(b"data:"):
             return b""
         data = line[5:].strip()
-        if not data or data == b"[DONE]":
+        if data == b"[DONE]":
+            self._finished = True
+            return b""
+        if not data:
             return b""
         try:
             event = json.loads(data)
@@ -225,6 +230,7 @@ class OllamaStream:
             return b""
         choice = choices[0]
         if choice.get("finish_reason"):
+            self._finished = True
             self._finish = FINISH.get(str(choice["finish_reason"]), "stop")
         delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
         for call in delta.get("tool_calls") or []:
@@ -295,6 +301,10 @@ class OllamaStream:
             tail = b""
         if self._error is not None:
             return tail + self._dump({"error": self._error})
+        if not self._finished:
+            # Never report a cut-off answer as complete.
+            self.truncated = True
+            return tail + self._dump({"error": "the split engine stopped in the middle of the answer"})
         calls = self._tool_calls()
         if self.stream:
             out = bytearray(tail)

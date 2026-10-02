@@ -101,6 +101,7 @@ def make_cluster(
     hub = Hub(cfg, state, EventLog(cfg.logs_dir, cfg.logging.file_max_bytes, cfg.logging.file_backups))
     app = create_app(hub)
     server = ThreadedServer(server=build_server(hub, app, own_logging=False)).start()
+    cfg.hub.port = server.port  # the harness binds its own port; benchmarks call the front door by config
 
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
@@ -296,7 +297,7 @@ def test_paused_helper_means_ollama_serves_with_a_warning(cluster, client):
     assert any("split mode for tiny:latest failed" in w and "desk is paused" in w for w in warnings)
     # Resting: the next request doesn't retry the failed start at once.
     chat(client, c)
-    assert c.call(lambda: c.hub.split.wants("tiny")) is False
+    assert c.call(lambda: c.hub.plans.route("tiny")) is None
 
 
 def test_helper_owner_pausing_mid_session_ends_it(cluster, client):
