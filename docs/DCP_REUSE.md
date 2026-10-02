@@ -12,7 +12,7 @@ is new), **drop** (not carried over).
 |---|---|---|---|---|
 | `src/networking/packets.py` | reuse | `ollamapower/core/packets.py` | 0 (2 for new types) | Binary `ControlPacket` (12 bytes) and `TaskPacket` (28-byte header + `zstd(msgpack(...))` payload) kept. The payload is now a plain msgpack dict instead of a render/simulation task object, so `task_from_dict`, `detect_task_type` and `TASK_FLAGS.render/simulation` are gone; `TASK_FLAGS` becomes `PayloadKind`. `parse_packets` raises `ValueError` instead of printing and returning `None`. Phase 2 adds `protocol_version` and the Section 11 packet types. |
 | `src/networking/network_io.py` | reuse | `ollamapower/core/network_io.py` | 0 | `read_one_packet` and the locked/encrypted write path kept. The task-specific senders (`net_send_task`, `net_send_subtask`, `net_send_result`) collapse into one `send_packet`; control senders (`hello`, `welcome`, `status`, `disconnect`, `heartbeat`) kept. A clean EOF between frames returns `None`; EOF inside a frame raises. |
-| `src/networking/encrypt_layer.py` | reuse | `ollamapower/core/encrypt_layer.py` | 0 (2 for pinning) | RSA-2048 OAEP-SHA256 key transport + AES-256-GCM frames with a fresh random 96-bit nonce per message, unchanged. Adds `public_key_fingerprint()`; Phase 2 uses it for trust-on-first-use pinning of the Hub key (the plain DCP handshake can be MITM'd). |
+| `src/networking/encrypt_layer.py` | reuse | `ollamapower/core/encrypt_layer.py` | 0 (2 for pinning) | RSA-2048 OAEP-SHA256 key transport + AES-256-GCM frames with a fresh random 96-bit nonce per message, kept; frames now also bind sender role + counter (see below). `master_handshake`/`worker_handshake` → `hub_handshake`/`node_handshake`. Adds `public_key_fingerprint()`; Phase 2 uses it for trust-on-first-use pinning of the Hub key (the plain DCP handshake can be MITM'd). |
 | token auth (`DCP_TOKEN` in `.env`, checked in `server.py`) | reuse | `ollamapower/core/auth.py` | 0 | Renamed `OLLAMAPOWER_TOKEN`. Comparison is now constant time (`hmac.compare_digest`; DCP used `!=`), tokens are generated with 256 bits from `secrets`, and short/empty tokens are rejected. Rate-limiting failed auths per IP comes with the control server in Phase 2. |
 | `src/loadbalancer/load_balancer.py` — `TaskPriority`, `TaskRecord`, heap, skip counter, forced dispatch, requeue | reuse | `ollamapower/scheduling/task_pool.py` | 0 | Extracted into a `TaskPool` class (priority + FIFO heap, `MAX_SKIPS = 10` forced dispatch, retry/requeue). Priorities map 1:1 onto the `X-OllamaPower-Priority: critical\|high\|normal\|low` header (Phase 1). |
 | `src/loadbalancer/load_balancer.py` — `WorkerState`, dispatch/heartbeat/metrics loops, callbacks, `get_snapshot()` | adapt | `ollamapower/scheduling/load_balancer.py` | 0, scoring in 2/5 | Worker → node. Dispatch, heartbeat timeout (→ requeue), metrics and the `get_snapshot()` dict are kept. The CPU-only `load_score` stays for now; Phase 2/5 scores by VRAM free, GPU util, link quality, warm model and queue length. |
@@ -50,6 +50,22 @@ Fixed in the port (with tests where it makes sense):
 - `decrypt_from_reader` raised on EOF before a frame but returned `None` on EOF
   inside one (the opposite of what callers expect) → clean EOF between frames is
   `None`, a truncated frame raises.
+- AES-GCM frames had no sequence number and one key served both directions,
+  so frames could be replayed, reordered or reflected within a session → each
+  frame's associated data binds the sender role and a per-direction counter;
+  encryption happens under the write lock so frames stay in counter order.
+- The plaintext (pre-auth) read path accepted 64 MB task packets → only the
+  12-byte control packets are read before encryption.
+- Result packets got a fresh wire id and no link to their request (DCP matched
+  them through the task object) → `build_result_packet` takes `request_id`,
+  carried in the `parent_id` header field.
+- Late or duplicate results/failures from a node that no longer owned a task
+  were applied (double execution, nodes stuck BUSY); a node dropping during a
+  send queued the task twice; any non-`OSError` from the send callback killed the
+  dispatch loop; skips were counted while no node existed, so capacity checks
+  were bypassed ~2 s after start; timed-out nodes stayed OFFLINE forever →
+  ownership checks, an idempotent queue, a broad catch around the send,
+  skips only counted when a node exists, and timed-out nodes are kicked.
 - Task ids came from a module-global `itertools.count`; kept, but the payload
   carries its own ids from Phase 2 on.
 
@@ -57,9 +73,6 @@ Left for the phase that rewrites the code (noted so they are not forgotten):
 
 - The handshake trusts whatever RSA key the server sends (no pinning) — Phase 2,
   TOFU fingerprint pinning.
-- AES-GCM frames have no sequence number, so frames can be replayed or
-  reordered within a live session — Phase 2, per-direction counter as
-  associated data.
 - `ctrl_hello` / `ctrl_welcome` travel unencrypted after the key exchange and
   carry no protocol version — Phase 2.
 - The master bound `0.0.0.0` unconditionally and dropped workers at ≥ 90 % CPU

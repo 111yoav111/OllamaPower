@@ -22,9 +22,16 @@ an attacker who already runs code as the owner on the Hub or a helper.
 
 - **Encrypted control plane.** Every packet after the handshake is one
   AES-256-GCM frame with a fresh random 96-bit nonce (tested for uniqueness);
-  tampered, truncated or replayed-into-another-session frames fail
+  tampered or truncated frames, and frames from another session, fail
   authentication and drop the connection. The session key is sent to the Hub
   with RSA-2048 OAEP-SHA256.
+- **No replay, reordering or reflection.** Each frame is bound (as GCM
+  associated data) to its sender's role and a per-direction counter, so a
+  frame re-sent, reordered or bounced back to its sender is rejected. Frames
+  are encrypted under the connection's write lock, so concurrent senders can't
+  put them on the wire out of order.
+- **Nothing large before authentication.** Until the token is checked only the
+  fixed 12-byte control packets are read in plaintext.
 - **Safe deserialisation.** Payloads are msgpack dicts (never pickle);
   extension types stay inert data. Decompressed payloads are capped at 64 MB,
   so a small zstd "bomb" can't exhaust memory, and every size field is
@@ -39,10 +46,6 @@ an attacker who already runs code as the owner on the Hub or a helper.
   Hub presents, so an active man-in-the-middle could read the token. Phase 2
   pins the Hub key fingerprint on each agent (trust on first use, confirmed by
   the owner) and refuses a changed key.
-- **Replay and reordering inside a session (Phase 2).** Frames carry no
-  sequence number, so someone in the path could re-send or reorder frames of a
-  live session (they still can't read or forge them). Phase 2 adds a per-direction
-  counter bound into each frame and rejects anything out of order.
 - **Failed-auth rate limiting (Phase 2).** Per-IP limits and temporary bans
   arrive with the control-plane server.
 - **llama.cpp RPC is unauthenticated and unencrypted (Phases 3-4).** It will
