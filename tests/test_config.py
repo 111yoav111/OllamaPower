@@ -33,6 +33,8 @@ def test_file_and_env_overrides(tmp_path):
         "[hub]\nmax_concurrency = 0\n",
         '[ollama]\nurl = "http://192.168.1.5:11435"\n',  # Ollama must stay local
         '[ollama]\nurl = "http://127.0.0.1:11434"\n',  # the front door's own port
+        '[hub]\nhost = "0.0.0.0"\n[ollama]\nurl = "http://127.0.0.1:11434"\n',  # 0.0.0.0 includes loopback
+        '[hub]\nport = 80\n[ollama]\nurl = "http://127.0.0.1"\n',  # no port means 80
         '[ollama]\nurl = "ftp://127.0.0.1"\n',
         '[logging]\nlevel = "loud"\n',
         "this is not toml",
@@ -60,3 +62,8 @@ def test_example_config_is_the_default(tmp_path):
     cfg = load_config(packaged, env={"OLLAMAPOWER_CONFIG_DIR": str(tmp_path)})
     default = Config()
     assert (cfg.hub, cfg.ollama, cfg.logging) == (default.hub, default.ollama, default.logging)
+
+
+def test_url_without_port_is_port_80_not_11434(tmp_path):
+    (tmp_path / "config.toml").write_text('[ollama]\nurl = "http://127.0.0.1"\n')
+    assert load_config(env={"OLLAMAPOWER_CONFIG_DIR": str(tmp_path)}).ollama.url == "http://127.0.0.1"

@@ -99,7 +99,9 @@ class Config:
             raise ConfigError(f"invalid ollama.url {self.ollama.url!r}")
         if not is_loopback_host(up.hostname):
             raise ConfigError("ollama.url must point at a loopback address (Ollama must stay local)")
-        if is_loopback_host(h.host) and (up_port or 11434) == h.port:
+        default_port = 443 if up.scheme == "https" else 80
+        serves_loopback = is_loopback_host(h.host) or h.host in ("0.0.0.0", "::", "")
+        if serves_loopback and (up_port or default_port) == h.port:
             raise ConfigError(
                 f"ollama.url uses port {h.port}, which is the front door's own port; move Ollama "
                 "to another port (default 11435, see `ollamapower doctor`)"
