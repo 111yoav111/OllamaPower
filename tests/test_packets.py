@@ -22,14 +22,17 @@ def test_task_request_round_trip():
     assert pkt.unpack_payload() == payload
 
 
-def test_result_packets():
-    [pkt] = p.parse_packets(p.build_result_packet({"ok": True}))
+def test_result_packets_name_their_request():
+    request = p.parse_packet(p.build_task_packet({"q": 1}))
+    [pkt] = p.parse_packets(p.build_result_packet({"ok": True}, request_id=request.task_id))
     assert pkt.packet_type is p.PACKET_FLAGS.task_result
     assert pkt.status is p.STATUS_FLAGS.DONE
-    [pkt] = p.parse_packets(p.build_result_packet({"ok": False}, status=p.STATUS_FLAGS.FAILED, subtask_index=1))
+    assert pkt.parent_id == request.task_id
+    raw = p.build_result_packet({"ok": False}, request_id=7, status=p.STATUS_FLAGS.FAILED, subtask_index=1)
+    [pkt] = p.parse_packets(raw)
     assert pkt.packet_type is p.PACKET_FLAGS.subtask_result
     assert pkt.status is p.STATUS_FLAGS.FAILED
-    assert pkt.subtask_index == 1
+    assert (pkt.parent_id, pkt.subtask_index) == (7, 1)
 
 
 def test_subtask_header_fields():
@@ -138,3 +141,17 @@ def test_payload_cannot_carry_objects():
 def test_control_type_is_not_a_task_packet():
     with pytest.raises(ValueError):
         p.TaskPacket.from_payload({}, p.PACKET_FLAGS.ctrl_hello)
+
+
+async def test_plaintext_path_accepts_only_control_packets():
+    """Before the token is checked, a peer must not be able to make us buffer a payload."""
+    import asyncio
+
+    from ollamapower.core.network_io import read_one_packet
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(p.build_hello() + p.build_task_packet({"x": 1}))
+    reader.feed_eof()
+    assert (await read_one_packet(reader)).packet_type is p.PACKET_FLAGS.ctrl_hello
+    with pytest.raises(ValueError):
+        await read_one_packet(reader)

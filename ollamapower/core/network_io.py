@@ -1,9 +1,9 @@
 """Reading and writing packets on an asyncio stream, inherited from DCP.
 
 With a ``SessionCrypto`` every packet is exactly one encrypted frame. Without
-one (only the hello/welcome exchange during the handshake, as in DCP) packets
-are read incrementally: the first byte tells the packet type and therefore how
-many more bytes to read.
+one - only the hello/welcome exchange before the token is checked, as in DCP -
+just the fixed-size 12-byte control packets are accepted, so an unauthenticated
+peer can't make us buffer a large payload.
 
 All writes to one connection go through a shared ``asyncio.Lock`` so frames
 written from different tasks never interleave.
@@ -13,18 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import struct
 
 from .encrypt_layer import SessionCrypto
 from .packets import (
     CONTROL_HEADER_SIZE,
     CTRL_VALUES_SET,
     DISCONNECT_FLAGS,
-    TASK_HEADER_SIZE,
-    TASK_VALUES_SET,
     ControlPacket,
     Packet,
-    TaskPacket,
     build_disconnect,
     build_heartbeat,
     build_hello,
@@ -34,8 +30,6 @@ from .packets import (
 )
 
 log = logging.getLogger("ollamapower.net")
-
-MAX_PAYLOAD_BYTES = 64 * 1024 * 1024  # plaintext path sanity cap
 
 
 async def read_one_packet(reader: asyncio.StreamReader, crypto: SessionCrypto | None = None) -> Packet | None:
@@ -52,19 +46,10 @@ async def read_one_packet(reader: asyncio.StreamReader, crypto: SessionCrypto | 
         first = await reader.readexactly(1)
     except asyncio.IncompleteReadError:
         return None
-    flag = first[0]
+    if first[0] not in CTRL_VALUES_SET:
+        raise ValueError(f"only control packets are allowed before encryption (got flag 0x{first[0]:02X})")
     try:
-        if flag in CTRL_VALUES_SET:
-            rest = await reader.readexactly(CONTROL_HEADER_SIZE - 1)
-            pkt: Packet = ControlPacket.from_bytes(first + rest)
-        elif flag in TASK_VALUES_SET:
-            header = first + await reader.readexactly(TASK_HEADER_SIZE - 1)
-            payload_size = struct.unpack("!I", header[4:8])[0]
-            if payload_size > MAX_PAYLOAD_BYTES:
-                raise ValueError(f"TaskPacket payload too large ({payload_size} bytes)")
-            pkt = TaskPacket.from_bytes(header + await reader.readexactly(payload_size))
-        else:
-            raise ValueError(f"unknown packet flag 0x{flag:02X}")
+        pkt = ControlPacket.from_bytes(first + await reader.readexactly(CONTROL_HEADER_SIZE - 1))
     except asyncio.IncompleteReadError:
         raise ValueError("connection closed inside a packet") from None
     log.debug("recv %r", pkt)
@@ -74,11 +59,12 @@ async def read_one_packet(reader: asyncio.StreamReader, crypto: SessionCrypto | 
 async def send_packet(
     writer: asyncio.StreamWriter, lock: asyncio.Lock, data: bytes, crypto: SessionCrypto | None = None
 ) -> None:
-    """Write one already-built packet, encrypted when the session has a key."""
-    if crypto is not None:
-        data = crypto.encrypt(data)
+    """Write one already-built packet, encrypted when the session has a key.
+
+    Encryption happens under the lock so frames hit the wire in counter order.
+    """
     async with lock:
-        writer.write(data)
+        writer.write(crypto.encrypt(data) if crypto is not None else data)
         await writer.drain()
 
 

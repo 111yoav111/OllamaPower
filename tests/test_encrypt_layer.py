@@ -44,7 +44,74 @@ def test_short_frame_is_rejected():
 
 def test_key_size_enforced():
     with pytest.raises(e.CryptoError):
-        e.SessionCrypto(b"short")
+        e.SessionCrypto(b"short", "hub")
+
+
+def _pair() -> tuple[e.SessionCrypto, e.SessionCrypto]:
+    return e.SessionCrypto(KEY, "hub"), e.SessionCrypto(KEY, "node")
+
+
+def _body(frame: bytes) -> bytes:
+    return frame[e.FRAME_LAYER_SIZE :]
+
+
+def test_session_frames_in_order():
+    hub, node = _pair()
+    for i in range(5):
+        assert node.decrypt(_body(hub.encrypt(b"m%d" % i))) == b"m%d" % i
+        assert hub.decrypt(_body(node.encrypt(b"r%d" % i))) == b"r%d" % i
+
+
+def test_replayed_frame_is_rejected():
+    hub, node = _pair()
+    frame = _body(hub.encrypt(b"run this once"))
+    assert node.decrypt(frame) == b"run this once"
+    with pytest.raises(e.CryptoError):
+        node.decrypt(frame)
+
+
+def test_reordered_frames_are_rejected():
+    hub, node = _pair()
+    first, second = _body(hub.encrypt(b"1")), _body(hub.encrypt(b"2"))
+    with pytest.raises(e.CryptoError):
+        node.decrypt(second)
+    assert node.decrypt(first) == b"1"
+
+
+def test_reflected_frame_is_rejected():
+    hub, _ = _pair()
+    with pytest.raises(e.CryptoError):
+        hub.decrypt(_body(hub.encrypt(b"echo")))  # a hub frame sent back to the hub
+
+
+def test_frames_from_another_session_are_rejected():
+    hub, _ = _pair()
+    other = e.SessionCrypto(b"o" * e.AES_KEY_SIZE, "node")
+    with pytest.raises(e.CryptoError):
+        other.decrypt(_body(hub.encrypt(b"x")))
+
+
+async def test_concurrent_writers_keep_counter_order():
+    """Encryption happens under the lock, so racing writers still produce in-order frames."""
+    from ollamapower.core.network_io import send_packet
+
+    hub, node = _pair()
+    reader = asyncio.StreamReader()
+
+    class Writer:
+        def write(self, data):
+            reader.feed_data(data)
+
+        async def drain(self):
+            await asyncio.sleep(0)  # let the other writers run in between
+
+    lock, writer = asyncio.Lock(), Writer()
+    await asyncio.gather(*(send_packet(writer, lock, b"msg%d" % i, hub) for i in range(20)))
+    reader.feed_eof()
+    received = []
+    while (plain := await node.decrypt_from_reader(reader)) is not None:
+        received.append(plain)
+    assert sorted(received) == sorted(b"msg%d" % i for i in range(20))
 
 
 def _reader(data: bytes) -> asyncio.StreamReader:
@@ -55,23 +122,23 @@ def _reader(data: bytes) -> asyncio.StreamReader:
 
 
 async def test_reader_eof_between_frames_is_clean():
-    crypto = e.SessionCrypto(KEY)
-    reader = _reader(crypto.encrypt(b"one"))
-    assert await crypto.decrypt_from_reader(reader) == b"one"
-    assert await crypto.decrypt_from_reader(reader) is None
+    hub, node = _pair()
+    reader = _reader(hub.encrypt(b"one"))
+    assert await node.decrypt_from_reader(reader) == b"one"
+    assert await node.decrypt_from_reader(reader) is None
 
 
 @pytest.mark.parametrize("cut", [2, 10])
 async def test_reader_eof_inside_a_frame_raises(cut):
-    crypto = e.SessionCrypto(KEY)
+    hub, node = _pair()
     with pytest.raises(e.CryptoError):
-        await crypto.decrypt_from_reader(_reader(crypto.encrypt(b"payload")[:cut]))
+        await node.decrypt_from_reader(_reader(hub.encrypt(b"payload")[:cut]))
 
 
 async def test_oversized_frame_length_is_refused():
-    crypto = e.SessionCrypto(KEY)
+    _, node = _pair()
     with pytest.raises(e.CryptoError):
-        await crypto.decrypt_from_reader(_reader((e.MAX_FRAME + 1).to_bytes(4, "big")))
+        await node.decrypt_from_reader(_reader((e.MAX_FRAME + 1).to_bytes(4, "big")))
 
 
 async def test_handshake_agrees_on_key_and_reports_fingerprint():

@@ -10,6 +10,10 @@ After that every packet is one frame ``[4-byte length][12-byte nonce][AES-256-GC
 ciphertext + tag]``. The nonce is fresh random for every message, so a nonce is
 never reused under the same key (2^-48 collision odds only after ~2^32 frames).
 
+Each frame is also bound (as GCM associated data) to its sender's role and a
+per-direction counter. A frame that is replayed, reordered, dropped-then-skipped
+or reflected back to its sender fails authentication. DCP had no such binding.
+
 The plain handshake trusts whatever key the server sends, so on its own it can
 be man-in-the-middled. Phase 2 pins the hub key's fingerprint on the agent
 (trust on first use, like SSH ``known_hosts``) using ``public_key_fingerprint``.
@@ -22,6 +26,7 @@ import hashlib
 import logging
 import os
 import struct
+from typing import Literal
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
@@ -40,6 +45,10 @@ FRAME_LAYER_SIZE = struct.calcsize(FRAME_LAYER_FORMAT)
 MAX_HANDSHAKE_FRAME = 10 * 1024
 # One encrypted packet. Large enough for streamed chunks and capability reports.
 MAX_FRAME = 30 * 1024 * 1024
+AAD_LABEL = b"ollamapower-frame-v1"
+
+Role = Literal["hub", "node"]
+_ROLE_BYTE: dict[str, bytes] = {"hub": b"H", "node": b"N"}
 
 
 class CryptoError(ValueError):
@@ -89,19 +98,23 @@ def rsa_decrypt_aes_key(private_key: rsa.RSAPrivateKey, ciphertext: bytes) -> by
 # ----- AES-256-GCM frames ---------------------------------------------------------------
 
 
-def encrypt_packet(aes_key: bytes, plaintext: bytes) -> bytes:
+def frame_aad(sender: Role, counter: int) -> bytes:
+    return AAD_LABEL + _ROLE_BYTE[sender] + counter.to_bytes(8, "big")
+
+
+def encrypt_packet(aes_key: bytes, plaintext: bytes, aad: bytes | None = None) -> bytes:
     """Return a frame ready for the socket: ``[length][nonce][ciphertext+tag]``."""
     nonce = os.urandom(AES_NONCE_SIZE)
-    payload = nonce + AESGCM(aes_key).encrypt(nonce, plaintext, None)
+    payload = nonce + AESGCM(aes_key).encrypt(nonce, plaintext, aad)
     return struct.pack(FRAME_LAYER_FORMAT, len(payload)) + payload
 
 
-def decrypt_packet(aes_key: bytes, frame: bytes) -> bytes:
+def decrypt_packet(aes_key: bytes, frame: bytes, aad: bytes | None = None) -> bytes:
     """Decrypt a frame *without* its length prefix (the reader already consumed it)."""
     if len(frame) < AES_NONCE_SIZE + AES_TAG_SIZE:
         raise CryptoError("frame too short for AES-GCM")
     try:
-        return AESGCM(aes_key).decrypt(frame[:AES_NONCE_SIZE], frame[AES_NONCE_SIZE:], None)
+        return AESGCM(aes_key).decrypt(frame[:AES_NONCE_SIZE], frame[AES_NONCE_SIZE:], aad)
     except InvalidTag:
         raise CryptoError("frame failed authentication") from None
 
@@ -127,12 +140,23 @@ async def read_frame(reader: asyncio.StreamReader) -> bytes:
 
 
 class SessionCrypto:
-    """The AES key of one hub <-> node connection."""
+    """The AES key and frame counters of one hub <-> node connection, seen from ``role``.
 
-    def __init__(self, aes_key: bytes) -> None:
+    Not safe to share between concurrent writers without a lock: frames must
+    reach the wire in the order they were encrypted (``encrypt_to_writer`` and
+    ``network_io.send_packet`` encrypt while holding the connection's lock).
+    """
+
+    def __init__(self, aes_key: bytes, role: Role) -> None:
         if len(aes_key) != AES_KEY_SIZE:
             raise CryptoError(f"AES key must be {AES_KEY_SIZE} bytes")
+        if role not in _ROLE_BYTE:
+            raise ValueError(f"role must be 'hub' or 'node' (got {role!r})")
         self.aes_key = aes_key
+        self.role: Role = role
+        self.peer_role: Role = "node" if role == "hub" else "hub"
+        self.send_counter = 0
+        self.recv_counter = 0
         # Set on the node side: the key the hub presented, for pinning.
         self.peer_fingerprint: str | None = None
 
@@ -146,7 +170,7 @@ class SessionCrypto:
         encrypted_key = await read_frame(reader)
         aes_key = rsa_decrypt_aes_key(rsa_private_key, encrypted_key)
         log.debug("handshake complete (hub side)")
-        return cls(aes_key)
+        return cls(aes_key, "hub")
 
     @classmethod
     async def node_handshake(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> SessionCrypto:
@@ -159,16 +183,22 @@ class SessionCrypto:
         aes_key = os.urandom(AES_KEY_SIZE)
         writer.write(frame_bytes(rsa_encrypt_aes_key(hub_key, aes_key)))
         await writer.drain()
-        session = cls(aes_key)
+        session = cls(aes_key, "node")
         session.peer_fingerprint = public_key_fingerprint(hub_key)
         log.debug("handshake complete (node side)")
         return session
 
     def encrypt(self, plaintext: bytes) -> bytes:
-        return encrypt_packet(self.aes_key, plaintext)
+        """Encrypt the next outgoing frame (advances the send counter)."""
+        frame = encrypt_packet(self.aes_key, plaintext, frame_aad(self.role, self.send_counter))
+        self.send_counter += 1
+        return frame
 
     def decrypt(self, frame: bytes) -> bytes:
-        return decrypt_packet(self.aes_key, frame)
+        """Decrypt the next incoming frame; anything but the expected next frame fails."""
+        plaintext = decrypt_packet(self.aes_key, frame, frame_aad(self.peer_role, self.recv_counter))
+        self.recv_counter += 1
+        return plaintext
 
     async def decrypt_from_reader(self, reader: asyncio.StreamReader) -> bytes | None:
         """Read and decrypt one frame.
@@ -192,10 +222,9 @@ class SessionCrypto:
         return self.decrypt(frame)
 
     async def encrypt_to_writer(self, writer: asyncio.StreamWriter, lock: asyncio.Lock, plaintext: bytes) -> None:
-        """Encrypt and write one frame; ``lock`` keeps concurrent frames from interleaving."""
-        frame = self.encrypt(plaintext)
+        """Encrypt and write one frame; ``lock`` keeps frames whole and in counter order."""
         async with lock:
-            writer.write(frame)
+            writer.write(self.encrypt(plaintext))
             await writer.drain()
 
 

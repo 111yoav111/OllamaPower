@@ -336,14 +336,19 @@ def build_subtask_packet(
 
 def build_result_packet(
     payload: dict[str, Any],
+    request_id: int,
     status: STATUS_FLAGS = STATUS_FLAGS.DONE,
     subtask_index: int | None = None,
     kind: PayloadKind = PayloadKind.generic,
 ) -> bytes:
-    """Node -> hub: the answer to a (sub)task request."""
+    """Node -> hub: the answer to the (sub)task request with wire id ``request_id``.
+
+    The request id travels in the ``parent_id`` header field, so the hub can
+    match a result to its request without opening the payload.
+    """
     packet_type = PACKET_FLAGS.subtask_result if subtask_index is not None else PACKET_FLAGS.task_result
     return TaskPacket.from_payload(
-        payload, packet_type, kind=kind, status=status, subtask_index=subtask_index
+        payload, packet_type, kind=kind, status=status, parent_id=request_id, subtask_index=subtask_index
     ).to_bytes()
 
 
