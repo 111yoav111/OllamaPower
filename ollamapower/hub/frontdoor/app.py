@@ -138,13 +138,14 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
         )
         app.state.http = client
         app.state.loop = asyncio.get_running_loop()
-        poller = asyncio.ensure_future(hub.poll_ollama(client))
+        pollers = [asyncio.ensure_future(hub.poll_ollama(client)), asyncio.ensure_future(hub.poll_local())]
         try:
             yield
         finally:
-            poller.cancel()
+            for poller in pollers:
+                poller.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await poller
+                await asyncio.gather(*pollers, return_exceptions=True)
             hub.kill_all_streams("hub shutting down")
             await client.aclose()
 

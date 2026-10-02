@@ -28,12 +28,16 @@ from ..ollama.client import OllamaStatus, human_bytes, probe
 from ..scheduling.request_queue import RequestGate
 from ..scheduling.task_pool import TaskPriority
 from ..state import StateStore
+from .control_server import ControlServer
+from .nodes import NodeRegistry
 
 log = logging.getLogger("ollamapower.hub")
 
 OLLAMA_POLL_INTERVAL = 5.0
 RECENT_WINDOW = 60.0  # seconds counted in "requests last minute"
 MAX_RECENT = 10_000
+MAX_EVENTS = 500
+LOCAL_POLL_INTERVAL = 2.0
 ENGINE_LOCAL = "local-ollama"
 
 _stream_ids = itertools.count(1)
@@ -90,6 +94,55 @@ class Hub:
         self.requests_failed = 0
         self._recent: deque[float] = deque(maxlen=MAX_RECENT)
         self.extra_warnings: list[str] = []
+        # The recent event feed (also written to events.jsonl) for the TUI's log screen.
+        self.recent_events: deque[dict[str, Any]] = deque(maxlen=MAX_EVENTS)
+        self.event_seq = 0
+        self.registry = NodeRegistry(state, self.event, config.control.heartbeat_timeout)
+        self.control: ControlServer | None = None
+        self.fingerprint = ""
+        self.local_static: dict[str, Any] = {}
+        self.local_sample: dict[str, Any] = {}
+
+    # ----- events ----------------------------------------------------------------------
+
+    def event(self, kind: str, **fields: Any) -> None:
+        """Record an event: the rotating events.jsonl and the in-memory feed."""
+        self.events.event(kind, **fields)
+        self.event_seq += 1
+        self.recent_events.append({"seq": self.event_seq, "ts": time.time(), "kind": kind, **fields})
+
+    @property
+    def version(self) -> int:
+        """Changes whenever something a view shows may have changed (cheap TUI refresh check)."""
+        return self.event_seq + self.registry.version + self.requests_total + len(self.streams)
+
+    # ----- control plane -----------------------------------------------------------------
+
+    async def start_control(self, key: Any, token: str | None, sock: Any = None) -> ControlServer:
+        from ..core.encrypt_layer import public_key_fingerprint
+
+        self.fingerprint = public_key_fingerprint(key.public_key())
+        self.control = ControlServer(self.config.control, self.registry, key, token, self.event)
+        await self.control.start(sock)
+        self.event("control_start", port=self.control.port, fingerprint=self.fingerprint)
+        return self.control
+
+    async def stop_control(self) -> None:
+        if self.control is not None:
+            await self.control.close()
+
+    async def poll_local(self) -> None:
+        """The hub's own CPU/GPU, for the Overview screen."""
+        from ..telemetry import Telemetry
+
+        probe = await asyncio.to_thread(Telemetry)
+        self.local_static = await asyncio.to_thread(probe.static)
+        while True:
+            try:
+                self.local_sample = await asyncio.to_thread(probe.sample)
+            except Exception as exc:  # noqa: BLE001 - telemetry is best effort
+                log.debug("local telemetry failed: %s", type(exc).__name__)
+            await asyncio.sleep(LOCAL_POLL_INTERVAL)
 
     # ----- streams ---------------------------------------------------------------------
 
@@ -162,6 +215,8 @@ class Hub:
             warnings.append(
                 f"Ollama is not reachable at {self.config.ollama.url} ({self.ollama.error}); run `ollamapower doctor`."
             )
+        for node in self.registry.nodes.values():
+            warnings.extend(node.warnings())
         for m in self.ollama.models:
             if m.spilled:
                 warnings.append(
@@ -236,6 +291,14 @@ class Hub:
                 }
                 for model, g in self.last_generation.items()
             },
-            "nodes": [],  # helpers arrive in Phase 2
+            "nodes": self.registry.snapshot(),
+            "control": {
+                "enabled": self.control is not None,
+                "port": self.control.port if self.control is not None and self.control.server else None,
+                "fingerprint": self.fingerprint,
+                "bans": {ip: round(left) for ip, left in self.control.bans.active().items()} if self.control else {},
+            },
+            "hub_hardware": {**self.local_static, "live": self.local_sample},
+            "events": list(self.recent_events)[-20:],
             "warnings": self.warnings(),
         }

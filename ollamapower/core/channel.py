@@ -17,6 +17,7 @@ from .network_io import read_one_packet, send_packet
 
 # Until the peer has proven itself, frames bigger than this are refused.
 PRE_AUTH_MAX_FRAME = 64 * 1024
+BYE_GRACE = 1.0  # seconds a peer gets to hang up after our bye
 
 
 class Channel:
@@ -60,6 +61,13 @@ class Channel:
         if reason is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self.send("bye", reason=reason[: protocol.MAX_STRING]), 2)
+                # Half-close and give the peer a moment to read the bye and hang up: closing
+                # at once can turn its next write into a reset that discards the bye unread.
+                if self.writer.can_write_eof():
+                    self.writer.write_eof()
+                deadline = asyncio.get_running_loop().time() + BYE_GRACE
+                while not self.reader.at_eof() and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.02)
         self.writer.close()
         with contextlib.suppress(Exception):
             await asyncio.wait_for(self.writer.wait_closed(), 2)

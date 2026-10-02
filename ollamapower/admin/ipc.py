@@ -61,8 +61,9 @@ class NotRunning(Exception):
     pass
 
 
-def run_dir(config_dir: Path) -> Path:
-    return config_dir / "run"
+def run_dir(config_dir: Path, name: str = "run") -> Path:
+    """``run`` for the hub, ``agent-run`` for an agent on the same machine."""
+    return config_dir / name
 
 
 def _mac(secret: str, role: str, challenge: str, nonce: str) -> str:
@@ -197,16 +198,16 @@ def _socket_path(rdir: Path) -> tuple[Path, Path | None]:
     return temp_dir / "admin.sock", temp_dir
 
 
-async def start_control_server(config_dir: Path, handler: Handler) -> ControlServer:
-    """Start the channel. Raises ``RuntimeError`` if another hub runs or the directory is unsafe."""
-    rdir = run_dir(config_dir)
+async def start_control_server(config_dir: Path, handler: Handler, name: str = "run") -> ControlServer:
+    """Start the channel. Raises ``RuntimeError`` if another instance runs or the directory is unsafe."""
+    rdir = run_dir(config_dir, name)
     try:
         private_dir(rdir)
     except OSError as exc:
         raise RuntimeError(str(exc)) from None
     info_path = rdir / "admin.json"
     if info_path.exists() and await asyncio.to_thread(_alive, info_path):
-        raise RuntimeError("another OllamaPower hub is already running")
+        raise RuntimeError(f"another OllamaPower {'hub' if name == 'run' else 'agent'} is already running")
     secret = secrets.token_urlsafe(32)
     writers: set[asyncio.StreamWriter] = set()
 
@@ -246,8 +247,8 @@ async def start_control_server(config_dir: Path, handler: Handler) -> ControlSer
 class ControlClient:
     """Synchronous client used by the CLI."""
 
-    def __init__(self, config_dir: Path, timeout: float = 10.0) -> None:
-        self._init(run_dir(config_dir) / "admin.json", timeout)
+    def __init__(self, config_dir: Path, timeout: float = 10.0, name: str = "run") -> None:
+        self._init(run_dir(config_dir, name) / "admin.json", timeout)
 
     @classmethod
     def from_info_file(cls, info_path: Path, timeout: float = 10.0) -> ControlClient:

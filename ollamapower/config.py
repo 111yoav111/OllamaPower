@@ -61,6 +61,39 @@ class OllamaConfig:
     read_timeout: float = 600.0
 
 
+DEFAULT_AGENT_NETWORKS = [
+    "127.0.0.0/8",
+    "::1/128",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",  # CGNAT, incl. Tailscale
+    "fc00::/7",
+    "fe80::/10",
+]
+
+
+@dataclass
+class ControlConfig:
+    """The control plane helpers connect to (DCP's protocol, encrypted)."""
+
+    enabled: bool = True
+    # Helpers on the LAN must reach it, so it listens on all interfaces by default;
+    # connections from outside allowed_networks are dropped before the handshake.
+    host: str = "0.0.0.0"
+    port: int = 9000
+    allowed_networks: list[str] = field(default_factory=lambda: list(DEFAULT_AGENT_NETWORKS))
+    # An agent silent for this long is treated as gone (it beats every 2 s).
+    heartbeat_timeout: float = 10.0
+    handshake_timeout: float = 10.0
+    max_nodes: int = 32
+    # Failed logins from one IP within ban_window seconds -> banned, doubling on repeat.
+    ban_failures: int = 5
+    ban_window: int = 600
+    ban_seconds: int = 600
+    max_ban_seconds: int = 86400
+
+
 @dataclass
 class LoggingConfig:
     level: str = "info"  # debug | info | warning | error
@@ -73,6 +106,7 @@ class LoggingConfig:
 class Config:
     hub: HubConfig = field(default_factory=HubConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    control: ControlConfig = field(default_factory=ControlConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     config_dir: Path = field(default_factory=default_config_dir)
 
@@ -106,6 +140,24 @@ class Config:
                 f"ollama.url uses port {h.port}, which is the front door's own port; move Ollama "
                 "to another port (default 11435, see `ollamapower doctor`)"
             )
+        c = self.control
+        if not (1 <= c.port <= 65535):
+            raise ConfigError(f"control.port out of range: {c.port}")
+        if c.enabled and c.port == h.port:
+            raise ConfigError("control.port must differ from hub.port")
+        for name in ("heartbeat_timeout", "handshake_timeout"):
+            value = getattr(c, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ConfigError(f"control.{name} must be a positive number")
+        if c.max_nodes < 1 or c.ban_failures < 1 or c.ban_window < 1 or c.ban_seconds < 1:
+            raise ConfigError("control.max_nodes, ban_failures, ban_window and ban_seconds must be positive")
+        if c.max_ban_seconds < c.ban_seconds:
+            raise ConfigError("control.max_ban_seconds must be at least control.ban_seconds")
+        for cidr in c.allowed_networks:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                raise ConfigError(f"invalid control.allowed_networks entry {cidr!r}") from None
         if self.logging.level not in ("debug", "info", "warning", "error"):
             raise ConfigError("logging.level must be debug, info, warning or error")
         if self.logging.file_max_bytes < 64 * 1024 or self.logging.file_backups < 1:
@@ -129,6 +181,10 @@ class Config:
         return self.config_dir / "state.json"
 
     @property
+    def hub_key_path(self) -> Path:
+        return self.config_dir / "hub_key.pem"
+
+    @property
     def logs_dir(self) -> Path:
         return self.config_dir / "logs"
 
@@ -146,11 +202,12 @@ def _coerce(value: typing.Any, hint: typing.Any, where: str) -> typing.Any:
     """Coerce a TOML or env-string value to the dataclass field type."""
     origin = typing.get_origin(hint)
     if origin is list:
+        item = (typing.get_args(hint) or (str,))[0]
         if isinstance(value, str):
             value = [v.strip() for v in value.split(",") if v.strip()]
-        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-            raise ConfigError(f"{where} must be a list of strings")
-        return list(value)
+        if not isinstance(value, list):
+            raise ConfigError(f"{where} must be a list")
+        return [_coerce(v, item, where) for v in value]
     if hint is bool:
         if isinstance(value, bool):
             return value
@@ -189,7 +246,7 @@ def _apply(section_obj: typing.Any, data: dict, section: str) -> None:
         setattr(section_obj, key, _coerce(value, hints[key], f"{section}.{key}"))
 
 
-SECTIONS = ("hub", "ollama", "logging")
+SECTIONS = ("hub", "ollama", "control", "logging")
 # Env vars with the prefix that are not config overrides.
 NON_CONFIG_ENV = {"OLLAMAPOWER_TOKEN", "OLLAMAPOWER_CONFIG_DIR"}
 

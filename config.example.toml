@@ -28,6 +28,25 @@ connect_timeout = 5.0
 # Max seconds between two chunks from Ollama (loading a big model can be slow).
 read_timeout = 600.0
 
+[control]
+# The control plane helpers connect to. It listens on all interfaces so LAN
+# helpers can reach it, but drops connections from outside allowed_networks
+# before the handshake, and every helper needs the cluster token from .env.
+enabled = true
+host = "0.0.0.0"
+port = 9000
+allowed_networks = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10"]
+# A helper silent this long (it beats every 2 s) counts as gone.
+heartbeat_timeout = 10.0
+handshake_timeout = 10.0
+max_nodes = 32
+# This many failed logins from one IP within ban_window seconds -> ban for
+# ban_seconds, doubling on each repeat up to max_ban_seconds.
+ban_failures = 5
+ban_window = 600
+ban_seconds = 600
+max_ban_seconds = 86400
+
 [logging]
 level = "info"   # debug | info | warning | error
 # logs/events.jsonl and logs/requests.jsonl rotate at this size; this many old files are kept.

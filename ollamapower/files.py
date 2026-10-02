@@ -112,3 +112,27 @@ def write_token(env_path: Path, token: str) -> None:
         pass
     lines.append(f'{TOKEN_ENV}="{token}"')
     write_private(env_path, ("\n".join(lines) + "\n").encode("utf-8"))
+
+
+# ----- the hub's RSA key ---------------------------------------------------------------
+
+
+def load_or_create_hub_key(path: Path):  # -> rsa.RSAPrivateKey
+    """The hub's long-lived control-plane key. Agents pin its fingerprint, so it must persist."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from .core.encrypt_layer import generate_rsa_keypair
+
+    if path.exists():
+        problem = permission_problem(path)
+        if problem:
+            raise OSError(f"{path} {problem}; refusing to use it (chmod 600)")
+        key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+        if not isinstance(key, rsa.RSAPrivateKey):
+            raise OSError(f"{path} is not an RSA private key")
+        return key
+    key = generate_rsa_keypair()
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    write_private(path, pem)
+    return key

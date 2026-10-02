@@ -61,7 +61,12 @@ def test_example_config_is_the_default(tmp_path):
     assert (root / "config.example.toml").read_text() == packaged.read_text()
     cfg = load_config(packaged, env={"OLLAMAPOWER_CONFIG_DIR": str(tmp_path)})
     default = Config()
-    assert (cfg.hub, cfg.ollama, cfg.logging) == (default.hub, default.ollama, default.logging)
+    assert (cfg.hub, cfg.ollama, cfg.control, cfg.logging) == (
+        default.hub,
+        default.ollama,
+        default.control,
+        default.logging,
+    )
 
 
 def test_url_without_port_is_port_80_not_11434(tmp_path):
