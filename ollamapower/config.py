@@ -95,6 +95,31 @@ class ControlConfig:
 
 
 @dataclass
+class LlamaCppConfig:
+    # auto | cpu | metal | vulkan | cuda12 | cuda13 | rocm. auto = Metal on Apple
+    # Silicon, Vulkan with a GPU, CPU otherwise. CUDA is faster on NVIDIA but a
+    # 600-850 MB download.
+    backend: str = "auto"
+    # Use your own build instead of downloading (it must be the pinned build).
+    path: str = ""
+
+
+@dataclass
+class SplitConfig:
+    """Split mode: one model across the hub's GPU and helpers' GPUs (llama.cpp RPC)."""
+
+    # Seconds an idle split model stays loaded before the GPU goes back to Ollama.
+    keep_alive: float = 300.0
+    # Context size when the plan doesn't set one.
+    default_ctx: int = 4096
+    # Seconds to wait for llama-server to load the model (first loads copy the
+    # weights to the helpers over the network).
+    load_timeout: float = 900.0
+    # No token for this long counts as a failure.
+    stall_timeout: float = 120.0
+
+
+@dataclass
 class LoggingConfig:
     level: str = "info"  # debug | info | warning | error
     # Rotating JSON-lines files in <config dir>/logs: size of each file, files kept.
@@ -107,6 +132,8 @@ class Config:
     hub: HubConfig = field(default_factory=HubConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
+    llamacpp: LlamaCppConfig = field(default_factory=LlamaCppConfig)
+    split: SplitConfig = field(default_factory=SplitConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     config_dir: Path = field(default_factory=default_config_dir)
 
@@ -158,6 +185,17 @@ class Config:
                 ipaddress.ip_network(cidr, strict=False)
             except ValueError:
                 raise ConfigError(f"invalid control.allowed_networks entry {cidr!r}") from None
+        from .llamacpp.variants import BACKENDS
+
+        if self.llamacpp.backend not in BACKENDS:
+            raise ConfigError(f"llamacpp.backend must be one of {', '.join(BACKENDS)}")
+        sp = self.split
+        for name in ("keep_alive", "load_timeout", "stall_timeout"):
+            value = getattr(sp, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ConfigError(f"split.{name} must be a positive number")
+        if not 256 <= sp.default_ctx <= 1_048_576:
+            raise ConfigError("split.default_ctx must be between 256 and 1048576")
         if self.logging.level not in ("debug", "info", "warning", "error"):
             raise ConfigError("logging.level must be debug, info, warning or error")
         if self.logging.file_max_bytes < 64 * 1024 or self.logging.file_backups < 1:
@@ -246,7 +284,7 @@ def _apply(section_obj: typing.Any, data: dict, section: str) -> None:
         setattr(section_obj, key, _coerce(value, hints[key], f"{section}.{key}"))
 
 
-SECTIONS = ("hub", "ollama", "control", "logging")
+SECTIONS = ("hub", "ollama", "control", "llamacpp", "split", "logging")
 # Env vars with the prefix that are not config overrides.
 NON_CONFIG_ENV = {"OLLAMAPOWER_TOKEN", "OLLAMAPOWER_CONFIG_DIR"}
 

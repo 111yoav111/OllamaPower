@@ -47,6 +47,26 @@ ban_window = 600
 ban_seconds = 600
 max_ban_seconds = 86400
 
+[llamacpp]
+# The llama.cpp build used for split mode (pinned and SHA-256 checked).
+# auto = Metal on Apple Silicon, Vulkan if there is a GPU, CPU otherwise.
+# cuda12 / cuda13 are usually faster on NVIDIA but a 600-850 MB download;
+# rocm needs AMD's ROCm runtime on Linux.
+backend = "auto"
+# Your own build instead of the download (it must be the pinned build).
+path = ""
+
+[split]
+# Split mode runs one model across the hub's GPU and helpers' GPUs.
+# Seconds an idle split model stays loaded before the GPU goes back to Ollama.
+keep_alive = 300.0
+# Context size when a plan doesn't set one.
+default_ctx = 4096
+# Seconds allowed for loading (the first load copies weights to the helpers).
+load_timeout = 900.0
+# No new token for this long counts as a failure.
+stall_timeout = 120.0
+
 [logging]
 level = "info"   # debug | info | warning | error
 # logs/events.jsonl and logs/requests.jsonl rotate at this size; this many old files are kept.

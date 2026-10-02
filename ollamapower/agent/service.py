@@ -8,7 +8,7 @@ from ..admin.ipc import AdminError
 from ..config import ConfigError
 from .client import AgentClient
 
-RULE_KEYS = ("max_vram_gb", "max_vram_percent", "gpus", "allow_cpu", "allow_direct", "schedule")
+RULE_KEYS = ("max_vram_gb", "max_vram_percent", "gpus", "allow_cpu", "allow_direct", "disk_cache", "schedule")
 
 
 def agent_snapshot(client: AgentClient) -> dict[str, Any]:

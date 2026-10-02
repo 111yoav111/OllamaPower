@@ -253,6 +253,9 @@ def agent_rules(
     allow_direct: bool | None = typer.Option(
         None, "--allow-direct/--no-direct", help="Allow unencrypted trusted-LAN mode"
     ),
+    disk_cache: bool | None = typer.Option(
+        None, "--disk-cache/--no-disk-cache", help="Keep received model weights on disk for faster reloads"
+    ),
 ) -> None:
     """Show or change the lending rules of the running agent (saved to agent.toml)."""
     changes: dict[str, Any] = {
@@ -262,6 +265,7 @@ def agent_rules(
             "max_vram_percent": max_vram_percent,
             "allow_cpu": allow_cpu,
             "allow_direct": allow_direct,
+            "disk_cache": disk_cache,
         }.items()
         if v is not None
     }

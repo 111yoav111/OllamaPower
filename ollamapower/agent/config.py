@@ -46,7 +46,8 @@ class LendingRules:
     max_vram_percent: int = 0
     gpus: list[int] = field(default_factory=list)  # empty = all GPUs
     allow_cpu: bool = False  # lend CPU/RAM when there is no GPU
-    allow_direct: bool = False  # allow unencrypted trusted-LAN mode for split traffic (Phase 4)
+    allow_direct: bool = False  # allow unencrypted trusted-LAN mode for split traffic
+    disk_cache: bool = True  # keep received model weights on disk so later loads skip the network
     schedule: list[str] = field(default_factory=list)  # e.g. ["22:00-08:00"] (Phase 6)
 
     def validate(self) -> None:
@@ -71,10 +72,18 @@ def _is_hhmm(value: str) -> bool:
 
 
 @dataclass
+class AgentLlamaCpp:
+    # auto | cpu | metal | vulkan | cuda12 | cuda13 | rocm (see the hub's config).
+    backend: str = "auto"
+    path: str = ""  # your own build instead of the download (must be the pinned build)
+
+
+@dataclass
 class AgentConfig:
     hub: HubAddress = field(default_factory=HubAddress)
     agent: AgentSettings = field(default_factory=AgentSettings)
     lending: LendingRules = field(default_factory=LendingRules)
+    llamacpp: AgentLlamaCpp = field(default_factory=AgentLlamaCpp)
     config_dir: Path = field(default_factory=default_config_dir)
 
     @property
@@ -103,9 +112,13 @@ class AgentConfig:
         if len(self.agent.name) > 64:
             raise ConfigError("agent.name is too long (64 characters at most)")
         self.lending.validate()
+        from ..llamacpp.variants import BACKENDS
+
+        if self.llamacpp.backend not in BACKENDS:
+            raise ConfigError(f"llamacpp.backend must be one of {', '.join(BACKENDS)}")
 
 
-SECTIONS = ("hub", "agent", "lending")
+SECTIONS = ("hub", "agent", "lending", "llamacpp")
 
 
 def load_agent_config(config_dir: Path | None = None, path: Path | None = None) -> AgentConfig:

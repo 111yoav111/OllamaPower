@@ -110,6 +110,7 @@ def clean_lending(value: Any) -> dict[str, Any]:
         "gpus": [g for g in (_index(x) for x in gpus[:16]) if g is not None],
         "allow_cpu": r.get("allow_cpu") is True,
         "allow_direct": r.get("allow_direct") is True,
+        "disk_cache": r.get("disk_cache") is not False,
         "schedule": [safe_text(w, 20) for w in schedule[:8] if isinstance(w, str)],
         "paused": r.get("paused") is True,
     }

@@ -61,6 +61,11 @@ class RulesScreen(ModalScreen[dict[str, Any] | None]):
                 r["allow_direct"],
                 id="rule-allow_direct",
             )
+            yield Checkbox(
+                "Keep received model weights on disk (faster reloads; uses disk space)",
+                r.get("disk_cache", True),
+                id="rule-disk_cache",
+            )
             yield Static(id="rule-error")
             with Horizontal(classes="buttons"):
                 yield Button("Save", id="save", variant="primary")
@@ -87,6 +92,7 @@ class RulesScreen(ModalScreen[dict[str, Any] | None]):
             "schedule": [w.strip() for w in self._value("schedule").split(",") if w.strip()],
             "allow_cpu": self.query_one("#rule-allow_cpu", Checkbox).value,
             "allow_direct": self.query_one("#rule-allow_direct", Checkbox).value,
+            "disk_cache": self.query_one("#rule-disk_cache", Checkbox).value,
         }
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -214,7 +220,7 @@ class AgentTUI(App[None]):
         lend.add_column(style="bold")
         lend.add_column()
         lend.add_row("Lending", t("PAUSED" if s["paused"] else "on", "bold yellow" if s["paused"] else "bold green"))
-        lend.add_row("Lent right now", t("nothing yet (split mode arrives in Phase 3)", "dim"))
+        lend.add_row("Lent right now", t(s["lent"] or "nothing", "bold" if s["lent"] else "dim"))
         caps = []
         if r["max_vram_gb"]:
             caps.append(f"{r['max_vram_gb']} GB")
