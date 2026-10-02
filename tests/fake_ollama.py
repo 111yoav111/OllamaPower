@@ -38,8 +38,13 @@ class Recorder:
     )
 
     @property
+    def client_requests(self) -> list[dict[str, Any]]:
+        """What clients sent through the front door (the hub's own status polls left out)."""
+        return [r for r in self.requests if r["headers"].get("user-agent") != "ollamapower-status-probe"]
+
+    @property
     def last(self) -> dict[str, Any]:
-        return self.requests[-1]
+        return self.client_requests[-1]
 
     def paths(self) -> list[str]:
         return [r["path"] for r in self.requests]

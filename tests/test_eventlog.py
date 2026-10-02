@@ -33,6 +33,7 @@ def test_rotation_keeps_old_entries_readable(tmp_path):
 def test_follow_sees_new_entries(tmp_path):
     log = EventLog(tmp_path, 1024 * 1024, 2)
     log.event("before")
+    assert wait_for(lambda: (tmp_path / "events.jsonl").read_text().strip())  # written by the log thread
     seen: list[str] = []
 
     def run():

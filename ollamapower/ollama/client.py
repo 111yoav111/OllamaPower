@@ -8,12 +8,15 @@ case where a helper GPU can help, so the hub surfaces it as a warning.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 
 from ..textsafe import safe_text
 
 PROBE_TIMEOUT = 3.0
+# Our own status polls identify themselves (visible in Ollama's logs).
+PROBE_HEADERS = {"user-agent": "ollamapower-status-probe"}
 
 
 @dataclass
@@ -91,9 +94,13 @@ def parse_tags(data: object) -> list[InstalledModel]:
 
 async def probe(client: httpx.AsyncClient) -> OllamaStatus:
     try:
-        version = (await client.get("/api/version", timeout=PROBE_TIMEOUT)).json().get("version", "")
-        ps = (await client.get("/api/ps", timeout=PROBE_TIMEOUT)).json()
-        tags = (await client.get("/api/tags", timeout=PROBE_TIMEOUT)).json()
+
+        def get(path: str) -> Any:
+            return client.get(path, timeout=PROBE_TIMEOUT, headers=PROBE_HEADERS)
+
+        version = (await get("/api/version")).json().get("version", "")
+        ps = (await get("/api/ps")).json()
+        tags = (await get("/api/tags")).json()
     except (httpx.HTTPError, ValueError, AttributeError) as exc:
         return OllamaStatus(reachable=False, error=type(exc).__name__)
     return OllamaStatus(

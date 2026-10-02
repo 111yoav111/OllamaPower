@@ -87,3 +87,12 @@ def test_permission_checks(make_config):
     os.chmod(cfg.env_path, 0o644)
     bad = doctor.check_permissions(cfg)
     assert bad[0].level == "error" and "chmod 600" in bad[0].fix
+
+
+def test_control_checks(make_config):
+    cfg = make_config("http://127.0.0.1:11435")
+    assert [f.level for f in doctor.check_control(cfg)] == ["ok", "warn"]  # no hub key yet
+    cfg.control.allowed_networks = ["0.0.0.0/0"]
+    assert doctor.check_control(cfg)[0].level == "warn"
+    cfg.control.enabled = False
+    assert doctor.check_control(cfg)[0].level == "ok"

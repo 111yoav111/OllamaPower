@@ -222,7 +222,17 @@ def check_permissions(config: Config) -> list[Finding]:
     if sys.platform == "win32":
         return [Finding("ok", "File permissions: per-user profile folder (not checked on Windows)")]
     findings = []
-    paths = [config.config_dir, config.env_path, config.state_path, config.state_path.with_name("state.json.bak")]
+    d = config.config_dir
+    paths = [
+        d,
+        config.env_path,
+        config.state_path,
+        config.state_path.with_name("state.json.bak"),
+        config.hub_key_path,
+        d / "agent.toml",
+        d / "known_hub",
+        d / "node_id",
+    ]
     if config.logs_dir.exists():
         paths += [config.logs_dir, *sorted(config.logs_dir.iterdir())]
     for path in paths:
@@ -232,7 +242,38 @@ def check_permissions(config: Config) -> list[Finding]:
                 Finding("error", f"{path} {problem}", f"chmod {'700' if path.is_dir() else '600'} '{path}'")
             )
     if not findings:
-        findings.append(Finding("ok", "Token, state and log files are owner-only"))
+        findings.append(Finding("ok", "Token, keys, state and log files are owner-only"))
+    return findings
+
+
+def check_control(config: Config) -> list[Finding]:
+    c = config.control
+    if not c.enabled:
+        return [Finding("ok", "Control plane disabled (no helpers can join)")]
+    findings = []
+    public = []
+    for cidr in c.allowed_networks:
+        net = ipaddress.ip_network(cidr, strict=False)
+        if net.prefixlen == 0 or (net.is_global and not net.is_private):
+            public.append(cidr)
+    if public:
+        findings.append(
+            Finding(
+                "warn",
+                f"control.allowed_networks includes public addresses ({', '.join(public)})",
+                "Helpers belong on your LAN (or a tailnet). Keep the private ranges only.",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "ok", f"Control plane on port {c.port} accepts only {len(c.allowed_networks)} private network ranges"
+            )
+        )
+    if config.hub_key_path.exists():
+        findings.append(Finding("ok", "Hub key exists (helpers pin its fingerprint)"))
+    else:
+        findings.append(Finding("warn", "No hub key yet", "Run `ollamapower init` (or start the hub once)."))
     return findings
 
 
@@ -247,6 +288,7 @@ def run_all(config: Config) -> list[Finding]:
         *check_ports(config),
         *check_exposure(config),
         *check_token(config),
+        *check_control(config),
         *check_permissions(config),
         *check_user(),
     ]

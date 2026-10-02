@@ -226,7 +226,7 @@ def test_foreign_host_header_is_refused(frontdoor, client, host):
     for path in ("/api/tags", "/ollamapower/status", "/"):
         r = client.get(frontdoor.url + path, headers={"Host": host})
         assert r.status_code == 403 and r.json() == {"error": "forbidden host"}
-    assert all(r["path"] != "/api/tags" for r in frontdoor.recorder.requests)
+    assert frontdoor.recorder.client_requests == []
 
 
 @pytest.mark.parametrize("host", ["localhost:11434", "127.0.0.1", "[::1]:11434", "my-pc.local", "192.168.1.10:11434"])

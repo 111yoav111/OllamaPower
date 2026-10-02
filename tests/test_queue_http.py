@@ -39,7 +39,7 @@ def test_higher_priority_goes_first(frontdoor_factory):
     assert {s["state"] for s in snap["streams"]} == {"running", "queued"}
     for t in [blocker, *threads]:
         t.join(10)
-    order = [r["body"]["tag"] for r in fd.recorder.requests if r["path"] == "/api/chat"]
+    order = [r["body"]["tag"] for r in fd.recorder.client_requests if r["path"] == "/api/chat"]
     assert order == ["blocker", "critical", "high", "normal", "low"]
     assert all(r.status_code == 200 for r in results.values())
 
@@ -53,7 +53,7 @@ def test_queue_timeout_gives_503(frontdoor_factory):
     assert results["late"].status_code == 503
     assert results["late"].headers["retry-after"] == "10"
     blocker.join(5)
-    assert [r["body"]["tag"] for r in fd.recorder.requests if r["path"] == "/api/chat"] == ["blocker"]
+    assert [r["body"]["tag"] for r in fd.recorder.client_requests if r["path"] == "/api/chat"] == ["blocker"]
 
 
 def test_full_queue_rejects_at_once(frontdoor_factory):
@@ -86,7 +86,7 @@ def test_client_leaving_the_queue_never_reaches_ollama(frontdoor_factory):
     impatient()
     assert wait_for(lambda: fd.call(lambda: fd.hub.gate.waiting) == 0)
     blocker.join(5)
-    assert [r["body"]["tag"] for r in fd.recorder.requests if r["path"] == "/api/chat"] == ["blocker"]
+    assert [r["body"]["tag"] for r in fd.recorder.client_requests if r["path"] == "/api/chat"] == ["blocker"]
     assert wait_for(lambda: fd.call(lambda: fd.hub.gate.active) == 0)
 
 

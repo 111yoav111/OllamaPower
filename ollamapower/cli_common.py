@@ -1,0 +1,130 @@
+"""Helpers shared by the hub and agent CLI commands."""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import logging
+import os
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import typer
+
+from .config import Config, ConfigError, load_config
+
+ConfigOption = typer.Option(None, "--config", "-c", help="Path to config.toml", exists=True, dir_okay=False)
+WATCH_INTERVAL = 2.0
+Lines = list[tuple[str, Any]]
+
+
+def load(config_path: Path | None) -> Config:
+    try:
+        return load_config(config_path)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from None
+
+
+def call(config_dir: Path, cmd: str, *, name: str = "run", timeout: float = 10.0, **args: Any) -> Any:
+    """Run an admin command on the running hub (``name="run"``) or agent (``"agent-run"``)."""
+    from .admin.ipc import AdminError, ControlClient, NotRunning
+
+    what = "hub" if name == "run" else "agent"
+    try:
+        with ControlClient(config_dir, timeout=timeout, name=name) as client:
+            return client.call(cmd, **args)
+    except NotRunning as exc:
+        message = str(exc).replace("the OllamaPower hub", f"the OllamaPower {what}")
+        typer.secho(f"{message}. Start it with `ollamapower {what}`.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(3) from None
+    except AdminError as exc:
+        typer.secho(f"Error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from None
+
+
+def ts(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return dt.datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def duration(secs: float) -> str:
+    secs = int(secs)
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
+
+
+def gb(n: float | None) -> str:
+    return "-" if n is None else f"{float(n) / 1024**3:.1f}"
+
+
+def running_as_admin() -> bool:
+    if hasattr(os, "geteuid"):
+        return os.geteuid() == 0
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return False
+
+
+def refuse_root(allow_root: bool, what: str) -> None:
+    if running_as_admin() and not allow_root:
+        typer.secho(
+            f"Refusing to run the {what} as root/Administrator: run OllamaPower as a normal user "
+            "(or pass --allow-root if you really must, e.g. inside a container).",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(2)
+
+
+class BufferHandler(logging.Handler):
+    """Keeps log lines in memory while a TUI owns the terminal (writing would corrupt it)."""
+
+    def __init__(self, lines: Any) -> None:
+        super().__init__()
+        self.lines = lines
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.lines.append(self.format(record))
+        except Exception:  # noqa: BLE001 - logging must never raise
+            self.handleError(record)
+
+
+def configure_logging(level: str, buffer: Any = None) -> None:
+    """Headless: plain lines on stderr. With a TUI: into ``buffer`` instead."""
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    if buffer is None:
+        logging.basicConfig(level=level.upper(), format=fmt, force=True)
+    else:
+        handler = BufferHandler(buffer)
+        handler.setFormatter(logging.Formatter(fmt, "%H:%M:%S"))
+        logging.basicConfig(level=level.upper(), handlers=[handler], force=True)
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def show(fetch: Callable[[], Any], render: Callable[[Any], Lines], as_json: bool, watch: bool) -> None:
+    """Print once, or (``--watch``) refresh in place until Ctrl+C."""
+    try:
+        while True:
+            data = fetch()
+            if watch:
+                typer.clear()
+            if as_json:
+                typer.echo(json.dumps(data, indent=2))
+            else:
+                for text, color in render(data):
+                    typer.secho(text, fg=color)
+            if not watch:
+                return
+            time.sleep(WATCH_INTERVAL)
+    except KeyboardInterrupt:
+        pass
