@@ -266,3 +266,24 @@ def test_host_parsing():
     assert host_allowed("", "pc") and host_allowed("pc", "pc") and host_allowed("0.0.0.0", "pc")
     assert not host_allowed("localhost.evil.example", "pc")
     assert not host_allowed("evil.example", "pc")
+
+
+# ----- review regressions ----------------------------------------------------------------
+
+
+def test_inference_keeps_query_and_raw_path(frontdoor, client):
+    client.post(frontdoor.url + "/v1/chat/completions?foo=bar", json={"model": "m", "messages": []})
+    assert frontdoor.recorder.last["query"] == "foo=bar"
+    client.post(frontdoor.url + "/api/blobs/sha256-a%2Bb", content=b"x")
+    assert frontdoor.recorder.last["raw_path"] == "/api/blobs/sha256-a%2Bb"
+
+
+def test_untagged_model_name_matches_latest(frontdoor, client):
+    frontdoor.recorder.ps_models.append({"name": "plain:latest", "size": 1, "size_vram": 1})
+    chat(frontdoor, client, model="plain", stream=False)
+
+    def tps():
+        models = frontdoor.call(frontdoor.hub.get_snapshot)["ollama"]["models"]
+        return next((m["last_gen_tps"] for m in models if m["name"] == "plain:latest"), None)
+
+    assert wait_for(lambda: tps() == 20.0, 8)

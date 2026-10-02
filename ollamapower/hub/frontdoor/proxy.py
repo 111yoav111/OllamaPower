@@ -57,8 +57,9 @@ FORWARD_RESPONSE_HEADERS = (
 )
 # How long we try to deliver an in-band error before giving up on a client.
 TRAILER_TIMEOUT = 1.0
-# The tap only looks at lines up to this size (final chunks are small).
-MAX_TAP_LINE = 64 * 1024
+# The tap only looks at lines up to this size. /api/generate's final chunk
+# carries the whole token context (~7 bytes per token), so allow for 128k+ tokens.
+MAX_TAP_LINE = 16 * 1024 * 1024
 
 
 class StreamKilled(Exception):
@@ -149,25 +150,29 @@ class GenerationTap:
     """Finds the ``"done": true`` object of a native-API response and reads its timings."""
 
     def __init__(self) -> None:
-        self._buf = b""
+        self._buf = bytearray()
         self._overflow = False
         self.stats: GenerationStats | None = None
 
     def feed(self, chunk: bytes) -> None:
-        self._buf += chunk
-        while b"\n" in self._buf:
-            line, _, self._buf = self._buf.partition(b"\n")
+        start = 0
+        while (end := chunk.find(b"\n", start)) != -1:
             if not self._overflow:
-                self._consider(line)
+                self._buf += chunk[start:end]
+                self._consider(bytes(self._buf))
+            self._buf.clear()
             self._overflow = False
-        if len(self._buf) > MAX_TAP_LINE:  # a huge line (non-streamed reply, embeddings): skip it
-            self._buf = b""
-            self._overflow = True
+            start = end + 1
+        if not self._overflow:
+            self._buf += chunk[start:]
+            if len(self._buf) > MAX_TAP_LINE:  # absurdly long line: skip it, don't hold it
+                self._buf.clear()
+                self._overflow = True
 
     def close(self) -> GenerationStats | None:
         if self._buf and not self._overflow:
-            self._consider(self._buf)  # non-streaming replies have no trailing newline
-        self._buf = b""
+            self._consider(bytes(self._buf))  # non-streaming replies have no trailing newline
+        self._buf.clear()
         return self.stats
 
     def _consider(self, line: bytes) -> None:

@@ -40,3 +40,12 @@ def test_no_done_no_stats():
     tap = GenerationTap()
     tap.feed(b'{"done": false}\nnot json "done"\n')
     assert tap.close() is None
+
+
+def test_final_generate_chunk_with_long_context():
+    """/api/generate's done chunk carries the token context: far over 64 KiB for long sessions."""
+    tap = GenerationTap()
+    line = json.dumps({**FINAL, "context": list(range(50_000))}).encode() + b"\n"
+    for i in range(0, len(line), 4096):
+        tap.feed(line[i : i + 4096])
+    assert tap.close().gen_tokens == 40

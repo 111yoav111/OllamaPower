@@ -71,6 +71,8 @@ INFERENCE_ENDPOINTS = frozenset(
 TIMED_ENDPOINTS = frozenset({"/api/chat", "/api/generate"})
 PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 MAX_PS_BYTES = 4 * 1024 * 1024
+# Bodies bigger than this are parsed off the event loop (base64 images can be huge).
+INLINE_PARSE_BYTES = 256 * 1024
 
 
 class BodyTooLarge(Exception):
@@ -156,6 +158,10 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
 
     async def forward(request: Request) -> Response:
         method, path = request.method, request.url.path
+        # Forward exactly what the client asked for: the raw (still percent-encoded) path and query.
+        target = request.scope.get("raw_path", path.encode()).decode("latin-1")
+        if request.url.query:
+            target += "?" + request.url.query
         priority = TaskPriority.from_header(request.headers.get(PRIORITY_HEADER))
         stream = hub.register_stream(method, path, priority)
         ticket = Ticket(priority)
@@ -183,7 +189,10 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 except ClientDisconnect:
                     finish("client_disconnect", 499)
                     return Response(status_code=499)
-                stream.model = requested_model(body)
+                if len(body) > INLINE_PARSE_BYTES:
+                    stream.model = await asyncio.to_thread(requested_model, body)
+                else:
+                    stream.model = requested_model(body)
 
                 # 2. Wait for a slot, highest priority first, giving up if the client leaves.
                 queued_at = time.monotonic()
@@ -199,7 +208,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     return error(path, 503, "server busy, try again shortly", {"Retry-After": "10"})
                 stream.queued_ms = int((time.monotonic() - queued_at) * 1000)
                 upstream_request = http.build_request(
-                    method, path, content=body, headers=build_upstream_headers(request.headers)
+                    method, target, content=body, headers=build_upstream_headers(request.headers)
                 )
                 upstream = await race_kill(http.send(upstream_request, stream=True), stream, request.receive)
             else:
@@ -208,8 +217,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 has_body = method not in ("GET", "HEAD", "OPTIONS")
                 upstream_request = http.build_request(
                     method,
-                    path,
-                    params=request.url.query or None,
+                    target,
                     content=request.stream() if has_body else None,
                     headers=build_upstream_headers(request.headers),
                 )

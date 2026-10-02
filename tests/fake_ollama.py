@@ -58,6 +58,7 @@ def make_fake_ollama() -> tuple[Starlette, Recorder]:
             "method": request.method,
             "path": request.url.path,
             "query": request.url.query,
+            "raw_path": request.scope.get("raw_path", b"").decode("latin-1"),
             "headers": {k.lower(): v for k, v in request.headers.items()},
             "body": parsed,
         }

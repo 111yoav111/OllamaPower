@@ -39,6 +39,11 @@ ENGINE_LOCAL = "local-ollama"
 _stream_ids = itertools.count(1)
 
 
+def model_key(name: str) -> str:
+    """Ollama's canonical name: a missing tag means ``:latest`` (``llama3`` == ``llama3:latest``)."""
+    return name if ":" in name.rsplit("/", 1)[-1] else f"{name}:latest"
+
+
 @dataclass
 class ActiveStream:
     """One request being served (or waiting for a slot)."""
@@ -122,7 +127,7 @@ class Hub:
 
     def record_generation(self, model: str, stats: GenerationStats) -> None:
         if model:
-            self.last_generation[model] = stats
+            self.last_generation[model_key(model)] = stats
 
     # ----- Ollama ----------------------------------------------------------------------
 
@@ -188,8 +193,8 @@ class Hub:
                         "vram_percent": m.vram_percent,
                         "spilled": m.spilled,
                         "engine": ENGINE_LOCAL,
-                        "last_gen_tps": round(self.last_generation[m.name].gen_tps, 1)
-                        if m.name in self.last_generation
+                        "last_gen_tps": round(self.last_generation[model_key(m.name)].gen_tps, 1)
+                        if model_key(m.name) in self.last_generation
                         else None,
                     }
                     for m in o.models
