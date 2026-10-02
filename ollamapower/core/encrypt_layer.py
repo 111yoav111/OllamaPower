@@ -157,6 +157,8 @@ class SessionCrypto:
         self.peer_role: Role = "node" if role == "hub" else "hub"
         self.send_counter = 0
         self.recv_counter = 0
+        # Largest frame we accept; kept small until the peer has authenticated.
+        self.max_frame = MAX_FRAME
         # Set on the node side: the key the hub presented, for pinning.
         self.peer_fingerprint: str | None = None
 
@@ -213,7 +215,7 @@ class SessionCrypto:
                 return None
             raise CryptoError("connection closed inside a frame length") from None
         length = struct.unpack(FRAME_LAYER_FORMAT, raw_len)[0]
-        if length == 0 or length > MAX_FRAME:
+        if length == 0 or length > self.max_frame:
             raise CryptoError(f"encrypted frame length out of range ({length} bytes)")
         try:
             frame = await reader.readexactly(length)

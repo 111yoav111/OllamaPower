@@ -33,6 +33,7 @@ class PACKET_FLAGS(enum.Enum):  # noqa: N801 - DCP's wire-level name, kept recog
     task_fail = 4
     subtask_request = 5
     subtask_result = 6
+    message = 7  # a control-plane message (see protocol.py)
 
     ctrl_hello = 10  # node connecting
     ctrl_welcome = 11  # hub accepted the node and assigns its id
@@ -46,6 +47,7 @@ class PayloadKind(enum.Enum):
     """What a TaskPacket payload carries. DCP's render/simulation kinds are gone."""
 
     generic = 1
+    message = 2
 
 
 class STATUS_FLAGS(enum.Enum):  # noqa: N801 - wire-level name
