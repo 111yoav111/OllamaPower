@@ -7,6 +7,7 @@ file back when the owner edits the rules, so it only holds known keys.
 
 from __future__ import annotations
 
+import json
 import math
 import platform
 import tomllib
@@ -139,7 +140,7 @@ def _toml_value(value: Any) -> str:
     if isinstance(value, (int, float)):
         return repr(value)
     if isinstance(value, str):
-        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        return json.dumps(value)  # JSON string escapes are valid TOML basic-string escapes
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(v) for v in value) + "]"
     raise TypeError(type(value).__name__)

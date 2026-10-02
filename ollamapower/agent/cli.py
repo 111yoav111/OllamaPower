@@ -146,7 +146,6 @@ def agent(
 
                 app = AgentTUI(client)
                 await app.run_async()
-                await client.leave()
                 if app.stopped_reason:
                     typer.secho(f"Stopped: {app.stopped_reason}", fg=typer.colors.RED, err=True)
                     return 4

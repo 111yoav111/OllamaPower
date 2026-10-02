@@ -140,8 +140,6 @@ def hub(
     ),
 ) -> None:
     """Run the hub: the Ollama-compatible front door, the queue, the control plane and the TUI."""
-    import socket
-
     from .admin.ipc import start_control_server
     from .admin.service import Admin
     from .agent.pinning import format_fingerprint
@@ -209,7 +207,7 @@ def hub(
     control_sock = None
     if config.control.enabled and token:
         try:
-            control_sock = socket.create_server((config.control.host, config.control.port), reuse_port=False)
+            control_sock = _control_socket(config.control.host, config.control.port)
         except OSError as exc:
             typer.secho(f"Cannot open the control plane on port {config.control.port}: {exc}", fg="red", err=True)
             raise typer.Exit(1) from None
@@ -249,6 +247,16 @@ def hub(
             events.close()
 
     asyncio.run(main())
+
+
+def _control_socket(host: str, port: int) -> Any:
+    """Listen for helpers. "All interfaces" means IPv4 *and* IPv6 where the OS allows one dual-stack socket."""
+    import socket
+
+    if host in ("0.0.0.0", "::", "") and socket.has_dualstack_ipv6():
+        return socket.create_server(("::", port), family=socket.AF_INET6, dualstack_ipv6=True)
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    return socket.create_server((host, port), family=family)
 
 
 async def _run_hub_tui(the_hub: Any, server: Any, server_task: Any, log_lines: deque[str], level: str) -> None:

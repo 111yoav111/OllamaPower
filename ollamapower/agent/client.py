@@ -25,7 +25,7 @@ import os
 import secrets
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,7 +39,7 @@ from ..core.encrypt_layer import CryptoError, SessionCrypto
 from ..files import write_private
 from ..telemetry import Telemetry, network_info
 from ..textsafe import safe_text
-from .config import AgentConfig, save_agent_config
+from .config import AgentConfig, load_agent_config, save_agent_config
 from .pinning import KnownHubs, format_fingerprint, normalize_fingerprint
 
 log = logging.getLogger("ollamapower.agent")
@@ -48,6 +48,7 @@ RECONNECT_DELAY = 5.0  # seconds, as in DCP
 KICKED_DELAY = 60.0  # after the hub owner kicked us, wait longer before coming back
 CONNECT_TIMEOUT = 10.0
 MAX_OLLAMA_MODELS = 200
+MAX_TESTS = 8  # network tests remembered at once
 
 # Confirm callback: (hub address, fingerprint hex) -> trust it?
 Confirm = Callable[[str, str], Awaitable[bool]]
@@ -113,7 +114,8 @@ class AgentClient:
         self.state = AgentState(hub=f"{address}:{port}", node_id=load_node_id(config.node_id_path))
         self.channel: Channel | None = None
         self.welcome: dict[str, Any] = {}
-        self._tests: dict[str, dict[str, Any]] = {}
+        self._tests: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._background: set[asyncio.Task[Any]] = set()
         self._requested: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._heartbeat_seq = 0
 
@@ -138,6 +140,11 @@ class AgentClient:
                 self.state.error = f"cannot reach the hub at {self.hub_key} ({type(exc).__name__})"
             except (CryptoError, protocol.ProtocolError, ValueError) as exc:
                 self.state.error = f"protocol error: {exc}"
+            except asyncio.CancelledError:
+                # Stopping (Ctrl+C, quitting the TUI): tell the hub, so it isn't logged as a failure.
+                if self.channel is not None:
+                    await asyncio.shield(self.channel.close("agent stopping"))
+                raise
             finally:
                 if self.channel is not None:
                     await self.channel.close()
@@ -158,7 +165,13 @@ class AgentClient:
             raise
         channel = Channel(reader, writer, crypto)
         self.channel = channel
-        await self._check_pin(crypto.peer_fingerprint or "")
+        if not await self._check_pin(crypto.peer_fingerprint or ""):
+            # The owner must confirm a new key, which can take longer than the hub's
+            # handshake timeout: hang up, ask, and come straight back once trusted.
+            await channel.close()
+            self.channel = None
+            await self._confirm_new_key(crypto.peer_fingerprint or "")
+            return 0.0
         await channel.send(
             "hello",
             protocol=protocol.PROTOCOL_VERSION,
@@ -187,7 +200,8 @@ class AgentClient:
         await self._send_lend_state()
         return await self._serve(channel, float(reply["heartbeat_interval"]))
 
-    async def _check_pin(self, fingerprint: str) -> None:
+    async def _check_pin(self, fingerprint: str) -> bool:
+        """True if the hub key is trusted now; False if the owner has to be asked first."""
         self.state.fingerprint = fingerprint
         pinned = self.known.get(self.hub_key)
         if pinned is not None:
@@ -198,18 +212,26 @@ class AgentClient:
                     "the hub's key yourself, run `ollamapower agent forget-hub` and connect again."
                 )
             self.state.pinned = True
-            return
+            return True
         expected = normalize_fingerprint(self.config.hub.fingerprint)
         if expected:
             if expected != fingerprint:
                 raise AgentStopped(
                     f"the hub's key {format_fingerprint(fingerprint)} doesn't match the configured fingerprint"
                 )
-        elif self.confirm is None or not await self.confirm(self.hub_key, fingerprint):
+            self._pin(fingerprint)
+            return True
+        return False
+
+    async def _confirm_new_key(self, fingerprint: str) -> None:
+        if self.confirm is None or not await self.confirm(self.hub_key, fingerprint):
             raise AgentStopped(
                 "the hub's key was not confirmed. Compare it with the fingerprint `ollamapower hub` prints and "
                 "pass it with --hub-fingerprint."
             )
+        self._pin(fingerprint)
+
+    def _pin(self, fingerprint: str) -> None:
         self.known.pin(self.hub_key, fingerprint)
         self.state.pinned = True
         self.state.note(f"trusted the hub key {format_fingerprint(fingerprint)[:23]}…")
@@ -218,6 +240,8 @@ class AgentClient:
 
     async def _serve(self, channel: Channel, interval: float) -> float:
         heartbeat = asyncio.ensure_future(self._heartbeat_loop(channel, interval))
+        # If heartbeats stop (send failed), end the session: the hub would drop us anyway.
+        heartbeat.add_done_callback(lambda t: t.cancelled() or t.exception() is None or channel.writer.close())
         try:
             while True:
                 message = await channel.recv()
@@ -231,12 +255,16 @@ class AgentClient:
                 await self._on_message(channel, message)
         finally:
             heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await heartbeat
 
     async def _heartbeat_loop(self, channel: Channel, interval: float) -> None:
         while True:
-            sample = await asyncio.to_thread(self.telemetry.sample)
+            try:
+                sample = await asyncio.to_thread(self.telemetry.sample)
+            except Exception as exc:  # noqa: BLE001 - a flaky sensor must not stop the heartbeats
+                log.warning("telemetry failed: %s", type(exc).__name__)
+                sample = {}
             self.state.telemetry = sample
             self.state.version += 1
             self._heartbeat_seq += 1
@@ -247,8 +275,12 @@ class AgentClient:
         kind = m["type"]
         if kind == "net_test_start":
             self._tests[m["test_id"]] = {"kind": m["kind"], "count": m.get("count", 0), "bytes": 0, "seen": 0}
+            while len(self._tests) > MAX_TESTS:
+                self._tests.popitem(last=False)
             if m["kind"] == "up":
-                asyncio.ensure_future(self._send_up(channel, m["test_id"], m.get("count", 0), m.get("size", 0)))
+                task = asyncio.ensure_future(self._send_up(channel, m["test_id"], m.get("count", 0), m.get("size", 0)))
+                self._background.add(task)  # keep a reference: the loop only holds weak ones
+                task.add_done_callback(self._background.discard)
         elif kind == "net_test_data":
             await self._on_test_data(channel, m)
         elif kind == "net_test_result":
@@ -336,11 +368,17 @@ class AgentClient:
 
         new = replace(self.config.lending, **changes)
         new.validate()
+        await asyncio.to_thread(self._save_rules, new)
         self.config.lending = new
-        await asyncio.to_thread(save_agent_config, self.config)
         self.state.note("lending rules changed")
         await self._send_lend_state()
         return self.lending_dict()
+
+    def _save_rules(self, rules: Any) -> None:
+        """Write only the lending rules: one-off CLI overrides (--name, --hub-fingerprint) stay one-off."""
+        on_disk = load_agent_config(self.config.config_dir)
+        on_disk.lending = rules
+        save_agent_config(on_disk)
 
     async def request_net_test(self, timeout: float = 60.0) -> dict[str, Any]:
         channel = self.channel
