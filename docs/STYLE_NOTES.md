@@ -184,5 +184,7 @@ OllamaGate is strict and fails closed; OllamaPower matches that:
   list what the review found.
 - Phases are developed on a branch and merged with
   `Merge Phase N: <summary>`.
-- Per the OllamaPower spec: no AI co-author trailers and no session links in
-  commits, PRs or code (OllamaGate's history has them; the spec overrides).
+- Author and committer: `Yoav <197086229+111yoav111@users.noreply.github.com>`;
+  Claude is credited with a `Co-Authored-By: Claude ...` trailer (the owner's
+  rule, replacing the spec's original "no AI co-author trailers"). Still no
+  session links in commits, PRs or code.
