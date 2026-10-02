@@ -173,6 +173,7 @@ class Admin:
         if cmd in ("nodes.pause", "nodes.resume"):
             node = self._node(args.get("ref"))
             registry.set_hub_paused(node, cmd == "nodes.pause")
+            hub.split.on_node_state(node)
             return node.summary()
         if cmd == "nodes.kick":
             node = self._node(args.get("ref"))
@@ -248,6 +249,22 @@ class Admin:
             node = self._node(args.get("node"))
             hub.plans.set_excluded(key, node.node_id, args.get("exclude") is not False)
             return {"model": key, **hub.plans.describe(key)}
+        if cmd == "benchmarks.list":
+            benchmarks = hub.state.data.get("benchmarks", []) if hub.state is not None else []
+            nodes = {n.node_id: n for n in registry.nodes.values()}
+            return {
+                "hub_gpus": [g.get("name", "GPU") for g in hub.local_static.get("gpus", []) if isinstance(g, dict)],
+                "hub_cpu": (hub.local_static.get("cpu") or {}).get("model", ""),
+                "helpers": {
+                    nid: {
+                        "name": n.name,
+                        "gpus": [g.get("name") for g in n.capabilities.get("gpus", [])],
+                        "link": n.link,
+                    }
+                    for nid, n in nodes.items()
+                },
+                "benchmarks": list(benchmarks),
+            }
         if cmd == "models.show":
             return await self.show_model(self._model(args.get("model")))
         if cmd == "split.stop":

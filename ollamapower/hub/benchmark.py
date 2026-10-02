@@ -16,7 +16,6 @@ CPU, the GPU helpers alone are tried first (CPU helpers last, spec 8.2).
 
 from __future__ import annotations
 
-import asyncio
 import json
 import secrets
 import time
@@ -24,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from ..aio import wait_for
 from ..textsafe import safe_text
 
 if TYPE_CHECKING:
@@ -164,7 +164,7 @@ async def benchmark_model(hub: Hub, model: str, ctx: int | None = None, automati
             session = hub.split.session
             if session is not None and session.active:
                 try:  # don't cut off anyone's answer: wait for the running split session to go idle
-                    await asyncio.wait_for(session.idle.wait(), IDLE_WAIT)
+                    await wait_for(session.idle.wait(), IDLE_WAIT)
                 except TimeoutError:
                     raise BenchmarkError("split mode is busy serving requests; try again later") from None
             await hub.split.stop(reason="benchmark")

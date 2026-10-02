@@ -678,6 +678,54 @@ def models_benchmark(
     typer.echo(f"Result: {d.get('choice') or '-'} - {safe(d.get('reason', ''))}")
 
 
+def benchmark_markdown(d: dict[str, Any]) -> str:
+    """The benchmark history as a Markdown table for docs/BENCHMARKS.md (real numbers only)."""
+    lines = [
+        f"**Hub:** {', '.join(d['hub_gpus']) or 'no GPU'}" + (f" · {d['hub_cpu']}" if d["hub_cpu"] else ""),
+        "",
+    ]
+    for h in d["helpers"].values():
+        link = h.get("link") or {}
+        speed = f", {link['speed_mbps']} Mbps" if link.get("speed_mbps") else ""
+        gpus = ", ".join(g for g in h["gpus"] if g) or "CPU only"
+        lines.append(f"**Helper {h['name']}:** {gpus} ({link.get('kind', '?')}{speed})")
+    lines += [
+        "",
+        "| Date | Model | Ctx | Engine | Helpers (tunnel) | Load s | TTFT ms | Prompt tok/s | Gen tok/s |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for b in d["benchmarks"]:
+        if not b.get("ok"):
+            continue
+        helpers = ", ".join(f"{h['name']} ({h['tunnel']})" for h in b.get("helpers") or []) or "-"
+        lines.append(
+            f"| {ts(b['ts'])[:10]} | {b['model']} | {b['ctx']} | {'split' if b['engine'] == 'split' else 'Ollama'} | "
+            f"{helpers} | {b.get('load_s', '-')} | {b.get('ttft_ms', '-')} | {_tps(b.get('prompt_tps'))} | "
+            f"{_tps(b.get('gen_tps'))} |"
+        )
+    return "\n".join(lines)
+
+
+@models_cli.command("benchmarks")
+def models_benchmarks(
+    config_path: Path | None = ConfigOption,
+    markdown: bool = typer.Option(False, "--markdown", help="A table to paste into docs/BENCHMARKS.md"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Every stored benchmark result (all models)."""
+    d = call(load(config_path).config_dir, "benchmarks.list")
+    if as_json:
+        typer.echo(json.dumps(d, indent=2))
+    elif markdown:
+        typer.echo(benchmark_markdown(d))
+    else:
+        if not d["benchmarks"]:
+            typer.echo("No benchmarks yet: `ollamapower models benchmark <model>`.")
+        for b in d["benchmarks"]:
+            result = f"{_tps(b.get('gen_tps'))} tok/s" if b.get("ok") else f"failed: {safe(b.get('error', ''))}"
+            typer.echo(f"{ts(b['ts'])}  {safe(b['model']):34} {b['engine']:6} ctx {b['ctx']:<6} {result}")
+
+
 @models_cli.command("pin")
 def models_pin(
     model: str,

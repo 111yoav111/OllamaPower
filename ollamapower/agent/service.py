@@ -8,7 +8,18 @@ from ..admin.ipc import AdminError
 from ..config import ConfigError
 from .client import AgentClient
 
-RULE_KEYS = ("max_vram_gb", "max_vram_percent", "gpus", "allow_cpu", "allow_direct", "disk_cache", "schedule")
+RULE_KEYS = (
+    "max_vram_gb",
+    "max_vram_percent",
+    "gpus",
+    "allow_cpu",
+    "allow_direct",
+    "disk_cache",
+    "schedule",
+    "auto_yield",
+    "yield_gpu_percent",
+    "yield_seconds",
+)
 
 
 def agent_snapshot(client: AgentClient) -> dict[str, Any]:
@@ -22,6 +33,8 @@ def agent_snapshot(client: AgentClient) -> dict[str, Any]:
         "name": client.config.display_name,
         "error": s.error,
         "paused": s.paused,
+        "lend_state": s.lend_state,
+        "lend_reason": s.lend_reason,
         "connected_since": s.connected_since,
         "lending": client.lending_dict(),
         "lent": client.rpc.session.info() if client.rpc.session is not None else None,

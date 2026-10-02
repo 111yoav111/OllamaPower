@@ -26,8 +26,9 @@ TOKEN = new_token()
 
 
 class FakeTelemetry:
-    def __init__(self, vram_used: int = 4 * GIB) -> None:
+    def __init__(self, vram_used: int = 4 * GIB, util: int = 30) -> None:
         self.vram_used = vram_used
+        self.util = util
 
     def static(self) -> dict[str, Any]:
         return {
@@ -43,7 +44,7 @@ class FakeTelemetry:
             "cpu_percent": 10.0,
             "ram_total": 64 * GIB,
             "ram_used": 8 * GIB,
-            "gpus": [{"index": 0, "vram_total": 24 * GIB, "vram_used": self.vram_used, "util": 30, "temp": 55}],
+            "gpus": [{"index": 0, "vram_total": 24 * GIB, "vram_used": self.vram_used, "util": self.util, "temp": 55}],
         }
 
 

@@ -25,6 +25,7 @@ import statistics
 import time
 from typing import Any
 
+from ..aio import wait_for
 from ..core.tunnel import (
     TLS_HANDSHAKE_TIMEOUT,
     TunnelError,
@@ -67,10 +68,10 @@ async def open_tunnel(
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """One connection to a helper's relay."""
     if ctx is None:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), CONNECT_TIMEOUT)
+        reader, writer = await wait_for(asyncio.open_connection(host, port), CONNECT_TIMEOUT)
         nodelay(writer)
         return reader, writer
-    reader, writer = await asyncio.wait_for(
+    reader, writer = await wait_for(
         asyncio.open_connection(host, port, ssl=ctx, server_hostname="", ssl_handshake_timeout=TLS_HANDSHAKE_TIMEOUT),
         CONNECT_TIMEOUT + TLS_HANDSHAKE_TIMEOUT,
     )

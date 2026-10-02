@@ -191,7 +191,12 @@ def render_agent(s: dict[str, Any]) -> Lines:
             (format_fingerprint(s["fingerprint"]) if s["fingerprint"] else "-") + (" (pinned)" if s["pinned"] else ""),
         ),
         ("Helper", f"{s['name']} ({s['node_id']})"),
-        ("Lending", "PAUSED" if s["paused"] else "on"),
+        (
+            "Lending",
+            "on"
+            if s.get("lend_state", "lending") == "lending"
+            else f"{s.get('lend_state', '').upper()} ({s.get('lend_reason', '')})",
+        ),
         ("Lent now", _lent_text(s.get("lent"))),
         ("llama.cpp", _llama_text(s.get("llama_cpp") or {})),
         ("Rules", json.dumps({k: v for k, v in r.items() if k != "paused"})),
@@ -272,6 +277,14 @@ def agent_rules(
     disk_cache: bool | None = typer.Option(
         None, "--disk-cache/--no-disk-cache", help="Keep received model weights on disk for faster reloads"
     ),
+    schedule: str | None = typer.Option(
+        None, help='When to lend, local time, e.g. "22:00-08:00" or "09:00-12:00,20:00-23:00"; "" = always'
+    ),
+    auto_yield: bool | None = typer.Option(
+        None, "--auto-yield/--no-auto-yield", help="Step back when you use the GPU yourself"
+    ),
+    yield_gpu_percent: int | None = typer.Option(None, help="GPU load that counts as you using it (1-100)"),
+    yield_seconds: int | None = typer.Option(None, help="For how long, before stepping back (and back in)"),
 ) -> None:
     """Show or change the lending rules of the running agent (saved to agent.toml)."""
     changes: dict[str, Any] = {
@@ -282,6 +295,9 @@ def agent_rules(
             "allow_cpu": allow_cpu,
             "allow_direct": allow_direct,
             "disk_cache": disk_cache,
+            "auto_yield": auto_yield,
+            "yield_gpu_percent": yield_gpu_percent,
+            "yield_seconds": yield_seconds,
         }.items()
         if v is not None
     }
@@ -290,6 +306,8 @@ def agent_rules(
         if not all(p.isdigit() for p in parts):
             raise typer.BadParameter("GPU indexes like 0,1")
         changes["gpus"] = [int(p) for p in parts]
+    if schedule is not None:
+        changes["schedule"] = [w.strip() for w in schedule.split(",") if w.strip()]
     d = _config_dir(config_dir)
     rules = (
         call(d, "agent.rules", name=RUN_DIR, **changes) if changes else call(d, "agent.status", name=RUN_DIR)["lending"]

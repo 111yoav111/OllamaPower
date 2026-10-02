@@ -26,6 +26,7 @@ import httpx
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
+from ...aio import wait_for
 from ..runtime import ActiveStream, GenerationStats
 
 log = logging.getLogger("ollamapower.proxy")
@@ -284,7 +285,7 @@ class ProxyStreamResponse(Response):
             await send({"type": "http.response.body", "body": b"", "more_body": False})
 
         try:
-            await asyncio.wait_for(deliver(), TRAILER_TIMEOUT)
+            await wait_for(deliver(), TRAILER_TIMEOUT)
         except (TimeoutError, OSError):
             pass
 

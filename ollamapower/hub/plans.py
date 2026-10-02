@@ -28,13 +28,13 @@ spilled, are worth benchmarking.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ..aio import reap
 from ..llamacpp.install import Pins
 from ..ollama.blobs import ModelUnavailable, resolve
 from ..textsafe import safe_text
@@ -216,6 +216,8 @@ class PlanBook:
             self._update(model, degraded=None)
             self.hub.event("plan_recovered", model=model)
         if rec["pin"] == "split":
+            if not self.current_helpers(model):
+                return None  # every helper is away (paused, yielding, outside its schedule): not a failure
             return SplitSpec(ctx=ctx, exclude=exclude)
         if rec["choice"] == "split" and not self.key_problem(model, rec):
             ids = tuple(h["id"] for h in rec["key"]["helpers"])
@@ -396,9 +398,7 @@ class PlanBook:
 
     async def stop(self) -> None:
         if self.auto_task is not None:
-            self.auto_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self.auto_task
+            await reap(self.auto_task)
 
     # ----- views -----------------------------------------------------------------------------
 
@@ -426,6 +426,9 @@ class PlanBook:
             why = "forced local by the owner"
         elif isinstance(rec["degraded"], dict):
             why = f"degraded: {rec['degraded'].get('reason', '')}"
+        elif rec["pin"] == "split" and spec is None:
+            _, away = self.hub.split.candidates()
+            why = "pinned to split, but no helper can take part now" + (f" ({'; '.join(away)})" if away else "")
         elif rec["pin"] == "split":
             why = "pinned to split by the owner"
         elif rec["choice"] == "split" and problem:

@@ -48,13 +48,22 @@ class LendingRules:
     allow_cpu: bool = False  # lend CPU/RAM when there is no GPU
     allow_direct: bool = False  # allow unencrypted trusted-LAN mode for split traffic
     disk_cache: bool = True  # keep received model weights on disk so later loads skip the network
-    schedule: list[str] = field(default_factory=list)  # e.g. ["22:00-08:00"] (Phase 6)
+    schedule: list[str] = field(default_factory=list)  # e.g. ["22:00-08:00"], local time; empty = always
+    # Step back when you use the GPU yourself: it is busier than yield_gpu_percent for
+    # yield_seconds while the hub isn't using it (see agent/lending.py).
+    auto_yield: bool = True
+    yield_gpu_percent: int = 60
+    yield_seconds: int = 20
 
     def validate(self) -> None:
         if not math.isfinite(self.max_vram_gb) or self.max_vram_gb < 0:
             raise ConfigError("lending.max_vram_gb must be 0 or more")
         if not 0 <= self.max_vram_percent <= 100:
             raise ConfigError("lending.max_vram_percent must be between 0 and 100")
+        if not 1 <= self.yield_gpu_percent <= 100:
+            raise ConfigError("lending.yield_gpu_percent must be between 1 and 100")
+        if not 2 <= self.yield_seconds <= 3600:
+            raise ConfigError("lending.yield_seconds must be between 2 and 3600")
         if any(g < 0 for g in self.gpus):
             raise ConfigError("lending.gpus must be GPU indexes (0, 1, ...)")
         for window in self.schedule:

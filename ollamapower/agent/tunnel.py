@@ -24,6 +24,7 @@ import ipaddress
 import logging
 import socket
 import ssl
+import time
 
 from ..core.tunnel import TLS_HANDSHAKE_TIMEOUT, TunnelError, check_peer, splice
 
@@ -61,6 +62,7 @@ class HelperRelay:
         self.connections: set[asyncio.StreamWriter] = set()
         self.closed = False
         self.refused = 0
+        self.last_active = 0.0  # monotonic time of the last byte from the hub (auto-yield needs it)
         self._accepting: asyncio.Task[None] | None = None
         self._handlers: set[asyncio.Task[None]] = set()
 
@@ -121,7 +123,7 @@ class HelperRelay:
                 check_peer(writer, self.hub_fingerprint)
             up_reader, upstream = await asyncio.open_connection("127.0.0.1", self.target_port)
             self.connections.add(upstream)
-            await splice((reader, writer), (up_reader, upstream))
+            await splice((reader, writer), (up_reader, upstream), self._count)
         except (OSError, TimeoutError, ssl.SSLError, TunnelError) as exc:
             log.warning("relay: dropped a connection from the hub's address: %s", type(exc).__name__)
         finally:
@@ -131,6 +133,9 @@ class HelperRelay:
                 if w is not None:
                     self.connections.discard(w)
                     w.close()
+
+    def _count(self, n: int) -> None:
+        self.last_active = time.monotonic()
 
     def close(self) -> None:
         self.closed = True

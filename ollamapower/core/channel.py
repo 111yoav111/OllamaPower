@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 from typing import Any
 
+from ..aio import wait_for
 from . import protocol
 from .encrypt_layer import SessionCrypto
 from .network_io import read_one_packet, send_packet
@@ -60,7 +61,7 @@ class Channel:
         self.closed = True
         if reason is not None:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(self.send("bye", reason=reason[: protocol.MAX_STRING]), 2)
+                await wait_for(self.send("bye", reason=reason[: protocol.MAX_STRING]), 2)
                 # Half-close and give the peer a moment to read the bye and hang up: closing
                 # at once can turn its next write into a reset that discards the bye unread.
                 if self.writer.can_write_eof():
@@ -70,4 +71,4 @@ class Channel:
                     await asyncio.sleep(0.02)
         self.writer.close()
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(self.writer.wait_closed(), 2)
+            await wait_for(self.writer.wait_closed(), 2)

@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..aio import wait_for
 from ..files import private_dir, write_private
 
 log = logging.getLogger("ollamapower.admin")
@@ -130,7 +131,7 @@ async def _serve_connection(
         await reply({"challenge": challenge})
         while True:
             try:
-                line = await asyncio.wait_for(reader.readline(), IDLE_TIMEOUT)
+                line = await wait_for(reader.readline(), IDLE_TIMEOUT)
             except (TimeoutError, asyncio.LimitOverrunError, ValueError):
                 break
             if not line:

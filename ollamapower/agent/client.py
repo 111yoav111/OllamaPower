@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .. import __version__
+from ..aio import reap, wait_for
 from ..core import protocol
 from ..core.channel import Channel
 from ..core.encrypt_layer import CryptoError, SessionCrypto
@@ -39,12 +40,14 @@ from ..files import write_private
 from ..telemetry import Telemetry, network_info
 from ..textsafe import safe_text
 from .config import AgentConfig, load_agent_config, save_agent_config
+from .lending import TUNNEL_QUIET, LendingGuard
 from .pinning import KnownHubs, format_fingerprint, normalize_fingerprint
 from .rpc_manager import RpcManager, RpcRefused
 
 log = logging.getLogger("ollamapower.agent")
 
 RECONNECT_DELAY = 5.0  # seconds, as in DCP
+DRAIN_GRACE = 45.0  # seconds the hub gets to finish an answer and release us after we stop lending
 KICKED_DELAY = 60.0  # after the hub owner kicked us, wait longer before coming back
 CONNECT_TIMEOUT = 10.0
 MAX_TESTS = 8  # network tests remembered at once
@@ -79,6 +82,8 @@ class AgentState:
     node_id: str = ""
     error: str = ""
     paused: bool = False
+    lend_state: str = "lending"  # what the hub is told: lending · paused · yielding
+    lend_reason: str = ""
     connected_since: float | None = None
     telemetry: dict[str, Any] = field(default_factory=dict)
     static: dict[str, Any] = field(default_factory=dict)
@@ -118,6 +123,8 @@ class AgentClient:
         self._requested: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._heartbeat_seq = 0
         self.rpc = RpcManager(config, self.state.note, self._rpc_failed)
+        self.guard = LendingGuard()
+        self._draining: asyncio.Task[Any] | None = None
 
     @property
     def hub_key(self) -> str:
@@ -160,9 +167,9 @@ class AgentClient:
     async def _connect_and_serve(self) -> float:
         self.state.connection = "connecting"
         self.state.version += 1
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(self.address, self.port), CONNECT_TIMEOUT)
+        reader, writer = await wait_for(asyncio.open_connection(self.address, self.port), CONNECT_TIMEOUT)
         try:
-            crypto = await asyncio.wait_for(SessionCrypto.node_handshake(reader, writer), CONNECT_TIMEOUT)
+            crypto = await wait_for(SessionCrypto.node_handshake(reader, writer), CONNECT_TIMEOUT)
         except BaseException:
             writer.close()
             raise
@@ -183,7 +190,7 @@ class AgentClient:
             name=self.config.display_name,
             token=self.token,
         )
-        reply = await asyncio.wait_for(channel.recv(), CONNECT_TIMEOUT)
+        reply = await wait_for(channel.recv(), CONNECT_TIMEOUT)
         if reply is None:
             raise ConnectionError("the hub closed the connection")
         if reply["type"] == "reject":
@@ -200,6 +207,8 @@ class AgentClient:
         local = channel.local
         self.state.network = await asyncio.to_thread(network_info, local[0] if local else None)
         await channel.send("capabilities", capabilities=await self.capabilities())
+        decision = self.guard.evaluate(self.config.lending, self.state.paused)
+        self.state.lend_state, self.state.lend_reason = decision.state, decision.reason
         await self._send_lend_state()
         return await self._serve(channel, float(reply["heartbeat_interval"]))
 
@@ -257,9 +266,7 @@ class AgentClient:
                     return KICKED_DELAY if "kicked" in reason else RECONNECT_DELAY
                 await self._on_message(channel, message)
         finally:
-            heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await heartbeat
+            await reap(heartbeat)
 
     async def _heartbeat_loop(self, channel: Channel, interval: float) -> None:
         while True:
@@ -270,6 +277,7 @@ class AgentClient:
                 sample = {}
             self.state.telemetry = sample
             self.state.version += 1
+            await self._check_lending(sample)
             self._heartbeat_seq += 1
             await channel.send("heartbeat", seq=self._heartbeat_seq, telemetry=sample)
             await asyncio.sleep(interval)
@@ -319,7 +327,8 @@ class AgentClient:
             if peer is None or local is None:
                 raise RpcRefused("the connection to the hub is gone")
             start = self.rpc.start_bench if m.get("purpose") == "bench" else self.rpc.start
-            endpoint = await start(m, peer[0], local[0], self.config.lending, self.state.paused)
+            not_lending = self.state.lend_reason if self.state.lend_state != "lending" else ""
+            endpoint = await start(m, peer[0], local[0], self.config.lending, not_lending)
         except RpcRefused as exc:
             self.state.note(f"split session refused: {exc}")
             with contextlib.suppress(Exception):
@@ -390,21 +399,50 @@ class AgentClient:
     def lending_dict(self) -> dict[str, Any]:
         return {**self.config.lending.to_dict(), "paused": self.state.paused}
 
-    async def _send_lend_state(self, reason: str = "") -> None:
+    async def _send_lend_state(self) -> None:
         channel = self.channel
         if channel is None or channel.closed or self.state.connection != "connected":
             return
-        state = "paused" if self.state.paused else "lending"
-        await channel.send("lend_state", state=state, reason=reason, lending=self.lending_dict())
+        await channel.send(
+            "lend_state", state=self.state.lend_state, reason=self.state.lend_reason, lending=self.lending_dict()
+        )
+
+    async def _check_lending(self, sample: dict[str, Any] | None = None) -> None:
+        """Re-decide lending (pause, schedule, auto-yield); tell the hub when it changes."""
+        rules = self.config.lending
+        if sample is not None:
+            self.guard.update_yield(rules, sample, self.rpc.tunnel_quiet(TUNNEL_QUIET), time.monotonic())
+        decision = self.guard.evaluate(rules, self.state.paused)
+        if (decision.state, decision.reason) == (self.state.lend_state, self.state.lend_reason):
+            return
+        was_lending = self.state.lend_state == "lending"
+        self.state.lend_state, self.state.lend_reason = decision.state, decision.reason
+        self.state.note(f"lending: {decision.state}" + (f" ({decision.reason})" if decision.reason else ""))
+        with contextlib.suppress(Exception):
+            await self._send_lend_state()
+        if was_lending and decision.state != "lending" and not self.state.paused:
+            # Schedule end or auto-yield: give the hub time to finish the current answer
+            # and release us (rpc_stop); stop by ourselves only if it doesn't.
+            if self._draining is None or self._draining.done():
+                self._draining = asyncio.ensure_future(self._drain_session(decision.reason))
+
+    async def _drain_session(self, reason: str) -> None:
+        session = self.rpc.session
+        if session is None:
+            return
+        deadline = time.monotonic() + DRAIN_GRACE
+        while self.rpc.session is session and time.monotonic() < deadline:
+            await asyncio.sleep(0.25)
+        if self.rpc.session is session:
+            await self._end_session(reason)
 
     # ----- owner actions ---------------------------------------------------------------
 
     async def set_paused(self, paused: bool, reason: str = "paused by the helper's owner") -> None:
         self.state.paused = paused
-        self.state.note("lending paused" if paused else "lending resumed")
-        if paused:
-            await self._end_session("lending paused by the helper's owner")
-        await self._send_lend_state(reason if paused else "")
+        if paused:  # the owner's pause is instant (spec 10.2)
+            await self._end_session(reason)
+        await self._check_lending()
 
     async def update_rules(self, **changes: Any) -> dict[str, Any]:
         """Change lending rules, save agent.toml and tell the hub."""
@@ -416,7 +454,8 @@ class AgentClient:
         self.config.lending = new
         self.state.note("lending rules changed")
         await self._end_session("the helper's owner changed the lending rules")
-        await self._send_lend_state()
+        await self._check_lending()
+        await self._send_lend_state()  # the hub shows the new rules even if the state didn't change
         return self.lending_dict()
 
     def _save_rules(self, rules: Any) -> None:
@@ -434,7 +473,7 @@ class AgentClient:
         self._requested[test_id] = fut
         await channel.send("net_test_start", test_id=test_id, kind="request")
         try:
-            return await asyncio.wait_for(fut, timeout)
+            return await wait_for(fut, timeout)
         finally:
             self._requested.pop(test_id, None)
 

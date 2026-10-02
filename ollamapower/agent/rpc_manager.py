@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..aio import reap, wait_for
 from ..core.tunnel import TunnelError, TunnelIdentity, cert_fingerprint, check_cert_pem
 from ..llamacpp.binaries import Device, LlamaCpp
 from ..llamacpp.manager import LlamaCppUnavailable, ensure
@@ -222,7 +223,7 @@ class RpcManager:
         hub_ip: str,
         bind_ip: str,
         rules: LendingRules,
-        paused: bool,
+        not_lending: str,
     ) -> dict[str, Any]:
         """Start a session for ``rpc_start``; returns the endpoint for ``rpc_ready``."""
         async with self._lock:
@@ -230,8 +231,8 @@ class RpcManager:
                 raise RpcRefused(
                     f"llama.cpp is not ready on this helper ({self.status}{': ' + self.error if self.error else ''})"
                 )
-            if paused:
-                raise RpcRefused("lending is paused by the helper's owner")
+            if not_lending:
+                raise RpcRefused(f"this helper isn't lending right now: {not_lending}")
             tunnel = _Tunnel.from_message(message, rules)
             if self.session is not None:
                 await self._stop(self.session, "replaced by a new session")
@@ -309,7 +310,7 @@ class RpcManager:
             if proc.returncode is not None:
                 return False
             try:
-                _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", session.port), 2.0)
+                _, writer = await wait_for(asyncio.open_connection("127.0.0.1", session.port), 2.0)
             except (OSError, TimeoutError):
                 await asyncio.sleep(0.2)
                 continue
@@ -337,14 +338,21 @@ class RpcManager:
         if self.on_failure is not None:
             await self.on_failure(session.session_id, error)
 
+    def tunnel_quiet(self, seconds: float) -> bool:
+        """No split-mode traffic from the hub for ``seconds`` (or no session at all)."""
+        session = self.session
+        if session is None or session.relay is None:
+            return True
+        return time.monotonic() - session.relay.last_active >= seconds
+
     # ----- tunnel test -------------------------------------------------------------------
 
     async def start_bench(
-        self, message: dict[str, Any], hub_ip: str, bind_ip: str, rules: LendingRules, paused: bool
+        self, message: dict[str, Any], hub_ip: str, bind_ip: str, rules: LendingRules, not_lending: str
     ) -> dict[str, Any]:
         """A relay in front of an echo server, so the hub can time the tunnel itself."""
-        if paused:
-            raise RpcRefused("lending is paused by the helper's owner")
+        if not_lending:
+            raise RpcRefused(f"this helper isn't lending right now: {not_lending}")
         tunnel = _Tunnel.from_message(message, rules)
         session_id = message["session_id"]
         if len(self.benches) >= 2:
@@ -393,15 +401,13 @@ class RpcManager:
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
             try:
-                await asyncio.wait_for(proc.wait(), STOP_GRACE)
+                await wait_for(proc.wait(), STOP_GRACE)
             except TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
                 await proc.wait()
         if session.watcher is not None and session.watcher is not asyncio.current_task():
-            session.watcher.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await session.watcher
+            await reap(session.watcher)
         log.info("rpc session %s stopped: %s", session.session_id[:8], reason)
 
 

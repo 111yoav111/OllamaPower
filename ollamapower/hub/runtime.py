@@ -126,6 +126,7 @@ class Hub:
         self.fingerprint = public_key_fingerprint(key.public_key())
         self.control = ControlServer(self.config.control, self.registry, key, token, self.event)
         self.control.on_rpc = self.split.on_rpc
+        self.control.on_node_state = self.split.on_node_state
         await self.control.start(sock)
         self.event("control_start", port=self.control.port, fingerprint=self.fingerprint)
         return self.control

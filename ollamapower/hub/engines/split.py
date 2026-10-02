@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from ...aio import wait_for
 from ...core.tunnel import TunnelError, TunnelIdentity, check_cert_pem
 from ...llamacpp.binaries import LlamaCpp
 from ...llamacpp.install import Pins
@@ -65,6 +66,7 @@ RPC_READY_TIMEOUT = 60.0
 OLLAMA_RELEASE_TIMEOUT = 30.0
 STOP_GRACE = 10.0
 IDLE_CHECK = 5.0
+DRAIN_TIMEOUT = 30.0  # seconds running answers get to finish when a helper leaves on purpose
 WARNING_TTL = 600.0
 ENGINE_SPLIT = "split"
 
@@ -111,6 +113,7 @@ class SplitSession:
     idle: asyncio.Event = field(default_factory=asyncio.Event)
     output: deque[str] = field(default_factory=lambda: deque(maxlen=60))
     error: str = ""
+    draining: bool = False  # a helper stopped lending: finish the current answers, then stop
 
     def transfer(self) -> dict[str, Any] | None:
         """Model weights sent to the helpers so far (secure mode counts them), for a progress bar."""
@@ -193,18 +196,20 @@ class SplitEngine:
         key = model_key(model)
         async with self._lock:
             current = self.session
-            if current is not None and current.model == key and current.alive() and current.spec == spec:
+            reusable = current is not None and current.alive() and not current.draining
+            if reusable and current.model == key and current.spec == spec:
                 current.active += 1
                 current.idle.clear()
                 return current
             if current is not None:
-                if current.model != key and current.active:
-                    await current.idle.wait()  # let running requests of the other model finish
+                if current.active:  # let running answers finish first (another model, or a helper leaving)
+                    with contextlib.suppress(TimeoutError):
+                        await wait_for(current.idle.wait(), DRAIN_TIMEOUT)
                 await self._stop(current, f"switching to {key}" if current.model != key else "restarting")
             session = SplitSession(model=key, ctx=spec.ctx, spec=spec)
             self.session = session
             try:
-                await asyncio.wait_for(self._start(session), self.config.split.load_timeout)
+                await wait_for(self._start(session), self.config.split.load_timeout)
             except BaseException as exc:
                 reason = (
                     str(exc)
@@ -518,7 +523,7 @@ class SplitEngine:
                 tunnel={"mode": mode, **({"cert": lease.identity.cert_pem} if lease.identity else {})},
                 purpose="bench",
             )
-            reply = await asyncio.wait_for(fut, RPC_READY_TIMEOUT)
+            reply = await wait_for(fut, RPC_READY_TIMEOUT)
         except TimeoutError:
             raise SplitUnavailable(f"{node.name} did not answer the tunnel test") from None
         finally:
@@ -607,7 +612,7 @@ class SplitEngine:
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
             try:
-                await asyncio.wait_for(proc.wait(), STOP_GRACE)
+                await wait_for(proc.wait(), STOP_GRACE)
             except TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
@@ -623,15 +628,46 @@ class SplitEngine:
         if was_ready or failed:
             self.hub.event("split_stop", model=s.model, reason=reason)
 
-    async def stop(self, model: str | None = None, reason: str = "stopped") -> bool:
+    async def stop(self, model: str | None = None, reason: str = "stopped", drain: bool = False) -> bool:
+        """Stop the session (of ``model``, if given). ``drain``: let running answers finish first."""
         from ..runtime import model_key
 
         async with self._lock:
             s = self.session
             if s is None or (model is not None and s.model != model_key(model)):
                 return False
+            if drain and s.active:
+                with contextlib.suppress(TimeoutError):
+                    await wait_for(s.idle.wait(), DRAIN_TIMEOUT)
+                if self.session is not s:
+                    return True
             await self._stop(s, reason)
             return True
+
+    def on_node_state(self, node: Node) -> None:
+        """A helper stopped lending (schedule, auto-yield, paused): drain the session it is part of.
+
+        This is planned, not a failure: the plan isn't marked degraded, and once the
+        helper lends again the same plan applies without a new benchmark.
+        """
+        s = self.session
+        if s is None or s.state not in ("ready", "starting") or s.draining or node.status == "lending":
+            return
+        if not any(x.node is node for x in s.leases):
+            return
+        s.draining = True
+        reason = f"{node.name} is {node.status}" + (f" ({node.lend_reason})" if node.lend_reason else "")
+        self.hub.event("split_drain", model=s.model, node=node.node_id, reason=reason)
+        log.info("draining the split session of %s: %s", s.model, reason)
+        self._spawn(self._drain_and_stop(s, reason))
+
+    async def _drain_and_stop(self, s: SplitSession, reason: str) -> None:
+        if s.active:
+            with contextlib.suppress(TimeoutError):
+                await wait_for(s.idle.wait(), DRAIN_TIMEOUT)
+        async with self._lock:
+            if self.session is s:
+                await self._stop(s, reason)
 
     async def run(self) -> None:
         """Stop an idle session after ``split.keep_alive``; notice a crashed llama-server."""

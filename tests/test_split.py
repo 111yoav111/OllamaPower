@@ -286,17 +286,17 @@ def test_unplan_stops_the_session_and_ollama_serves_again(cluster, client):
         c.admin("models.unplan", model="tiny")
 
 
-def test_paused_helper_means_ollama_serves_with_a_warning(cluster, client):
+def test_paused_helper_means_ollama_serves_and_says_why(cluster, client):
     c = cluster
     c.admin("models.plan", model="tiny", ctx=512)
     c.run(c.agent.set_paused(True))
     assert wait_for(lambda: c.node.status == "paused", 5)
     r = chat(client, c)
     assert r.status_code == 200 and c.rec.last["path"] == "/api/chat"
-    warnings = c.call(c.hub.warnings)
-    assert any("split mode for tiny:latest failed" in w and "desk is paused" in w for w in warnings)
-    # Resting: the next request doesn't retry the failed start at once.
-    chat(client, c)
+    why = c.admin("models.show", model="tiny")["why"]
+    assert "no helper can take part now" in why and "desk is paused" in why
+    # A helper being away on purpose is not a failure: nothing is degraded.
+    assert c.call(lambda: c.hub.plans.record("tiny")["degraded"]) is None
     assert c.call(lambda: c.hub.plans.route("tiny")) is None
 
 
@@ -307,7 +307,7 @@ def test_helper_owner_pausing_mid_session_ends_it(cluster, client):
     c.run(c.agent.set_paused(True))
     assert wait_for(lambda: not c.call(lambda: c.hub.split.is_running("tiny")), 10)
     assert c.agent.rpc.session is None
-    assert any("lending paused" in w for w in c.call(c.hub.warnings))
+    assert any("paused by the helper's owner" in w for w in c.call(c.hub.warnings))
 
 
 def test_helper_leaving_mid_session_ends_it(cluster, client):

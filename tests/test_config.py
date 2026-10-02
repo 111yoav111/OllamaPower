@@ -72,3 +72,16 @@ def test_example_config_is_the_default(tmp_path):
 def test_url_without_port_is_port_80_not_11434(tmp_path):
     (tmp_path / "config.toml").write_text('[ollama]\nurl = "http://127.0.0.1"\n')
     assert load_config(env={"OLLAMAPOWER_CONFIG_DIR": str(tmp_path)}).ollama.url == "http://127.0.0.1"
+
+
+def test_agent_example_is_the_default(tmp_path):
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from ollamapower.agent.config import AgentConfig, load_agent_config
+
+    root = Path(__file__).resolve().parent.parent
+    loaded = load_agent_config(tmp_path, path=root / "agent.example.toml")
+    default = AgentConfig(config_dir=tmp_path)
+    for section in ("hub", "agent", "lending", "llamacpp"):
+        assert asdict(getattr(loaded, section)) == asdict(getattr(default, section)), section

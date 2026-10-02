@@ -42,6 +42,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.requests import ClientDisconnect
 
+from ...aio import reap, wait_for
 from ...scheduling.request_queue import QueueFull, Ticket
 from ...scheduling.task_pool import TaskPriority
 from ...textsafe import safe_text
@@ -186,10 +187,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
         try:
             yield
         finally:
-            for poller in pollers:
-                poller.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.gather(*pollers, return_exceptions=True)
+            await reap(*pollers)
             hub.kill_all_streams("hub shutting down")
             await client.aclose()
 
@@ -297,7 +295,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 chunks = upstream.aiter_raw()
                 try:
                     first = await race_kill(
-                        asyncio.wait_for(anext(chunks), config.split.stall_timeout), stream, request.receive
+                        wait_for(anext(chunks), config.split.stall_timeout), stream, request.receive
                     )
                 except StopAsyncIteration:
                     first = b""
@@ -317,7 +315,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     if stopping is not None:
                         # Let llama-server give the GPU back before Ollama loads the model.
                         with contextlib.suppress(Exception):
-                            await asyncio.wait_for(asyncio.shield(stopping), 30)
+                            await wait_for(asyncio.shield(stopping), 30)
                     stream.killed.clear()
                     stream.kill_reason = ""
                     stream.engine = ENGINE_LOCAL
@@ -365,7 +363,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 # 2. Wait for a slot, highest priority first, giving up if the client leaves.
                 queued_at = time.monotonic()
                 try:
-                    await asyncio.wait_for(
+                    await wait_for(
                         race_kill(hub.gate.acquire(ticket), stream, request.receive), config.hub.queue_timeout
                     )
                 except QueueFull:
@@ -389,7 +387,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                             return served
                     if hub.split.is_running(stream.model):
                         # Ollama serves this model now: llama-server must give the GPU back first.
-                        await hub.split.stop(stream.model, "Ollama serves this model now")
+                        await hub.split.stop(stream.model, "Ollama serves this model now", drain=True)
                 upstream_request = http.build_request(
                     method, target, content=body, headers=build_upstream_headers(request.headers)
                 )

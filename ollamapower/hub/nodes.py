@@ -111,6 +111,7 @@ def clean_lending(value: Any) -> dict[str, Any]:
         "allow_cpu": r.get("allow_cpu") is True,
         "allow_direct": r.get("allow_direct") is True,
         "disk_cache": r.get("disk_cache") is not False,
+        "auto_yield": r.get("auto_yield") is not False,
         "schedule": [safe_text(w, 20) for w in schedule[:8] if isinstance(w, str)],
         "paused": r.get("paused") is True,
     }

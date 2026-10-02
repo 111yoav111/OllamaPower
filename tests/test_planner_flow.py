@@ -338,3 +338,16 @@ def test_benchmark_waits_for_a_busy_split_session(cluster, monkeypatch):
     with pytest.raises(AdminError, match="busy"):
         c.admin("models.benchmark", model="tiny")
     assert c.call(lambda: c.hub.split.is_running("tiny"))  # nobody's answer was cut off
+
+
+@pytestmark_e2e
+def test_benchmark_report_for_the_docs(cluster):
+    from ollamapower.__main__ import benchmark_markdown
+
+    c = cluster
+    split_speed(c, 30.0)
+    c.admin("models.benchmark", model="tiny")
+    report = benchmark_markdown(c.admin("benchmarks.list"))
+    assert "| Date | Model |" in report and "**Helper desk:** RTX 4090" in report
+    rows = [line for line in report.splitlines() if line.startswith("| 20")]
+    assert len(rows) == 2 and any("| split | desk (secure) |" in r for r in rows)

@@ -32,6 +32,7 @@ from typing import Any
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from .. import __version__
+from ..aio import wait_for
 from ..config import ControlConfig
 from ..core import protocol
 from ..core.auth import check_token
@@ -89,6 +90,8 @@ class ControlServer:
         self._pending = 0
         # Split mode's handler for rpc_ready/rpc_error; called with None when a helper leaves.
         self.on_rpc: Callable[[Node, dict[str, Any] | None], None] | None = None
+        # Split mode's handler for a helper that stopped (or started again) lending.
+        self.on_node_state: Callable[[Node], None] | None = None
 
     # ----- server lifecycle ----------------------------------------------------------------
 
@@ -118,7 +121,7 @@ class ControlServer:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         if self.server is not None:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(self.server.wait_closed(), 3)
+                await wait_for(self.server.wait_closed(), 3)
 
     def _spawn(self, coro: Any) -> asyncio.Task[Any]:
         task = asyncio.ensure_future(coro)
@@ -164,7 +167,7 @@ class ControlServer:
         channel: Channel | None = None
         try:
             try:
-                hello, channel = await asyncio.wait_for(self._handshake(reader, writer), self.config.handshake_timeout)
+                hello, channel = await wait_for(self._handshake(reader, writer), self.config.handshake_timeout)
             except TimeoutError:
                 self._fail(ip, "handshake timeout")
                 return
@@ -269,6 +272,8 @@ class ControlServer:
             self.registry.update_capabilities(node, m["capabilities"])
         elif kind == "lend_state":
             self.registry.set_lend_state(node, m["state"], m.get("reason", ""), m.get("lending"))
+            if self.on_node_state is not None:
+                self.on_node_state(node)
         elif kind == "net_test_start" and m["kind"] == "request":
             self._spawn(self._agent_requested_test(node, m["test_id"]))
         elif kind == "net_test_data":
@@ -316,7 +321,7 @@ class ControlServer:
         test = _NetTest()
         self._tests[test_id] = test
         try:
-            return await asyncio.wait_for(self._run_test(node, channel, test_id, test), NET_TEST_TIMEOUT)
+            return await wait_for(self._run_test(node, channel, test_id, test), NET_TEST_TIMEOUT)
         except TimeoutError:
             raise NetTestError(f"{node.name} did not finish the network test in time") from None
         except (OSError, CryptoError) as exc:

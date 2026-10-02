@@ -50,7 +50,9 @@ class RulesScreen(ModalScreen[dict[str, Any] | None]):
                 ("max_vram_gb", "Max VRAM to lend (GB, 0 = no cap)", r["max_vram_gb"]),
                 ("max_vram_percent", "Max VRAM to lend (%, 0 = no cap)", r["max_vram_percent"]),
                 ("gpus", "GPUs to lend (e.g. 0,1; empty = all)", ",".join(str(g) for g in r["gpus"])),
-                ("schedule", "Schedule (e.g. 22:00-08:00; Phase 6)", ",".join(r["schedule"])),
+                ("schedule", "Lend only (e.g. 22:00-08:00; empty = always)", ",".join(r["schedule"])),
+                ("yield_gpu_percent", "Step back when my GPU use is above (%)", r.get("yield_gpu_percent", 60)),
+                ("yield_seconds", "...for this many seconds", r.get("yield_seconds", 20)),
             ):
                 with Horizontal(classes="field"):
                     yield Label(label, classes="field-key")
@@ -65,6 +67,11 @@ class RulesScreen(ModalScreen[dict[str, Any] | None]):
                 "Keep received model weights on disk (faster reloads; uses disk space)",
                 r.get("disk_cache", True),
                 id="rule-disk_cache",
+            )
+            yield Checkbox(
+                "Step back automatically when I use the GPU myself (games, rendering)",
+                r.get("auto_yield", True),
+                id="rule-auto_yield",
             )
             yield Static(id="rule-error")
             with Horizontal(classes="buttons"):
@@ -93,6 +100,9 @@ class RulesScreen(ModalScreen[dict[str, Any] | None]):
             "allow_cpu": self.query_one("#rule-allow_cpu", Checkbox).value,
             "allow_direct": self.query_one("#rule-allow_direct", Checkbox).value,
             "disk_cache": self.query_one("#rule-disk_cache", Checkbox).value,
+            "auto_yield": self.query_one("#rule-auto_yield", Checkbox).value,
+            "yield_gpu_percent": number("yield_gpu_percent", int),
+            "yield_seconds": number("yield_seconds", int),
         }
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -219,7 +229,11 @@ class AgentTUI(App[None]):
         lend = Table.grid(padding=(0, 2))
         lend.add_column(style="bold")
         lend.add_column()
-        lend.add_row("Lending", t("PAUSED" if s["paused"] else "on", "bold yellow" if s["paused"] else "bold green"))
+        state = s.get("lend_state", "lending")
+        label = {"lending": "on", "paused": "PAUSED", "yielding": "STEPPED BACK"}.get(state, state)
+        if s.get("lend_reason") and state != "lending":
+            label += f" - {s['lend_reason']}"
+        lend.add_row("Lending", t(label, "bold green" if state == "lending" else "bold yellow"))
         lent = s["lent"]
         if lent:
             what = f"{lent['device']} ({lent['cap_mib']} MiB) for {lent['model'] or 'a model'}"
@@ -253,6 +267,15 @@ class AgentTUI(App[None]):
                     if on
                 )
                 or "nothing else"
+            ),
+        )
+        lend.add_row("Schedule", t(", ".join(r["schedule"]) or "always"))
+        lend.add_row(
+            "Auto-yield",
+            t(
+                f"when GPU use > {r.get('yield_gpu_percent', 60)} % for {r.get('yield_seconds', 20)} s"
+                if r.get("auto_yield", True)
+                else "off"
             ),
         )
         if s["last_net_test"]:
