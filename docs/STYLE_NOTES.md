@@ -70,7 +70,10 @@ recognisable.
   treated as atomic; an `asyncio.Lock` is taken only to keep state consistent
   across an `await`. Background loops are `asyncio.ensure_future` tasks that are
   cancelled in `finally`. Cancellation is never swallowed
-  (`if current.cancelling(): raise`).
+  (`if current.cancelling(): raise`): stop helper tasks with `aio.reap()`, not
+  `suppress(CancelledError)`, and use `aio.wait_for()`, not
+  `asyncio.wait_for()` (on Python 3.11 the latter can drop a cancellation
+  that races the result, and a shut-down task keeps running).
 - Constants and tunables: module-level constants for fixed values, `config.toml`
   for anything the owner might want to change. Config is plain dataclasses per
   section, loaded from TOML, overridden by env vars, then `validate()`d; unknown

@@ -51,4 +51,15 @@ modes). Split mode is used only when it wins by `planner.min_gain`.
 **Real model numbers:** not measured yet. The development container has no
 GPU and no second machine, so its only split runs use a tiny generated test
 model, which says nothing about real speed-ups. Numbers from the owner's
-hub and helpers go here (Phase 7).
+hub and helpers go here.
+
+### Adding your numbers
+
+1. On the hub, with the helpers connected: `ollamapower models benchmark <model>`
+   for each model you care about (or let the hub do it while idle), and
+   `ollamapower nodes tunnel-test <helper>` for each helper.
+2. `ollamapower models benchmarks --markdown` prints the hub's GPUs, each
+   helper's GPUs and link, and a table of every successful run (date, model,
+   context, engine, helpers with tunnel mode, load time, time to first token,
+   prompt and generation tokens/s). Paste it below with a line on the setup
+   (switch, cables), and `nodes show <helper>` for the tunnel numbers.

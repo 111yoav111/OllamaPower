@@ -3,9 +3,9 @@
 OllamaPower lets other machines on your network take part in running your
 models, so it is built to fail closed. This file describes the threat model and
 what is (and isn't) protected. It is updated after every build phase; this is
-the **Phase 5** version: the front door, the control plane between the hub
-and its helpers, split mode (llama.cpp RPC) with its encrypted tunnel, and
-the planner that decides when to use it.
+the **Phase 6** version: the front door, the control plane between the hub
+and its helpers, split mode (llama.cpp RPC) with its encrypted tunnel, the
+planner that decides when to use it, and the helper owner's lending controls.
 
 ## Threat model
 
@@ -180,6 +180,20 @@ as it could use Ollama directly before.
   while it runs (only when the hub has been idle for `planner.idle_seconds`,
   and it stops as soon as a request arrives). Turn it off with
   `planner.auto_benchmark = false`.
+
+### Lending controls (Phase 6)
+
+- **The schedule and auto-yield are decided on the helper**, from its own
+  clock and its own GPU readings; the hub is only told the result
+  (`lending`, `paused` or `yielding`, with a reason) and can't override it.
+  The agent refuses `rpc_start` whenever it isn't lending.
+- **Pause is instant:** any split session using the helper ends at once.
+  Schedule ends and auto-yield are graceful: the hub gets up to 45 s to finish
+  its current answers and release the helper, then the agent stops
+  `rpc-server` by itself anyway.
+- **Auto-yield looks at nothing new:** only the GPU load percentage the hub
+  already sees in the heartbeats. No process names or lists are read or
+  reported; the hub learns "yielding" and which GPU was busy.
 
 ### Control-plane encryption (Phase 0 building blocks)
 

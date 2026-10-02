@@ -6,14 +6,16 @@ the Hub exactly as they talk to Ollama today; the Hub decides, per model, whethe
 a helper can make it faster or let it run a model that doesn't fit, and only
 uses a helper when a benchmark proves it wins.
 
-> **Status: Phase 5 (planner).** The hub runs in front of your Ollama with a
-> priority queue and a terminal UI; helpers join and report their GPUs. For a
-> model that doesn't fit the hub's GPU, the hub benchmarks plain Ollama
-> against split mode (the model spread over the hub's and helpers' GPUs with
-> llama.cpp) and uses split mode only if it is measurably faster. Split-mode
-> traffic is encrypted (mutually authenticated TLS 1.3) unless both owners opt
-> in to direct mode. Everything else is served by your local Ollama, exactly
-> as before.
+> **Status: all phases built (0-6).** The hub runs in front of your Ollama
+> with a priority queue and a terminal UI; helpers join and lend their GPUs
+> on their owners' terms (caps, schedule, pause, auto-yield). For a model that
+> doesn't fit the hub's GPU, the hub benchmarks plain Ollama against split
+> mode (the model spread over the hub's and helpers' GPUs with llama.cpp) and
+> uses split mode only if it is measurably faster. Split-mode traffic is
+> encrypted (mutually authenticated TLS 1.3) unless both owners opt in to
+> direct mode. Everything else is served by your local Ollama, exactly as
+> before. Not yet measured on real multi-machine hardware: see
+> [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## What it can and can't do
 
@@ -44,6 +46,11 @@ changed. If split mode fails, Ollama serves the request.
 ```bash
 pipx install git+https://github.com/111yoav111/OllamaPower    # or, for development: see below
 ```
+
+From a source checkout, `scripts/start_hub.sh` / `scripts/start_agent.sh`
+(`.bat` on Windows) start the hub or a helper with the checkout's `.venv` if
+there is one, else the installed `ollamapower`; extra arguments are passed on
+(`scripts/start_agent.sh --hub 192.168.1.10`).
 
 ## Set up the Hub
 
@@ -153,7 +160,8 @@ split mode needs a cable.
 ### What a helper lends (its owner decides)
 
 The helper's owner controls lending in the agent TUI (`E`), with
-`ollamapower agent rules`, or in `agent.toml`:
+`ollamapower agent rules`, or in `agent.toml`
+([`agent.example.toml`](agent.example.toml) lists every setting):
 
 | Rule | Default | Effect |
 |---|---|---|
@@ -162,9 +170,25 @@ The helper's owner controls lending in the agent TUI (`E`), with
 | `allow_cpu` | off | lend CPU/RAM when there is no GPU |
 | `allow_direct` | off | allow trusted-LAN direct mode (below) |
 | `disk_cache` | on | keep received model weights on disk, so the next load skips the network |
-| `schedule` | always | e.g. `22:00-08:00` (enforced from Phase 6) |
+| `schedule` | always | when to lend, local time, e.g. `22:00-08:00` or `09:00-12:00,20:00-23:00` (windows may cross midnight) |
+| `auto_yield` | on | step back when you use the GPU yourself (below) |
+| `yield_gpu_percent`, `yield_seconds` | 60 %, 20 s | what counts as "you are using it" |
 
-`P` in the agent TUI (or `ollamapower agent pause`) stops lending at once.
+`P` in the agent TUI (or `ollamapower agent pause`) stops lending at once:
+any split session using the helper ends immediately.
+
+**Schedule and auto-yield are gentler.** When the schedule ends, or the
+helper's GPU has been busier than `yield_gpu_percent` for `yield_seconds`
+while the hub wasn't using it (you started a game or a render), the helper
+tells the hub it is stepping back. The hub lets the answers it is generating
+finish (up to 30 s), stops split mode, and serves the model from Ollama;
+nothing counts as a failure. When the helper lends again (the schedule
+starts, or the GPU has been calm for `yield_seconds`), split mode resumes
+without a new benchmark. The agent TUI and `agent status` say why the helper
+isn't lending right now. Limits: while the hub is actively using the GPU,
+your own load can't be told apart from it, so the helper steps back within
+`yield_seconds` of the hub's next pause; GPUs that don't report their load
+(Apple, some AMD) can't auto-yield - use the schedule or `P`.
 
 ```bash
 ollamapower agent status [--json] [--watch]
@@ -229,6 +253,7 @@ ollamapower models pin <model> split|local   # override the benchmark   (TUI: L 
 ollamapower models force-local <model>       # same as `pin <model> local`
 ollamapower models unpin <model>             # automatic again           (TUI: U)
 ollamapower models exclude <model> <helper> [--undo]
+ollamapower models benchmarks [--markdown]   # every result; --markdown for docs/BENCHMARKS.md
 ollamapower llamacpp install | status        # the pinned llama.cpp (also done automatically)
 ```
 
@@ -372,8 +397,8 @@ clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
 | 2 Agents & telemetry (done) | Control plane with protocol version and Hub key pinning, GPU telemetry, net tests, Hub and agent TUIs, CLI |
 | 3 Split MVP (done) | llama.cpp pin/download/verify, Ollama blob resolver, `rpc-server`/`llama-server` lifecycle, layer placement under the lending caps, API translation, direct-mode relay |
 | 4 Secure tunnel (done) | Per-session pinned TLS 1.3 relays, hub-address allowlist checked before TLS, two-owner direct mode, `nodes tunnel-test` overhead measurement |
-| **5 Planner** (done) | Memory estimate, spill detection, benchmarks through the real path, automatic "never slower" choice tied to a benchmark key, pins and exclusions, idle auto-benchmarks, transparent fallback, degraded plans and recovery |
-| 6 Lending & polish | Schedules, auto-yield, real benchmark numbers, start scripts |
+| 5 Planner (done) | Memory estimate, spill detection, benchmarks through the real path, automatic "never slower" choice tied to a benchmark key, pins and exclusions, idle auto-benchmarks, transparent fallback, degraded plans and recovery |
+| **6 Lending & polish** (done) | Lending schedules, auto-yield with graceful drain, `agent.example.toml`, start scripts, `models benchmarks --markdown` for real numbers |
 
 Later ideas, not planned yet: speculative decoding with helpers running the
 draft model, MoE expert offload, several Hubs.
