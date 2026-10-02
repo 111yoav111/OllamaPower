@@ -51,11 +51,7 @@ def _link(link: dict[str, Any]) -> Text:
 def _rules_text(r: dict[str, Any]) -> str:
     caps = [f"{r['max_vram_gb']:g} GB" for _ in [0] if r.get("max_vram_gb")]
     caps += [f"{r['max_vram_percent']}%" for _ in [0] if r.get("max_vram_percent")]
-    allowed = [
-        name
-        for key, name in (("allow_cpu", "CPU"), ("allow_overflow", "overflow"), ("allow_direct", "direct mode"))
-        if r.get(key)
-    ]
+    allowed = [name for key, name in (("allow_cpu", "CPU"), ("allow_direct", "direct mode")) if r.get(key)]
     gpus = ", ".join(str(g) for g in r.get("gpus") or []) or "all"
     return f"VRAM cap {' and '.join(caps) or 'none'} · GPUs {gpus} · also allows {', '.join(allowed) or 'nothing else'}"
 
@@ -377,7 +373,6 @@ class HubTUI(App[None]):
         grid.add_column(style="bold")
         grid.add_column()
         cpu = caps.get("cpu") or {}
-        ollama = caps.get("ollama") or {}
         lending = d["lending"]
         rows = [
             ("Name", d["name"]),
@@ -389,12 +384,6 @@ class HubTUI(App[None]):
             ("CPU", f"{cpu.get('model', '?')} · {cpu.get('cores', '?')} cores / {cpu.get('threads', '?')} threads"),
             ("RAM", f"{gib(d['ram_used'])} / {gib(d['ram_total'])} GB"),
             ("Backends", ", ".join(caps.get("backends") or []) or "-"),
-            (
-                "Ollama",
-                f"{ollama.get('version', '')} · {len(ollama.get('models') or [])} models"
-                if ollama.get("present")
-                else "not found",
-            ),
             ("Link", _link(d["link"]).plain),
             ("Tunnel", f"{d['tunnel_effective']} (requested {d['tunnel_mode']})"),
             ("Lending rules", _rules_text(lending)),

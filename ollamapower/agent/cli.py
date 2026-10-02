@@ -250,7 +250,6 @@ def agent_rules(
     max_vram_percent: int | None = typer.Option(None, help="0 = no cap"),
     gpus: str | None = typer.Option(None, help='GPU indexes to lend, e.g. "0,1"; "" = all'),
     allow_cpu: bool | None = typer.Option(None, "--allow-cpu/--no-cpu"),
-    allow_overflow: bool | None = typer.Option(None, "--allow-overflow/--no-overflow"),
     allow_direct: bool | None = typer.Option(
         None, "--allow-direct/--no-direct", help="Allow unencrypted trusted-LAN mode"
     ),
@@ -262,7 +261,6 @@ def agent_rules(
             "max_vram_gb": max_vram_gb,
             "max_vram_percent": max_vram_percent,
             "allow_cpu": allow_cpu,
-            "allow_overflow": allow_overflow,
             "allow_direct": allow_direct,
         }.items()
         if v is not None

@@ -109,7 +109,6 @@ def clean_lending(value: Any) -> dict[str, Any]:
         "max_vram_percent": int(min(100.0, max(0.0, _num(r.get("max_vram_percent"))))),
         "gpus": [g for g in (_index(x) for x in gpus[:16]) if g is not None],
         "allow_cpu": r.get("allow_cpu") is True,
-        "allow_overflow": r.get("allow_overflow") is True,
         "allow_direct": r.get("allow_direct") is True,
         "schedule": [safe_text(w, 20) for w in schedule[:8] if isinstance(w, str)],
         "paused": r.get("paused") is True,
@@ -123,14 +122,11 @@ def clean_capabilities(value: Any) -> dict[str, Any]:
         caps["network"] = {}
     if not isinstance(caps["network"].get("kind"), str):
         caps["network"]["kind"] = "unknown"
-    for key in ("cpu", "ollama"):
-        if not isinstance(caps.get(key), dict):
-            caps[key] = {}
+    if not isinstance(caps.get("cpu"), dict):
+        caps["cpu"] = {}
     if not isinstance(caps.get("backends"), list):
         caps["backends"] = []
     caps["backends"] = [b for b in caps["backends"] if isinstance(b, str)]
-    if not isinstance(caps["ollama"].get("models"), list):
-        caps["ollama"]["models"] = []
     return caps
 
 
@@ -261,7 +257,7 @@ class Node:
             "hub_paused": self.hub_paused,
             "tunnel_mode": self.tunnel_mode,
             "tunnel_effective": self.tunnel_effective,
-            "role": "idle",  # split / overflow roles arrive with Phases 3 and 6
+            "role": "idle",  # "split" once split mode arrives (Phase 3)
             "first_seen": self.first_seen,
             "last_seen": self.last_seen if not self.connected else time.time(),
             "connected_at": self.connected_at,

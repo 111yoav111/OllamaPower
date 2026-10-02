@@ -10,8 +10,8 @@ Lifecycle, retried every ``RECONNECT_DELAY`` seconds like DCP:
 3. ``hello`` with the token -> ``welcome`` (or ``reject``: a wrong token or an
    incompatible version stops the agent; a full hub is retried).
 4. ``capabilities``, the lend state, then heartbeats with telemetry every 2 s,
-   while answering network tests. Split mode and overflow requests are answered
-   with "not available yet" until Phases 3 and 6.
+   while answering network tests. Split-mode requests are answered with "not
+   available yet" until Phase 3.
 
 ``AgentState`` holds what the agent TUI and ``ollamapower agent status`` show.
 """
@@ -30,8 +30,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
-
 from .. import __version__
 from ..core import protocol
 from ..core.channel import Channel
@@ -47,7 +45,6 @@ log = logging.getLogger("ollamapower.agent")
 RECONNECT_DELAY = 5.0  # seconds, as in DCP
 KICKED_DELAY = 60.0  # after the hub owner kicked us, wait longer before coming back
 CONNECT_TIMEOUT = 10.0
-MAX_OLLAMA_MODELS = 200
 MAX_TESTS = 8  # network tests remembered at once
 
 # Confirm callback: (hub address, fingerprint hex) -> trust it?
@@ -291,8 +288,6 @@ class AgentClient:
                 fut.set_result(m["result"])
         elif kind == "rpc_start":
             await channel.send("rpc_error", session_id=m["session_id"], error="split mode is not available yet")
-        elif kind == "overflow_request":
-            await channel.send("stream_error", request_id=m["request_id"], error="overflow is not available yet")
 
     async def _on_test_data(self, channel: Channel, m: dict[str, Any]) -> None:
         test = self._tests.get(m["test_id"])
@@ -321,26 +316,11 @@ class AgentClient:
 
     # ----- facts -----------------------------------------------------------------------
 
-    async def ollama_info(self) -> dict[str, Any]:
-        try:
-            async with httpx.AsyncClient(base_url=self.config.agent.ollama_url, timeout=3, trust_env=False) as c:
-                version = (await c.get("/api/version")).json().get("version", "")
-                tags = (await c.get("/api/tags")).json().get("models", []) or []
-        except (httpx.HTTPError, ValueError, AttributeError):
-            return {"present": False}
-        models = [
-            {"name": str(m.get("name", "")), "digest": str(m.get("digest", "")), "size": m.get("size", 0)}
-            for m in tags[:MAX_OLLAMA_MODELS]
-            if isinstance(m, dict)
-        ]
-        return {"present": True, "version": str(version), "models": models}
-
     async def capabilities(self) -> dict[str, Any]:
         return {
             **self.state.static,
             "agent_version": __version__,
             "llama_cpp": None,  # Phase 3
-            "ollama": await self.ollama_info(),
             "network": self.state.network,
             "lending": self.lending_dict(),
         }

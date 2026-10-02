@@ -50,17 +50,12 @@ class RulesScreen(ModalScreen[dict[str, Any] | None]):
                 ("max_vram_gb", "Max VRAM to lend (GB, 0 = no cap)", r["max_vram_gb"]),
                 ("max_vram_percent", "Max VRAM to lend (%, 0 = no cap)", r["max_vram_percent"]),
                 ("gpus", "GPUs to lend (e.g. 0,1; empty = all)", ",".join(str(g) for g in r["gpus"])),
-                ("schedule", "Schedule (e.g. 22:00-08:00; Phase 7)", ",".join(r["schedule"])),
+                ("schedule", "Schedule (e.g. 22:00-08:00; Phase 6)", ",".join(r["schedule"])),
             ):
                 with Horizontal(classes="field"):
                     yield Label(label, classes="field-key")
                     yield Input(str(value), id=f"rule-{key}", classes="field-value")
             yield Checkbox("Lend CPU/RAM when there is no GPU", r["allow_cpu"], id="rule-allow_cpu")
-            yield Checkbox(
-                "Allow overflow: whole requests on this PC's Ollama (Phase 6)",
-                r["allow_overflow"],
-                id="rule-allow_overflow",
-            )
             yield Checkbox(
                 "Allow trusted-LAN direct mode (split traffic UNENCRYPTED; the hub owner must also choose it)",
                 r["allow_direct"],
@@ -91,7 +86,6 @@ class RulesScreen(ModalScreen[dict[str, Any] | None]):
             "gpus": [int(g) for g in gpus],
             "schedule": [w.strip() for w in self._value("schedule").split(",") if w.strip()],
             "allow_cpu": self.query_one("#rule-allow_cpu", Checkbox).value,
-            "allow_overflow": self.query_one("#rule-allow_overflow", Checkbox).value,
             "allow_direct": self.query_one("#rule-allow_direct", Checkbox).value,
         }
 
@@ -235,7 +229,6 @@ class AgentTUI(App[None]):
                     k
                     for k, on in (
                         ("CPU", r["allow_cpu"]),
-                        ("overflow", r["allow_overflow"]),
                         ("direct mode", r["allow_direct"]),
                     )
                     if on

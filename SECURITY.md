@@ -88,8 +88,10 @@ as it could use Ollama directly before.
   owner changes them; the hub can pause or kick a helper but never widen what
   it lends. Unencrypted direct mode needs **both** owners to opt in and keeps a
   warning on screen.
-- **Agent requests are refused for now.** Split-mode and overflow requests are
-  answered "not available" until Phases 3 and 6.
+- **Helpers never run models on their own.** They only lend GPU/CPU to the
+  Hub's engine (split mode, Phase 3); until then they answer split-mode
+  requests with "not available". There is no way for the Hub to make a helper
+  run Ollama or any other program than the pinned, hash-checked `rpc-server`.
 
 ### Control-plane encryption (Phase 0 building blocks)
 

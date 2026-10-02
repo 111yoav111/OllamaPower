@@ -127,7 +127,6 @@ async def test_agent_joins_reports_and_heartbeats(setup):
     assert snap["vram_total"] == 24 * GIB and snap["vram_free"] == 20 * GIB
     assert snap["vram_lendable"] == 8 * GIB  # capped by the helper owner's rule
     assert snap["link"]["kind"] in ("loopback", "unknown")
-    assert node.capabilities["ollama"]["present"] is False
     assert agent.state.connection == "connected" and agent.state.pinned
     assert any(e["kind"] == "node_join" for e in setup.hub.recent_events)
     assert await until(lambda: len(node.history) >= 2, 6)
@@ -308,7 +307,7 @@ async def test_network_test_both_ways(setup):
     assert from_agent["rtt_ms"] > 0 and agent.state.last_net_test == from_agent
 
 
-async def test_split_and_overflow_requests_are_declined_for_now(setup):
+async def test_split_requests_are_declined_for_now(setup):
     agent = setup.agent()
     setup.run(agent)
     assert await until(lambda: setup.node() is not None and setup.node().connected)

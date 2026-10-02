@@ -411,7 +411,6 @@ def nodes_list(
 def render_node(d: dict[str, Any]) -> Lines:
     caps = d.get("capabilities", {})
     cpu = caps.get("cpu") or {}
-    ollama = caps.get("ollama") or {}
     rows = [
         ("ID", d["id"]),
         ("Name", d["name"]),
@@ -424,12 +423,6 @@ def render_node(d: dict[str, Any]) -> Lines:
         ("VRAM", f"{gb(d['vram_free'])} free of {gb(d['vram_total'])} GB, {gb(d['vram_lendable'])} GB lendable"),
         ("Link", _link(d["link"])),
         ("Tunnel", f"{d['tunnel_effective']} (requested {d['tunnel_mode']})"),
-        (
-            "Ollama",
-            f"{ollama.get('version', '')}, {len(ollama.get('models') or [])} models"
-            if ollama.get("present")
-            else "not found",
-        ),
         ("Lending", json.dumps(d["lending"])),
         ("Connected", ts(d["connected_at"]) if d["connected"] else f"no (last seen {ts(d['last_seen'])})"),
     ]

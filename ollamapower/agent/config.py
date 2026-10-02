@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..config import ConfigError, _apply, default_config_dir, is_loopback_host
+from ..config import ConfigError, _apply, default_config_dir
 from ..files import write_private
 
 AGENT_FILE = "agent.toml"
@@ -36,8 +36,6 @@ class HubAddress:
 class AgentSettings:
     # How this helper appears on the hub (default: the computer's name).
     name: str = ""
-    # This helper's own Ollama (for overflow, Phase 6).
-    ollama_url: str = "http://127.0.0.1:11434"
 
 
 @dataclass
@@ -48,9 +46,8 @@ class LendingRules:
     max_vram_percent: int = 0
     gpus: list[int] = field(default_factory=list)  # empty = all GPUs
     allow_cpu: bool = False  # lend CPU/RAM when there is no GPU
-    allow_overflow: bool = False  # run whole requests on this helper's Ollama (Phase 6)
     allow_direct: bool = False  # allow unencrypted trusted-LAN mode for split traffic (Phase 4)
-    schedule: list[str] = field(default_factory=list)  # e.g. ["22:00-08:00"] (Phase 7)
+    schedule: list[str] = field(default_factory=list)  # e.g. ["22:00-08:00"] (Phase 6)
 
     def validate(self) -> None:
         if not math.isfinite(self.max_vram_gb) or self.max_vram_gb < 0:
@@ -105,11 +102,6 @@ class AgentConfig:
             raise ConfigError(f"hub.port out of range: {self.hub.port}")
         if len(self.agent.name) > 64:
             raise ConfigError("agent.name is too long (64 characters at most)")
-        from urllib.parse import urlsplit
-
-        url = urlsplit(self.agent.ollama_url)
-        if url.scheme not in ("http", "https") or not url.hostname or not is_loopback_host(url.hostname):
-            raise ConfigError("agent.ollama_url must be a loopback http(s) URL")
         self.lending.validate()
 
 

@@ -22,7 +22,7 @@ model. VRAM moves hundreds of GB/s, system RAM tens of GB/s, a gigabit LAN about
 |---|---|
 | The model fits in the Hub's VRAM | **No.** Splitting it across machines makes it slower. OllamaPower leaves it on plain Ollama. |
 | The model doesn't fit, so Ollama spills layers to the Hub's CPU/RAM | **Often yes**, over a wired LAN: those layers run on a helper's GPU instead (llama.cpp RPC). It also lets you load models that don't fit at all. |
-| Several requests at once (agents, batch jobs, several users) | **Yes**: a helper with its own Ollama can take whole requests (overflow). |
+| Several requests at once (agents, batch jobs, several users) | **A little**: helper VRAM leaves the Hub room for a larger context and more parallel requests, but every request still runs through the Hub. Helpers never run Ollama or their own copy of a model. |
 | Helper on Wi-Fi or across the internet | **No** for split mode. Wi-Fi helpers get a loud warning. |
 
 **Golden rule: OllamaPower must never make things slower.** Every non-local plan
@@ -155,16 +155,15 @@ The helper's owner controls lending in the agent TUI (`E`), with
 | `max_vram_gb`, `max_vram_percent` | no cap | most VRAM the hub may use |
 | `gpus` | all | which GPUs to lend |
 | `allow_cpu` | off | lend CPU/RAM when there is no GPU |
-| `allow_overflow` | off | run whole requests on this PC's own Ollama (Phase 6) |
 | `allow_direct` | off | allow trusted-LAN direct mode (below) |
-| `schedule` | always | e.g. `22:00-08:00` (enforced from Phase 7) |
+| `schedule` | always | e.g. `22:00-08:00` (enforced from Phase 6) |
 
 `P` in the agent TUI (or `ollamapower agent pause`) stops lending at once.
 
 ```bash
 ollamapower agent status [--json] [--watch]
 ollamapower agent pause | resume
-ollamapower agent rules --max-vram-gb 8 --gpus 0 --allow-overflow
+ollamapower agent rules --max-vram-gb 8 --gpus 0
 ollamapower agent net-test
 ollamapower agent forget-hub          # only after you replaced the hub's key yourself
 ```
@@ -215,8 +214,7 @@ env var). On disk, all owner-only: `config.toml`, `.env`, `hub_key.pem`,
 ```
 clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
               ├─ local-ollama → Ollama on 127.0.0.1:11435
-              ├─ split        → llama-server --rpc → helpers' rpc-server (over an mTLS tunnel)
-              └─ overflow     → a helper's own Ollama, over the encrypted control plane
+              └─ split        → llama-server --rpc → helpers' rpc-server (over an mTLS tunnel)
 ```
 
 - **Ollama doesn't do multi-machine inference.** Split mode uses llama.cpp's RPC
@@ -237,8 +235,7 @@ clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
 | 3 Split MVP | llama.cpp pin/download/verify, Ollama blob resolver, `rpc-server`/`llama-server` lifecycle, API translation |
 | 4 Secure tunnel | mTLS relays, IP allowlist, opt-in trusted-LAN direct mode, overhead measured |
 | 5 Planner | Memory estimate, spill detection, benchmarks, automatic "never slower" plan choice, fault tolerance |
-| 6 Overflow | Whole requests on helpers' own Ollama when the Hub is busy |
-| 7 Lending & polish | Schedules, auto-yield, real benchmark numbers, start scripts |
+| 6 Lending & polish | Schedules, auto-yield, real benchmark numbers, start scripts |
 
 Later ideas, not planned yet: speculative decoding with helpers running the
 draft model, MoE expert offload, several Hubs.

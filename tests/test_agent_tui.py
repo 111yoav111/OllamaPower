@@ -36,10 +36,10 @@ async def test_first_connect_asks_to_trust_the_key(tmp_path, hub_key):  # noqa: 
             await pilot.press("e")
             assert isinstance(app.screen, RulesScreen)
             app.screen.query_one("#rule-max_vram_gb", Input).value = "6"
-            app.screen.query_one("#rule-allow_overflow", Checkbox).value = True
+            app.screen.query_one("#rule-allow_cpu", Checkbox).value = True
             await pilot.click("#save")
             assert await wait(pilot, lambda: s.node("laptop").lending.get("max_vram_gb") == 6.0)
-            assert "allow_overflow = true" in agent.config.path.read_text()
+            assert "allow_cpu = true" in agent.config.path.read_text()
 
             await pilot.press("n")
             assert await wait(pilot, lambda: "Last net test" in plain(app, "#lending"), 15)

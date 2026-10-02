@@ -109,15 +109,6 @@ SCHEMAS: dict[str, tuple[Direction, dict[str, Field]]] = {
     "rpc_ready": (Direction.TO_HUB, {"session_id": (STR, True), "endpoint": (DICT, False)}),
     "rpc_error": (Direction.TO_HUB, {"session_id": (STR, True), "error": (STR, True)}),
     "rpc_stop": (Direction.TO_AGENT, {"session_id": (STR, True)}),
-    # --- overflow (Phase 6) ---
-    "overflow_request": (
-        Direction.TO_AGENT,
-        {"request_id": (STR, True), "endpoint": (STR, True), "body": (DICT, True)},
-    ),
-    "stream_chunk": (Direction.TO_HUB, {"request_id": (STR, True), "data": (BYTES, True)}),
-    "stream_end": (Direction.TO_HUB, {"request_id": (STR, True), "status": (INT, False)}),
-    "stream_error": (Direction.TO_HUB, {"request_id": (STR, True), "error": (STR, True)}),
-    "cancel": (Direction.TO_AGENT, {"request_id": (STR, True)}),
 }
 
 LEND_STATES = ("lending", "paused", "yielding")
