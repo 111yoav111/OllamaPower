@@ -105,14 +105,20 @@ async def test_completion_fires_callback_and_frees_node():
     assert lb.compute_metrics().tasks_completed == 1
 
 
-async def test_heartbeat_timeout_requeues_work():
+async def test_heartbeat_timeout_kicks_node_and_requeues_work():
     lb, _ = make_lb()
+    kicked = []
+
+    async def kick(node_id):
+        kicked.append(node_id)
+
+    lb.set_kick_callback(kick)
     lb.register_node("n1", "127.0.0.1", 1)
     task_id = lb.submit_task("job")
     await lb.try_dispatch()
     timed_out = await lb.check_heartbeats(now=time.monotonic() + lb.HEARTBEAT_TIMEOUT + 1)
-    assert timed_out == ["n1"]
-    assert lb.nodes["n1"].status is NodeStatus.OFFLINE
+    assert timed_out == kicked == ["n1"]
+    assert "n1" not in lb.nodes
     assert lb.pool.records[task_id].status is TaskStatus.REQUEUED
     assert len(lb.pool) == 1
 
@@ -166,3 +172,69 @@ async def test_snapshot_is_json_safe():
     json.dumps(snap)
     assert snap["nodes"]["n1"]["status"] == "ready"
     assert snap["queue"][0]["priority"] == "HIGH"
+
+
+async def test_late_result_from_previous_owner_is_ignored():
+    lb, sent = make_lb()
+    lb.register_node("a", "10.0.0.1", 1)
+    task_id = lb.submit_task("job")
+    await lb.try_dispatch()
+    await lb.unregister_node("a")  # requeued
+    lb.register_node("b", "10.0.0.2", 1)
+    await lb.try_dispatch()
+    lb.task_completed("a", task_id, "stale")  # A's late answer
+    lb.task_failed("a", task_id, "stale")
+    record = lb.pool.records[task_id]
+    assert record.status is TaskStatus.ASSIGNED and record.assigned_node == "b"
+    assert len(lb.pool) == 0 and record.retries == 1
+    lb.task_completed("b", task_id, "fresh")
+    assert record.result == "fresh" and lb.nodes["b"].status is NodeStatus.READY
+
+
+async def test_result_for_queued_task_is_ignored():
+    lb, _ = make_lb()
+    lb.register_node("n1", "127.0.0.1", 1)
+    task_id = lb.submit_task("job")
+    lb.task_completed("n1", task_id, "never dispatched")
+    assert lb.pool.records[task_id].status is TaskStatus.PENDING
+    assert len(lb.pool) == 1
+
+
+async def test_node_dropping_during_send_does_not_queue_twice():
+    lb = LoadBalancer()
+    lb.register_node("n1", "127.0.0.1", 1)
+
+    async def send(node_id, record):
+        await lb.unregister_node(node_id)  # the node disconnects while we send
+        return False
+
+    lb.set_send_callback(send)
+    task_id = lb.submit_task("job")
+    assert await lb.try_dispatch() is None
+    assert len(lb.pool) == 1
+    assert lb.pool.records[task_id].status is TaskStatus.REQUEUED
+
+
+async def test_raising_send_callback_does_not_stop_dispatch():
+    lb = LoadBalancer()
+    lb.register_node("n1", "127.0.0.1", 1)
+
+    async def send(node_id, record):
+        raise RuntimeError("transport closing")
+
+    lb.set_send_callback(send)
+    task_id = lb.submit_task("job")
+    assert await lb.try_dispatch() is None
+    assert lb.pool.records[task_id].status is TaskStatus.REQUEUED
+    assert lb.nodes["n1"].status is NodeStatus.READY
+
+
+async def test_waiting_for_nodes_does_not_count_as_skips():
+    lb, sent = make_lb()
+    lb.submit_task("heavy", difficulty=10.0)
+    for _ in range(MAX_SKIPS * 2):
+        await lb.try_dispatch()  # no nodes yet
+    lb.register_node("n1", "127.0.0.1", 1)
+    lb.update_node_stats("n1", cpu=50.0)
+    assert await lb.try_dispatch() is None  # still subject to the capacity check
+    assert sent == []

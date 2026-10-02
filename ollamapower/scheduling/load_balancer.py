@@ -5,8 +5,8 @@ Three loops run on the hub's event loop:
 * **dispatch** - every ``DISPATCH_INTERVAL`` take the best few records from the
   ``TaskPool`` and hand the first one that fits to the least loaded node;
   records that keep not fitting are force-dispatched after ``MAX_SKIPS``.
-* **heartbeat** - a node silent for ``HEARTBEAT_TIMEOUT`` is marked offline
-  and its work is requeued.
+* **heartbeat** - a node silent for ``HEARTBEAT_TIMEOUT`` is kicked and its
+  work is requeued.
 * **metrics** - a periodic ``LBMetrics`` snapshot for the TUI and CLI.
 
 The load model is still DCP's (CPU percent, +20 while busy). Phase 2/5 replaces
@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from .task_pool import TaskPool, TaskPriority, TaskRecord, TaskStatus
+
+ACTIVE_STATES = (TaskStatus.ASSIGNED, TaskStatus.RUNNING)
 
 # CPU percent at which a node stops getting work, and below which it recovers.
 OVERLOAD_PERCENT = 90.0
@@ -180,7 +182,10 @@ class LoadBalancer:
     async def kick_node(self, node_id: str, reason: str = "manual") -> None:
         self.log.warning("kicking node %s (%s)", node_id, reason)
         if self.kick_node_cb is not None:
-            await self.kick_node_cb(node_id)
+            try:
+                await self.kick_node_cb(node_id)
+            except Exception as exc:  # noqa: BLE001 - the node is dropped either way
+                self.log.warning("kick callback for %s failed: %s", node_id, type(exc).__name__)
         await self.unregister_node(node_id)
 
     # ----- tasks -----------------------------------------------------------------------
@@ -196,31 +201,41 @@ class LoadBalancer:
         self.log.debug("task %.8s queued (%s)", record.task_id, record.priority_name)
         return record.task_id
 
-    def task_completed(self, node_id: str, task_id: str, result: Any = None) -> None:
+    def _owned(self, node_id: str, task_id: str, what: str) -> TaskRecord | None:
+        """The record if ``node_id`` is really running it; stale or foreign reports are ignored."""
         record = self.pool.records.get(task_id)
+        if record is None or record.assigned_node != node_id or record.status not in ACTIVE_STATES:
+            self.log.warning("ignoring %s for task %.8s from %s (not assigned to it)", what, task_id, node_id)
+            return None
+        return record
+
+    def _release(self, node_id: str, task_id: str) -> NodeState | None:
+        node = self.nodes.get(node_id)
+        if node is not None:
+            node.active_task_ids.discard(task_id)
+            node.settle()
+        return node
+
+    def task_completed(self, node_id: str, task_id: str, result: Any = None) -> None:
+        record = self._owned(node_id, task_id, "result")
         if record is None:
-            self.log.error("result for unknown task %.8s from %s", task_id, node_id)
             return
         self.pool.complete(record, result)
         self.tasks_completed += 1
         self._completion_times.append(time.monotonic())
-        node = self.nodes.get(node_id)
+        node = self._release(node_id, task_id)
         if node is not None:
-            node.active_task_ids.discard(task_id)
             node.completed_tasks += 1
-            node.settle()
         self.log.info("task %.8s done by %s (%.2fs)", task_id, node_id, record.elapsed or 0.0)
         self._fire(self.on_task_done_cbs, record)
 
     def task_failed(self, node_id: str, task_id: str, error: str) -> None:
-        record = self.pool.records.get(task_id)
+        record = self._owned(node_id, task_id, "failure")
         if record is None:
             return
-        node = self.nodes.get(node_id)
+        node = self._release(node_id, task_id)
         if node is not None:
-            node.active_task_ids.discard(task_id)
             node.failed_tasks += 1
-            node.settle()
         if self.pool.fail(record, error):
             self.log.warning(
                 "task %.8s failed (%d/%d), requeued: %s", task_id, record.retries, record.max_retries, error
@@ -242,8 +257,8 @@ class LoadBalancer:
     async def try_dispatch(self) -> TaskRecord | None:
         """One dispatch attempt; returns the record that was sent, if any."""
         candidates = self.pool.candidates()
-        if not candidates:
-            return None
+        if not candidates or self._select_node(None) is None:
+            return None  # no node at all is not a "skip": capacity checks must still apply later
         record, node = None, None
         for candidate in candidates:
             node = self._select_node(candidate)
@@ -251,12 +266,10 @@ class LoadBalancer:
                 record = candidate
                 break
         if record is None:
-            for due in self.pool.note_skipped(candidates):
-                node = self._select_node(None)
-                if node is not None:
-                    record = due
-                    self.log.warning("force-dispatching task %.8s after %d skips", due.task_id, due.skipped_count)
-                    break
+            due = self.pool.note_skipped(candidates)
+            if due:
+                record, node = due[0], self._select_node(None)
+                self.log.warning("force-dispatching task %.8s after %d skips", record.task_id, record.skipped_count)
         if record is None or node is None or not self.pool.take(record):
             return None
 
@@ -269,14 +282,15 @@ class LoadBalancer:
         if self.send_task_cb is not None:
             try:
                 sent = await self.send_task_cb(node.node_id, record)
-            except (OSError, ConnectionError) as exc:
+            except Exception as exc:  # noqa: BLE001 - one bad send must not stop the dispatch loop
                 self.log.warning("send of task %.8s to %s failed: %s", record.task_id, node.node_id, type(exc).__name__)
-        if not sent:
-            node.active_task_ids.discard(record.task_id)
-            node.settle()
+        if sent:
+            return record
+        # While we awaited, the node may have dropped and its work been requeued already.
+        if record.assigned_node == node.node_id and record.status in ACTIVE_STATES:
+            self._release(node.node_id, record.task_id)
             self.pool.requeue(record)
-            return None
-        return record
+        return None
 
     async def _dispatch_loop(self) -> None:
         while self.running:
@@ -286,19 +300,13 @@ class LoadBalancer:
     # ----- heartbeats ------------------------------------------------------------------
 
     async def check_heartbeats(self, now: float | None = None) -> list[str]:
-        """Mark silent nodes offline and requeue their work; returns their ids."""
+        """Kick silent nodes (their work is requeued); returns their ids."""
         now = time.monotonic() if now is None else now
-        timed_out = [
-            n
-            for n in self.nodes.values()
-            if n.status is not NodeStatus.OFFLINE and now - n.last_heartbeat > self.HEARTBEAT_TIMEOUT
-        ]
-        for node in timed_out:
-            self.log.error("node %s heartbeat timeout", node.node_id)
-            node.status = NodeStatus.OFFLINE
-            self._fire(self.on_node_change_cbs, node)
-            await self._handle_node_failure(node)
-        return [n.node_id for n in timed_out]
+        timed_out = [n.node_id for n in self.nodes.values() if now - n.last_heartbeat > self.HEARTBEAT_TIMEOUT]
+        for node_id in timed_out:
+            self.log.error("node %s heartbeat timeout", node_id)
+            await self.kick_node(node_id, "heartbeat timeout")
+        return timed_out
 
     async def _heartbeat_loop(self) -> None:
         while self.running:
@@ -308,7 +316,7 @@ class LoadBalancer:
     async def _handle_node_failure(self, node: NodeState) -> None:
         for task_id in list(node.active_task_ids):
             record = self.pool.records.get(task_id)
-            if record is not None and record.status in (TaskStatus.ASSIGNED, TaskStatus.RUNNING):
+            if record is not None and record.assigned_node == node.node_id and record.status in ACTIVE_STATES:
                 self.log.warning("requeueing task %.8s after node %s failed", task_id, node.node_id)
                 self.task_failed(node.node_id, task_id, "node_offline")
         node.active_task_ids.clear()

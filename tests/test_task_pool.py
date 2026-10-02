@@ -84,3 +84,26 @@ def test_snapshot():
     pool.submit("a", TaskPriority.LOW)
     pool.submit("b", TaskPriority.CRITICAL)
     assert [s["priority"] for s in pool.snapshot()] == ["CRITICAL", "LOW"]
+
+
+def test_push_is_idempotent():
+    pool = TaskPool()
+    record = pool.submit("job")
+    pool.push(record)
+    pool.requeue(record)
+    assert len(pool) == 1
+
+
+def test_requeue_resets_skips():
+    pool = TaskPool()
+    record = pool.submit("job")
+    pool.note_skipped([record] * (MAX_SKIPS - 1))
+    pool.take(record)
+    pool.requeue(record)
+    assert record.skipped_count == 0
+
+
+@pytest.mark.parametrize("bad", [0, 5, -1])
+def test_unknown_priority_is_refused(bad):
+    with pytest.raises(ValueError):
+        TaskPool().submit("job", bad)

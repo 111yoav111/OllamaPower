@@ -98,6 +98,7 @@ class TaskPool:
     def __init__(self, max_skips: int = MAX_SKIPS) -> None:
         self.max_skips = max_skips
         self._heap: list[TaskRecord] = []
+        self._queued: set[str] = set()  # ids in the heap, so a record is never queued twice
         self.records: dict[str, TaskRecord] = {}
 
     def __len__(self) -> int:
@@ -110,12 +111,17 @@ class TaskPool:
         difficulty: float = 1.0,
         max_retries: int = MAX_RETRIES,
     ) -> TaskRecord:
-        record = TaskRecord(priority=int(priority), payload=payload, difficulty=difficulty, max_retries=max_retries)
+        record = TaskRecord(
+            priority=TaskPriority(priority).value, payload=payload, difficulty=difficulty, max_retries=max_retries
+        )
         self.push(record)
         self.records[record.task_id] = record
         return record
 
     def push(self, record: TaskRecord) -> None:
+        if record.task_id in self._queued:
+            return
+        self._queued.add(record.task_id)
         heapq.heappush(self._heap, record)
 
     def candidates(self, n: int = DISPATCH_WINDOW) -> list[TaskRecord]:
@@ -124,10 +130,10 @@ class TaskPool:
 
     def take(self, record: TaskRecord) -> bool:
         """Remove ``record`` from the queue; False if it was no longer there."""
-        try:
-            self._heap.remove(record)
-        except ValueError:
+        if record.task_id not in self._queued:
             return False
+        self._heap.remove(record)
+        self._queued.discard(record.task_id)
         heapq.heapify(self._heap)
         return True
 
@@ -150,6 +156,7 @@ class TaskPool:
         record.status = TaskStatus.REQUEUED
         record.assigned_node = None
         record.started_at = None
+        record.skipped_count = 0
         self.push(record)
 
     def fail(self, record: TaskRecord, error: str) -> bool:
