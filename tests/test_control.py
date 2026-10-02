@@ -228,7 +228,10 @@ async def test_big_frame_before_auth_is_refused(setup):
     ch = await _raw_connect(setup.hub.control.port)
     ch.writer.write(ch.crypto.encrypt(b"x" * 200_000))
     await ch.writer.drain()
-    assert await ch.reader.read() == b""  # connection dropped
+    try:
+        assert await ch.reader.read() == b""  # connection dropped...
+    except ConnectionResetError:
+        pass  # ...or reset, since our unread bytes were still in flight
     assert await until(lambda: any(e["kind"] == "auth_failed" for e in setup.hub.recent_events))
 
 
