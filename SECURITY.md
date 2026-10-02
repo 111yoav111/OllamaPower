@@ -3,8 +3,8 @@
 OllamaPower lets other machines on your network take part in running your
 models, so it is built to fail closed. This file describes the threat model and
 what is (and isn't) protected. It is updated after every build phase; this is
-the **Phase 2** version: the front door and the control plane between the hub
-and its helpers.
+the **Phase 3** version: the front door, the control plane between the hub
+and its helpers, and split mode (llama.cpp RPC) in direct mode.
 
 ## Threat model
 
@@ -89,9 +89,46 @@ as it could use Ollama directly before.
   it lends. Unencrypted direct mode needs **both** owners to opt in and keeps a
   warning on screen.
 - **Helpers never run models on their own.** They only lend GPU/CPU to the
-  Hub's engine (split mode, Phase 3); until then they answer split-mode
-  requests with "not available". There is no way for the Hub to make a helper
-  run Ollama or any other program than the pinned, hash-checked `rpc-server`.
+  Hub's engine (split mode). There is no way for the Hub to make a helper run
+  Ollama or any other program than the pinned, hash-checked `rpc-server`, and
+  the Hub chooses none of its arguments beyond one of the devices the owner
+  lends.
+
+### Split mode (Phase 3)
+
+- **Pinned, verified llama.cpp.** Every machine runs one pinned release. Each
+  archive's size and SHA-256 are stored in OllamaPower (llama.cpp publishes no
+  checksums); a download that doesn't match is deleted and never unpacked or
+  run. Unpacking refuses absolute paths, `..`, links pointing outside the
+  install directory and device files. The build number is checked before use;
+  a helper with another build is shown as incompatible.
+- **`rpc-server` only on loopback.** llama.cpp RPC has no authentication or
+  encryption and executes whatever its client asks, so it is always started
+  with `-H 127.0.0.1` on a random port and only while the Hub uses it.
+- **Direct-mode relay.** The agent forwards to `rpc-server` through a relay
+  that listens only on the interface the hub connects from, accepts
+  connections **only from the hub's address** (anything else is closed
+  immediately), at most 8 at once, and only during a session. Direct mode is
+  used only when both owners opted in; otherwise a helper is skipped for
+  split mode - never silently downgraded to plaintext.
+- **The helper's owner keeps control.** The agent checks every `rpc_start`
+  itself against its own rules (paused, GPU allow-list, CPU lending, direct
+  mode, VRAM cap) instead of trusting the Hub. Pausing or changing the rules
+  ends a running session at once. `rpc-server` has no memory limit of its own,
+  so the cap is enforced by the Hub's layer placement (`--tensor-split`); a
+  compromised Hub could ignore it, as it could ask for anything the owner
+  lends.
+- **`llama-server` only on the hub's loopback, with a key.** It listens on
+  `127.0.0.1` on a random port. It allows every web origin, so it is started
+  with a random API key (passed in its environment, not on the command line)
+  that only the front door sends; a web page that finds the port gets `401`.
+- **Untrusted helper answers.** Ports, memory figures and device names in
+  `rpc_ready` are type- and range-checked; the Hub connects to the address it
+  sees for the helper's control connection, never to an address the helper
+  names.
+- **Model files are only read.** The Hub reads Ollama's GGUF blob (header
+  parsed by a bounded, dependency-free reader) and llama-server loads it
+  read-only. Request content is translated in memory and never logged.
 
 ### Control-plane encryption (Phase 0 building blocks)
 
@@ -123,7 +160,15 @@ as it could use Ollama directly before.
   fingerprint, or pass it with `--hub-fingerprint`.
 - **Network-test throughput** runs over the encrypted control channel, so it
   understates a fast link; the split-mode tunnel is measured separately later.
-- **llama.cpp RPC is unauthenticated and unencrypted (Phases 3-4).** It will
-  only ever listen on a helper's loopback, reached through a mutually
-  authenticated TLS 1.3 tunnel; plain TCP only as an explicit per-helper opt-in
-  with a permanent warning.
+- **Split-mode traffic is unencrypted until Phase 4.** Direct mode sends model
+  weights, activations (which reveal prompts and answers to someone who can
+  decode them) and RPC commands in plain TCP. Anyone who can sniff or spoof
+  the hub's IP on that LAN could read it or reach `rpc-server` through the
+  relay while a session runs. Use it only on a wired LAN you trust; Phase 4
+  adds the mutually authenticated TLS 1.3 tunnel and makes it the only
+  default.
+- **Other local users on a helper** can connect to `rpc-server` on its
+  loopback port while a session runs (it has no authentication). Don't lend a
+  machine shared with people you don't trust.
+- **Other local users on the hub** can reach `llama-server`'s port, but not
+  use it without the key; `/health` is open.

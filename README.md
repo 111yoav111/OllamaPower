@@ -6,11 +6,13 @@ the Hub exactly as they talk to Ollama today; the Hub decides, per model, whethe
 a helper can make it faster or let it run a model that doesn't fit, and only
 uses a helper when a benchmark proves it wins.
 
-> **Status: Phase 2 (helpers and telemetry).** The hub runs in front of your
-> Ollama with a priority queue and a terminal UI, and helpers can join: they
-> report their GPUs, VRAM, load and link speed, and their owners decide what
-> they lend. Actually *using* a helper (split mode) starts in Phase 3; until
-> then every request is served by your local Ollama, exactly as before.
+> **Status: Phase 3 (split mode MVP).** The hub runs in front of your Ollama
+> with a priority queue and a terminal UI; helpers join and report their GPUs,
+> and a model you plan for split mode runs across the hub's GPU and the
+> helpers' GPUs with llama.cpp. For now split mode needs **direct mode**
+> (plain TCP on a trusted, wired LAN, opted in by both owners); the encrypted
+> tunnel arrives in Phase 4, and automatic plans with benchmarks in Phase 5.
+> Everything else is served by your local Ollama, exactly as before.
 
 ## What it can and can't do
 
@@ -25,9 +27,11 @@ model. VRAM moves hundreds of GB/s, system RAM tens of GB/s, a gigabit LAN about
 | Several requests at once (agents, batch jobs, several users) | **A little**: helper VRAM leaves the Hub room for a larger context and more parallel requests, but every request still runs through the Hub. Helpers never run Ollama or their own copy of a model. |
 | Helper on Wi-Fi or across the internet | **No** for split mode. Wi-Fi helpers get a loud warning. |
 
-**Golden rule: OllamaPower must never make things slower.** Every non-local plan
-is benchmarked against plain local Ollama and is only used if it beats it (by
-10 % by default).
+**Golden rule: OllamaPower must never make things slower.** Today that means:
+a model that fits on the hub's GPU is never split, and if split mode can't
+start, Ollama serves the request as before. From Phase 5 every non-local plan
+is also benchmarked against plain local Ollama and only used if it beats it
+(by 10 % by default).
 
 ## Requirements
 
@@ -156,6 +160,7 @@ The helper's owner controls lending in the agent TUI (`E`), with
 | `gpus` | all | which GPUs to lend |
 | `allow_cpu` | off | lend CPU/RAM when there is no GPU |
 | `allow_direct` | off | allow trusted-LAN direct mode (below) |
+| `disk_cache` | on | keep received model weights on disk, so the next load skips the network |
 | `schedule` | always | e.g. `22:00-08:00` (enforced from Phase 6) |
 
 `P` in the agent TUI (or `ollamapower agent pause`) stops lending at once.
@@ -181,14 +186,83 @@ ollamapower nodes forget <name|id>            # an offline helper and its settin
 ollamapower models list [--json]
 ```
 
-### Tunnel modes (how split-mode traffic travels, from Phase 4)
+### Tunnel modes (how split-mode traffic travels)
 
 - **secure** (default): mutually authenticated TLS 1.3 between the hub and
-  the helper.
+  the helper. **Arrives in Phase 4**; until then a helper in secure mode is
+  simply not used for split mode (it never falls back to plaintext on its own).
 - **direct**: plain TCP on a trusted, wired LAN, a bit faster. It is used only
   if **both** owners opt in - the hub's owner with `nodes tunnel <helper>
   direct` (or `T`), the helper's owner with `allow_direct`. While it is on,
-  the TUI and `status` show a warning.
+  the TUI and `status` show a warning. The helper's relay accepts connections
+  only from the hub's address and only while a session runs.
+
+## Split mode
+
+One model across the hub's GPU and the helpers' GPUs, for models that don't
+fit on the hub alone:
+
+```bash
+ollamapower models plan llama3.1:70b --split [--ctx 8192]   # checks the model, previews, saves the plan
+ollamapower models unplan llama3.1:70b                      # back to plain Ollama
+ollamapower llamacpp install | status                       # the pinned llama.cpp (also done automatically)
+```
+
+The first request for a planned model starts a split session:
+
+1. The hub finds the model's GGUF file in Ollama's store (via `/api/show`; no
+   second copy) and reads its layer sizes.
+2. If it fits on the hub's GPU, nothing changes: Ollama serves it.
+3. Ollama is asked to unload its models (`keep_alive: 0`) and the hub waits
+   until `/api/ps` is empty, so the two never fight over VRAM.
+4. Each eligible helper starts `rpc-server` (bound to its loopback) and
+   reports how much memory its owner lends right now.
+5. The hub places the layers: its own GPU first, then the helpers, the rest on
+   its CPU; a helper never gets more than its owner's cap. `llama-server`
+   starts on `127.0.0.1` with exactly that placement.
+
+Clients don't notice: `/api/chat` and `/api/generate` are translated to and
+from llama-server (streaming NDJSON, the final `done` object with token counts
+and durations, tool calls, `format`, `think`, sampling options), `/v1/*`
+requests pass straight through, and `/api/ps` lists the split model with
+`"ollamapower": {"engine": "split", "nodes": [...]}`. The session stops after
+`split.keep_alive` seconds idle (Ollama gets the GPU back on its next
+request), when a helper leaves or its owner pauses, or with `models unplan`.
+
+If anything fails (no eligible helper, a helper refuses, llama-server doesn't
+start), the request is served by Ollama and the reason shows as a warning;
+split mode retries a minute later.
+
+Limits today: images (vision models' projector isn't loaded), raw/suffix
+`generate` prompts and per-request `num_ctx` are not supported in split mode
+(images get a clear 400; the context is fixed per plan); sharded models,
+adapters (LoRA) and safetensors imports can't be split; embeddings always run
+on Ollama; one split model at a time; one GPU per helper.
+
+### The llama.cpp download
+
+Every machine runs the same pinned llama.cpp release (**b11347**), downloaded
+from llama.cpp's GitHub releases on first use and checked against SHA-256
+hashes stored in OllamaPower (llama.cpp publishes none). Helpers download it
+when the agent starts (`auto_install = false` under `[llamacpp]` in
+`agent.toml` turns that off). Sizes:
+
+| Backend (`llamacpp.backend`) | Linux | Windows | macOS |
+|---|---|---|---|
+| `cpu` | 17.6 MB | 19.3 MB | 11.4 MB (Intel) |
+| `metal` (Apple Silicon) | - | - | 11.8 MB |
+| `vulkan` (any GPU) | 31.5 MB | 33.2 MB | - |
+| `cuda12` (NVIDIA) | 765 MB | 654 MB | - |
+| `cuda13` (NVIDIA) | 592 MB | 577 MB | - |
+| `rocm` (AMD) | 243 MB | 256 MB | - |
+
+`auto` picks Metal on Apple Silicon, Vulkan when there is a GPU and CPU
+otherwise, so a typical helper downloads about 30 MB once. CUDA is usually
+faster on NVIDIA but much bigger (it includes the CUDA runtime), so it is an
+opt-in. Machines in one cluster may use different backends; only the build
+must match (a helper with another build is shown as incompatible). Nothing is
+kept in RAM only: the build lives in `<config dir>/llamacpp/`, and received
+model weights are cached in `<config dir>/rpc-cache/` when `disk_cache` is on.
 
 ## Configuration
 
@@ -214,15 +288,16 @@ env var). On disk, all owner-only: `config.toml`, `.env`, `hub_key.pem`,
 ```
 clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
               ├─ local-ollama → Ollama on 127.0.0.1:11435
-              └─ split        → llama-server --rpc → helpers' rpc-server (over an mTLS tunnel)
+              └─ split        → llama-server --rpc → helpers' rpc-server (direct relay; mTLS tunnel in Phase 4)
 ```
 
 - **Ollama doesn't do multi-machine inference.** Split mode uses llama.cpp's RPC
   backend (`rpc-server` on helpers, `llama-server --rpc` on the Hub), loading the
   GGUF blob Ollama already has on disk, so there is no second copy of the model.
 - llama.cpp RPC has no authentication or encryption, so `rpc-server` only ever
-  listens on the helper's loopback and the Hub reaches it through a mutually
-  authenticated TLS 1.3 tunnel.
+  listens on the helper's loopback. The Hub reaches it through the agent's
+  relay: plain TCP limited to the hub's address in direct mode, a mutually
+  authenticated TLS 1.3 tunnel from Phase 4.
 - No GUI, ever: a terminal UI (Textual) plus a full CLI, and a headless mode.
 
 ## Roadmap
@@ -231,8 +306,8 @@ clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
 |---|---|
 | 0 Bootstrap (done) | Style notes, DCP reuse map, DCP networking/crypto/auth/scheduling ported with tests, lint + test + audit CI |
 | 1 Front door (done) | Ollama-compatible passthrough with true streaming, priority queue, `/ollamapower/status`, `doctor` port migration |
-| **2 Agents & telemetry** (done) | Control plane with protocol version and Hub key pinning, GPU telemetry, net tests, Hub and agent TUIs, CLI |
-| 3 Split MVP | llama.cpp pin/download/verify, Ollama blob resolver, `rpc-server`/`llama-server` lifecycle, API translation |
+| 2 Agents & telemetry (done) | Control plane with protocol version and Hub key pinning, GPU telemetry, net tests, Hub and agent TUIs, CLI |
+| **3 Split MVP** (done) | llama.cpp pin/download/verify, Ollama blob resolver, `rpc-server`/`llama-server` lifecycle, layer placement under the lending caps, API translation, direct-mode relay |
 | 4 Secure tunnel | mTLS relays, IP allowlist, opt-in trusted-LAN direct mode, overhead measured |
 | 5 Planner | Memory estimate, spill detection, benchmarks, automatic "never slower" plan choice, fault tolerance |
 | 6 Lending & polish | Schedules, auto-yield, real benchmark numbers, start scripts |
@@ -252,6 +327,7 @@ Python 3.11+.
 python -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-dev.lock
 .venv/bin/pip install --no-deps -e .
 .venv/bin/python -m pytest -q
+OLLAMAPOWER_TEST_LLAMACPP=/path/to/llama-b11347 .venv/bin/python -m pytest -q tests/test_split_real.py   # real llama.cpp
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
