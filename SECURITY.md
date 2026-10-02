@@ -3,7 +3,7 @@
 OllamaPower lets other machines on your network take part in running your
 models, so it is built to fail closed. This file describes the threat model and
 what is (and isn't) protected. It is updated after every build phase; this is
-the **Phase 0** version, which covers only the inherited building blocks.
+the **Phase 1** version: the inherited building blocks and the front door.
 
 ## Threat model
 
@@ -18,7 +18,44 @@ token.
 Out of scope: exposing the Hub to the internet (that is OllamaGate's job), and
 an attacker who already runs code as the owner on the Hub or a helper.
 
-## What's protected (Phase 0)
+## What's protected
+
+### Front door (Phase 1)
+
+- **Loopback only.** The Ollama-compatible API listens on `127.0.0.1`; any
+  other address is refused unless started with `--i-know-what-im-doing`, and
+  then a warning stays in `status`. It has no authentication by design: it
+  replaces Ollama's own local port, and remote access belongs to OllamaGate.
+- **Web pages can't use it.** Requests whose `Host` isn't a local name are
+  refused with `403` (DNS rebinding: a page under `evil.example` re-pointed at
+  127.0.0.1), using Ollama's own rules. `Origin` is forwarded, so Ollama's CORS
+  policy (`OLLAMA_ORIGINS`) still decides which web origins may call it, and
+  its CORS answers are passed back unchanged.
+- **Ollama stays local.** `ollama.url` must be a loopback address and may not
+  be the front door's own port. `doctor` flags Ollama's port answering on any
+  non-loopback interface and a non-loopback `OLLAMA_HOST`.
+- **Header hygiene.** Only `Content-Type` and `Accept` are forwarded to Ollama
+  (never `Authorization`, cookies or `X-OllamaPower-*`); only `Content-Type`
+  comes back. No `Server` header, no docs/OpenAPI routes, unknown paths `404`.
+- **Bounded resources.** Inference bodies are capped (100 MB), the queue is
+  capped (256) with a wait timeout, connections are capped (512), upstream
+  connect/read timeouts apply, and a client that disconnects stops its
+  generation in Ollama. Active streams are cut as soon as shutdown begins.
+- **No content in logs.** Request logs hold metadata only; the generation-speed
+  tap reads Ollama's final timing object and keeps nothing else.
+- **Owner-only files.** `.env`, `state.json`, its backup and the logs are
+  `0600` in a `0700` directory, written atomically; symlinked or foreign-owned
+  directories are refused. `doctor` checks the permissions. `hub` refuses to
+  run as root.
+- **Admin channel.** `status` reaches the hub only over a local channel (Unix
+  socket `0600`, or `127.0.0.1` on Windows) that requires a 256-bit secret from
+  an owner-only file, and the hub proves itself with an HMAC on every reply
+  (OllamaGate's design).
+
+Out of scope here: any local process running as you can use the front door,
+as it could use Ollama directly before.
+
+### Control plane (Phase 0 building blocks)
 
 - **Encrypted control plane.** Every packet after the handshake is one
   AES-256-GCM frame with a fresh random 96-bit nonce (tested for uniqueness);
@@ -52,5 +89,3 @@ an attacker who already runs code as the owner on the Hub or a helper.
   only ever listen on a helper's loopback, reached through a mutually
   authenticated TLS 1.3 tunnel; plain TCP only as an explicit per-helper opt-in
   with a permanent warning.
-- **Front door, file permissions, `doctor` (Phase 1).** The Ollama-compatible
-  API binds `127.0.0.1` only; secrets and state files are owner-only.

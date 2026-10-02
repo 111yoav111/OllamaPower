@@ -6,10 +6,10 @@ the Hub exactly as they talk to Ollama today; the Hub decides, per model, whethe
 a helper can make it faster or let it run a model that doesn't fit, and only
 uses a helper when a benchmark proves it wins.
 
-> **Status: Phase 0 (bootstrap).** This repository currently contains the
-> project skeleton and the parts of DCP it builds on (encrypted control-plane
-> protocol, token auth, priority queue, load balancer), with tests. Nothing is
-> runnable for end users yet; see the roadmap below.
+> **Status: Phase 1 (front door).** The hub runs in front of your Ollama with a
+> priority queue, status and logs. Helpers, split mode and the terminal UI
+> come in the next phases; see the roadmap below. Until then every request is
+> served by your local Ollama, exactly as before.
 
 ## What it can and can't do
 
@@ -27,6 +27,100 @@ model. VRAM moves hundreds of GB/s, system RAM tens of GB/s, a gigabit LAN about
 **Golden rule: OllamaPower must never make things slower.** Every non-local plan
 is benchmarked against plain local Ollama and is only used if it beats it (by
 10 % by default).
+
+## Requirements
+
+- Python 3.11+
+- Ollama on the same PC
+
+## Install
+
+```bash
+pipx install git+https://github.com/111yoav111/OllamaPower    # or, for development: see below
+```
+
+## Set up the Hub
+
+```bash
+ollamapower init      # config dir, a cluster token in .env, config.toml, state.json
+ollamapower doctor    # checks everything and shows how to move Ollama to port 11435
+ollamapower hub       # run it (headless for now; the terminal UI arrives in Phase 2)
+```
+
+OllamaPower takes Ollama's usual address, `127.0.0.1:11434`, so your clients
+(Open WebUI, scripts, the `ollama` CLI) keep working without any change. The
+real Ollama moves to `127.0.0.1:11435`. `ollamapower doctor` detects where
+Ollama listens and prints the exact steps for your OS, e.g. on Linux:
+
+```bash
+sudo systemctl edit ollama        # add: [Service]  Environment="OLLAMA_HOST=127.0.0.1:11435"
+sudo systemctl restart ollama
+```
+
+`hub` refuses to run as root/Administrator (`--allow-root` overrides) and to
+listen on anything but loopback (remote access is OllamaGate's job).
+
+### The front door
+
+| Route | What happens |
+|---|---|
+| `POST /api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | queued by priority, then streamed through (NDJSON / SSE, never buffered) |
+| `GET /api/ps` | Ollama's answer plus an `ollamapower` field per model (`engine`, `nodes`) that normal clients ignore |
+| everything else under `/`, `/api/*`, `/v1/*` (tags, show, pull, create, copy, delete, push, blobs, ...) | passed straight through, not queued |
+| `GET /ollamapower/status` | the hub's status as JSON |
+
+At most `hub.max_concurrency` inference requests (default 4) go to Ollama at
+once; the rest wait, highest priority first. Set the priority per request with
+a header:
+
+```
+X-OllamaPower-Priority: critical | high | normal | low      (default: normal)
+```
+
+A waiting request that keeps being overtaken goes next after 10 overtakes, so
+low priority work is delayed, never starved. A full queue (`hub.max_queue`) or
+a wait longer than `hub.queue_timeout` gets `503` with `Retry-After`. If a
+client disconnects, its generation is stopped in Ollama right away.
+
+> Set `hub.max_concurrency` to your `OLLAMA_NUM_PARALLEL`. Higher, and Ollama
+> queues the extra requests itself (first come first served, priorities lost);
+> lower, and Ollama sits partly idle.
+
+### Status and logs
+
+```bash
+ollamapower status            # front door, Ollama, queue, loaded models (VRAM %, last tok/s), active requests, warnings
+ollamapower status --watch    # refreshes every 2 s
+ollamapower status --json     # the same data as /ollamapower/status
+ollamapower logs [--follow] [--kind request] [--file events|requests] [-n 50] [--json]
+```
+
+`status` warns when a loaded model doesn't fully fit in VRAM (Ollama spilled
+part of it to the CPU): that is the case helpers will speed up.
+
+Logs are JSON lines in `<config dir>/logs/` (`events.jsonl`, `requests.jsonl`),
+rotated at 10 MB x 5. They hold metadata only (path, model, priority, status,
+queue and total time) - never prompts or responses.
+
+`status` talks to the running hub over a local-only channel (a `0600` Unix
+socket, or `127.0.0.1` on Windows, plus a secret in an owner-only file).
+
+## Configuration
+
+`ollamapower init` copies [`config.example.toml`](config.example.toml) to the
+config directory:
+
+| OS | Config dir |
+|---|---|
+| Linux | `~/.config/ollamapower/` |
+| macOS | `~/Library/Application Support/ollamapower/` |
+| Windows | `%APPDATA%\ollamapower\` |
+
+Every value can be overridden with `OLLAMAPOWER_<SECTION>__<KEY>` env vars,
+e.g. `OLLAMAPOWER_HUB__MAX_CONCURRENCY=2`; `OLLAMAPOWER_CONFIG_DIR` moves the
+directory. The cluster token lives only in `.env` (or the `OLLAMAPOWER_TOKEN`
+env var). On disk: `config.toml`, `.env`, `state.json` (+ `.bak`), `logs/`, and
+while running `run/` - all owner-only.
 
 ## How it works
 
@@ -49,8 +143,8 @@ clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
 
 | Phase | Delivers |
 |---|---|
-| **0 Bootstrap** (done) | Style notes, DCP reuse map, DCP networking/crypto/auth/scheduling ported with tests, lint + test + audit CI |
-| 1 Front door | Ollama-compatible passthrough with true streaming, priority queue, `/ollamapower/status`, `doctor` port migration |
+| 0 Bootstrap (done) | Style notes, DCP reuse map, DCP networking/crypto/auth/scheduling ported with tests, lint + test + audit CI |
+| **1 Front door** (done) | Ollama-compatible passthrough with true streaming, priority queue, `/ollamapower/status`, `doctor` port migration |
 | 2 Agents & telemetry | Control plane with protocol version and Hub key pinning, GPU telemetry, net tests, Hub and agent TUIs, CLI |
 | 3 Split MVP | llama.cpp pin/download/verify, Ollama blob resolver, `rpc-server`/`llama-server` lifecycle, API translation |
 | 4 Secure tunnel | mTLS relays, IP allowlist, opt-in trusted-LAN direct mode, overhead measured |
