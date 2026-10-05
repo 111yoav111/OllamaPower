@@ -106,15 +106,44 @@ def test_query_string_passes_through(frontdoor, client):
     assert frontdoor.recorder.last["query"] == "foo=bar"
 
 
-def test_only_safe_headers_cross(frontdoor, client):
+def test_headers_cross_except_hop_by_hop_cookies_and_ours(frontdoor, client):
     r = client.get(
         frontdoor.url + "/api/version",
-        headers={"Authorization": "Bearer secret", "Cookie": "a=b", "X-OllamaPower-Priority": "high"},
+        headers={
+            "Authorization": "Bearer for-ollamas-codex-proxy",
+            "Content-Encoding": "zstd",
+            "ChatGPT-Account-ID": "acct",
+            "User-Agent": "codex/1.0",
+            "Cookie": "a=b",
+            "X-OllamaPower-Priority": "high",
+            "Proxy-Authorization": "secret",
+        },
     )
     sent = frontdoor.recorder.last["headers"]
-    assert "authorization" not in sent and "cookie" not in sent and "x-ollamapower-priority" not in sent
-    assert "x-upstream-secret" not in r.headers
+    # What Ollama's own Codex and cloud proxies read must reach it.
+    assert sent["authorization"] == "Bearer for-ollamas-codex-proxy"
+    assert sent["content-encoding"] == "zstd" and sent["chatgpt-account-id"] == "acct"
+    assert sent["user-agent"] == "codex/1.0" and sent["accept-encoding"] == "identity"
+    assert "cookie" not in sent and "x-ollamapower-priority" not in sent and "proxy-authorization" not in sent
+    assert r.headers["x-upstream-secret"] == "leak"  # Ollama's response headers come back
     assert "server" not in r.headers
+
+
+def test_long_silence_from_ollama_is_not_a_timeout_by_default(frontdoor, client):
+    r = client.post(frontdoor.url + "/api/chat", json={"model": "m", "stream": False, "fake_first_delay": 0.5})
+    assert r.status_code == 200
+
+
+def test_read_timeout_is_a_504_not_unreachable(frontdoor_factory, client):
+    fd = frontdoor_factory(ollama__read_timeout=0.3)
+    r = client.post(fd.url + "/api/chat", json={"model": "m", "stream": False, "fake_first_delay": 1.0})
+    assert r.status_code == 504 and "did not answer within" in r.json()["error"]
+
+
+def test_default_read_timeout_is_unlimited():
+    from ollamapower.config import Config
+
+    assert Config().ollama.read_timeout == 0
 
 
 def test_api_ps_is_annotated(frontdoor, client):

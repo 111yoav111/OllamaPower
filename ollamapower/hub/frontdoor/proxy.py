@@ -33,29 +33,33 @@ log = logging.getLogger("ollamapower.proxy")
 
 T = TypeVar("T")
 
-# Only these request headers reach Ollama; everything else (cookies, auth,
-# X-OllamaPower-*, hop-by-hop headers) is dropped. Origin and the preflight
-# headers are kept so Ollama still applies its own CORS policy (OLLAMA_ORIGINS):
-# without them a web page could reach Ollama through us that Ollama would refuse.
-FORWARD_REQUEST_HEADERS = (
-    "content-type",
-    "accept",
-    "origin",
-    "access-control-request-method",
-    "access-control-request-headers",
+# Hop-by-hop headers belong to one connection and are never forwarded (RFC 9110 7.6.1).
+HOP_BY_HOP = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
 )
-# Only these response headers go back to the client (CORS ones so browser-based
-# clients keep working).
-FORWARD_RESPONSE_HEADERS = (
-    "content-type",
-    "access-control-allow-origin",
-    "access-control-allow-methods",
-    "access-control-allow-headers",
-    "access-control-allow-credentials",
-    "access-control-expose-headers",
-    "access-control-max-age",
-    "vary",
-)
+# Requests reach Ollama with every header except these, so Ollama sees what the
+# client sent: Origin and the CORS preflight headers (Ollama's own CORS policy,
+# OLLAMA_ORIGINS, still decides), Authorization and Content-Encoding (Ollama's
+# Codex and cloud proxies need them), User-Agent. Dropped: hop-by-hop headers,
+# Host and Content-Length (httpx sets them for the upstream connection), cookies
+# (Ollama doesn't use them; a browser would attach them unasked) and our own
+# X-OllamaPower-* headers. Accept-Encoding is forced to identity so bodies stream
+# through verbatim.
+DROP_REQUEST_HEADERS = HOP_BY_HOP | {"host", "content-length", "cookie", "accept-encoding", "expect"}
+# Responses come back with Ollama's headers except hop-by-hop ones and the ones the
+# front door's own server sets (Content-Length is recomputed when a body is rewritten).
+DROP_RESPONSE_HEADERS = HOP_BY_HOP | {"content-length", "date", "server"}
+OUR_PREFIX = "x-ollamapower-"
 # How long we try to deliver an in-band error before giving up on a client.
 TRAILER_TIMEOUT = 1.0
 # The tap only looks at lines up to this size. /api/generate's final chunk
@@ -83,12 +87,28 @@ class ClientGone(Exception):
     pass
 
 
-def response_headers(upstream: httpx.Response) -> dict[str, str]:
-    return {name: upstream.headers[name] for name in FORWARD_RESPONSE_HEADERS if name in upstream.headers}
+def response_headers(upstream: httpx.Response, keep_length: bool = False) -> dict[str, str]:
+    """Ollama's response headers for the client (repeated headers joined, as HTTP allows)."""
+    out: dict[str, str] = {}
+    for name, value in upstream.headers.multi_items():
+        name = name.lower()
+        if (name in DROP_RESPONSE_HEADERS and not (keep_length and name == "content-length")) or name.startswith(
+            OUR_PREFIX
+        ):
+            continue
+        if name == "set-cookie":
+            continue  # Ollama sets none; never let a cookie through to a browser via us
+        out[name] = f"{out[name]}, {value}" if name in out else value
+    return out
 
 
 def build_upstream_headers(incoming: Any) -> dict[str, str]:
-    headers = {name: incoming[name] for name in FORWARD_REQUEST_HEADERS if name in incoming}
+    headers: dict[str, str] = {}
+    for name, value in incoming.items():
+        name = name.lower()
+        if name in DROP_REQUEST_HEADERS or name.startswith(OUR_PREFIX):
+            continue
+        headers[name] = f"{headers[name]}, {value}" if name in headers else value
     # An uncompressed body can be streamed through verbatim.
     headers["accept-encoding"] = "identity"
     return headers

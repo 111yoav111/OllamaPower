@@ -57,8 +57,10 @@ class OllamaConfig:
     # Where the real Ollama listens after `ollamapower doctor`'s port move.
     url: str = "http://127.0.0.1:11435"
     connect_timeout: float = 5.0
-    # Max seconds to wait for the next chunk from Ollama (model loads can be slow).
-    read_timeout: float = 600.0
+    # Max seconds to wait for Ollama's next bytes; 0 = no limit (the default, like
+    # Ollama itself: a big pull or a long "stream": false answer sends nothing for
+    # minutes). A client that hangs up still stops the request at once.
+    read_timeout: float = 0.0
 
 
 DEFAULT_AGENT_NETWORKS = [
@@ -169,10 +171,11 @@ class Config:
         for name, value in (
             ("hub.queue_timeout", h.queue_timeout),
             ("ollama.connect_timeout", self.ollama.connect_timeout),
-            ("ollama.read_timeout", self.ollama.read_timeout),
         ):
             if not math.isfinite(value) or value <= 0:
                 raise ConfigError(f"{name} must be a positive number")
+        if not math.isfinite(self.ollama.read_timeout) or self.ollama.read_timeout < 0:
+            raise ConfigError("ollama.read_timeout must be 0 (no limit) or a positive number")
         up = urlsplit(self.ollama.url)
         try:
             up_port = up.port

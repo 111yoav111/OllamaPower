@@ -36,9 +36,12 @@ an attacker who already runs code as the owner on the Hub or a helper.
 - **Ollama stays local.** `ollama.url` must be a loopback address and may not
   be the front door's own port. `doctor` flags Ollama's port answering on any
   non-loopback interface and a non-loopback `OLLAMA_HOST`.
-- **Header hygiene.** Only `Content-Type` and `Accept` are forwarded to Ollama
-  (never `Authorization`, cookies or `X-OllamaPower-*`); only `Content-Type`
-  comes back. No `Server` header, no docs/OpenAPI routes, unknown paths `404`.
+- **Header hygiene.** Requests reach Ollama with the client's headers except
+  hop-by-hop ones, `Host`, `Content-Length`, cookies and every
+  `X-OllamaPower-*` header; Ollama needs the rest (Origin for its CORS check,
+  Authorization and Content-Encoding for its Codex and cloud proxies).
+  Responses come back with Ollama's headers except hop-by-hop ones,
+  `Set-Cookie`, `Server` and `Date`. No docs/OpenAPI routes, unknown paths `404`.
 - **Bounded resources.** Inference bodies are capped (100 MB), the queue is
   capped (256) with a wait timeout, connections are capped (512), upstream
   connect/read timeouts apply, and a client that disconnects stops its

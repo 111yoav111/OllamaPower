@@ -25,8 +25,10 @@ max_connections = 512
 # Must be a loopback address.
 url = "http://127.0.0.1:11435"
 connect_timeout = 5.0
-# Max seconds between two chunks from Ollama (loading a big model can be slow).
-read_timeout = 600.0
+# Max seconds to wait for Ollama's next bytes; 0 = no limit (default). A big pull or a
+# long "stream": false answer sends nothing for minutes; a client that hangs up still
+# stops its request at once.
+read_timeout = 0.0
 
 [control]
 # The control plane helpers connect to. It listens on all interfaces so LAN

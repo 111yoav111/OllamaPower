@@ -165,7 +165,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         timeout = httpx.Timeout(
-            connect=config.ollama.connect_timeout, read=config.ollama.read_timeout, write=60.0, pool=30.0
+            connect=config.ollama.connect_timeout, read=config.ollama.read_timeout or None, write=60.0, pool=30.0
         )
         client = httpx.AsyncClient(
             base_url=config.ollama.url,
@@ -420,6 +420,16 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
 
             handed_off = True
             return ProxyStreamResponse(upstream, stream, finish, tap=tap)
+        except httpx.TimeoutException as exc:
+            if isinstance(exc, httpx.ConnectTimeout | httpx.PoolTimeout):
+                log.warning("Ollama unavailable for %s %s: %s", method, path, type(exc).__name__)
+                finish("upstream_error", 502)
+                return error(path, 502, f"Ollama is not reachable at {config.ollama.url}")
+            log.warning("Ollama didn't answer %s %s in time: %s", method, path, type(exc).__name__)
+            finish("upstream_error", 504)
+            return error(
+                path, 504, f"Ollama did not answer within ollama.read_timeout ({config.ollama.read_timeout:g} s)"
+            )
         except httpx.HTTPError as exc:
             log.warning("Ollama unavailable for %s %s: %s", method, path, type(exc).__name__)
             finish("upstream_error", 502)
