@@ -124,6 +124,36 @@ async def test_quit_asks_and_models_tab_explains(tmp_path, hub_key):  # noqa: F8
     assert app.quit_confirmed
 
 
+async def test_slash_from_overview_types_into_the_filter(tmp_path, hub_key):  # noqa: F811
+    """`/` on another tab opens Nodes with the filter focused; letters typed there are text, not node actions."""
+    from textual.widgets import Input
+
+    s = Setup(tmp_path, hub_key)
+    await s.start()
+    agent = s.agent(name="desk")
+    s.run(agent)
+    assert await until(lambda: s.node("desk") is not None and s.node("desk").connected)
+    app = HubTUI(Admin(s.hub))
+    try:
+        async with app.run_test(size=(180, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("/")
+            await pilot.pause()
+            await pilot.pause()
+            assert app.query_one(TabbedContent).active == "nodes"
+            assert isinstance(app.focused, Input) and app.focused.id == "node-filter"
+            await pilot.press("p", "t")
+            await pilot.pause()
+            assert app.query_one("#node-filter", Input).value == "pt"
+            assert not s.node("desk").hub_paused
+            assert not isinstance(app.screen, ConfirmScreen)
+            # A plain tab switch still focuses the table.
+            await pilot.press("escape", "1", "2")
+            assert await wait(pilot, lambda: app.focused is app.query_one("#node-table"))
+    finally:
+        await s.close()
+
+
 async def test_models_tab_pins_and_shows_why(tmp_path, hub_key):  # noqa: F811
     from ollamapower.ollama.client import InstalledModel
 

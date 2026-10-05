@@ -114,6 +114,8 @@ class HubTUI(App[None]):
         self.selected_node: str | None = None
         self._filter = ""
         self._filter_log = ""
+        # `/` from another tab switches to Nodes; its TabActivated arrives later and must not steal the focus.
+        self._pending_focus: str | None = None
         self._seen_event = self.hub.event_seq
         self._log_rendered = -1
         self.quit_confirmed = False
@@ -518,7 +520,11 @@ class HubTUI(App[None]):
         self._log_rendered = -1
         self.refresh_bindings()
         self.refresh_visible()
-        self._focus_tab(event.pane.id or "")
+        pending, self._pending_focus = self._pending_focus, None
+        if pending is not None and event.pane.id == "nodes":
+            self.query_one(pending).focus()
+        else:
+            self._focus_tab(event.pane.id or "")
 
     def _focus_tab(self, tab: str) -> None:
         target = {"nodes": "#node-table", "models": "#model-table", "log": "#log-table"}.get(tab)
@@ -536,6 +542,7 @@ class HubTUI(App[None]):
     def action_filter(self) -> None:
         tabs = self.query_one(TabbedContent)
         if tabs.active not in ("nodes", "log"):
+            self._pending_focus = "#node-filter"
             tabs.active = "nodes"
         self.query_one("#node-filter" if tabs.active == "nodes" else "#log-filter", Input).focus()
 
