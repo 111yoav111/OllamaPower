@@ -12,6 +12,12 @@ Payloads are plain msgpack dicts - never pickled objects - so a peer can't
 make us run code by sending a crafted packet. On an encrypted session each
 packet travels inside one AES-GCM frame (see ``encrypt_layer.py``).
 
+Decoding is bounded twice, because a few hundred compressed bytes can expand
+into millions of objects: the caller caps the decompressed size (tiny before
+the peer has authenticated, see ``channel.py``), and msgpack is held to that
+size per string/array/map plus a total budget of containers, so the cost of
+decoding stays proportional to the cap rather than to what the peer claims.
+
 Phase 2 adds a protocol version and the packet types of spec Section 11.
 """
 
@@ -72,8 +78,12 @@ CONTROL_HEADER_FORMAT = "!B B H Q"
 CONTROL_HEADER_SIZE = struct.calcsize(CONTROL_HEADER_FORMAT)
 
 ZSTD_COMPRESS_LEVEL = 3
-# A decompressed payload larger than this is refused (zstd bomb protection).
+# A decompressed payload larger than this is refused (zstd bomb protection); callers pass smaller caps.
 MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
+# One map or array allowed per this many decompressed bytes: an empty map is 1 byte on the wire but
+# ~64 bytes in Python, so without a budget 1 MB of payload could become 64 MB of dicts.
+BYTES_PER_CONTAINER = 64
+MIN_CONTAINERS = 64
 
 NO_PARENT = 0
 NO_SUBTASK = 0xFFFF
@@ -93,6 +103,21 @@ def _u8(value: int, name: str) -> int:
     if not 0 <= value <= 0xFF:
         raise ValueError(f"{name} must fit in one byte (got {value})")
     return value
+
+
+class _ContainerBudget:
+    """msgpack hook that refuses a payload once it has built too many maps and arrays."""
+
+    __slots__ = ("left",)
+
+    def __init__(self, max_out: int) -> None:
+        self.left = max(MIN_CONTAINERS, max_out // BYTES_PER_CONTAINER)
+
+    def __call__(self, value: Any) -> Any:
+        self.left -= 1
+        if self.left < 0:
+            raise ValueError("too many maps and arrays in the payload")
+        return value
 
 
 class TaskPacket:
@@ -186,16 +211,33 @@ class TaskPacket:
         pkt.raw_payload = data[TASK_HEADER_SIZE:end]
         return pkt
 
-    def unpack_payload(self) -> dict[str, Any]:
-        """Decompress and decode the payload; refuses anything but a dict."""
+    def unpack_payload(self, max_out: int = MAX_DECOMPRESSED_BYTES) -> dict[str, Any]:
+        """Decompress and decode the payload; refuses anything but a dict.
+
+        ``max_out`` caps the decompressed size, and through it every msgpack
+        length and the number of maps/arrays, so a small packet can't expand
+        into a large amount of memory or CPU time.
+        """
+        max_out = min(max_out, MAX_DECOMPRESSED_BYTES)
         try:
             # Stream with a hard cap: ``decompress(max_output_size=...)`` trusts the
             # size declared in the frame header, which an attacker controls.
             with zstd.ZstdDecompressor().stream_reader(self.raw_payload) as reader:
-                raw = reader.read(MAX_DECOMPRESSED_BYTES + 1)
-            if len(raw) > MAX_DECOMPRESSED_BYTES:
+                raw = reader.read(max_out + 1)
+            if len(raw) > max_out:
                 raise ValueError("payload too large")
-            value = msgpack.unpackb(raw, raw=False, strict_map_key=True)
+            value = msgpack.unpackb(
+                raw,
+                raw=False,
+                strict_map_key=True,
+                max_str_len=max_out,
+                max_bin_len=max_out,
+                max_ext_len=max_out,
+                max_array_len=max_out,
+                max_map_len=max_out // 2,
+                object_hook=(budget := _ContainerBudget(max_out)),
+                list_hook=budget,
+            )
         except (zstd.ZstdError, ValueError, msgpack.ExtraData, msgpack.FormatError, msgpack.StackError) as exc:
             raise ValueError(f"invalid TaskPacket payload: {type(exc).__name__}") from None
         if not isinstance(value, dict):

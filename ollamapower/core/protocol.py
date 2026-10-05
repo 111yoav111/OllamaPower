@@ -22,7 +22,7 @@ from __future__ import annotations
 import enum
 from typing import Any
 
-from .packets import PACKET_FLAGS, PayloadKind, TaskPacket
+from .packets import MAX_DECOMPRESSED_BYTES, PACKET_FLAGS, PayloadKind, TaskPacket
 
 PROTOCOL_VERSION = "1.1"
 MAX_STRING = 4096
@@ -201,12 +201,12 @@ def encode(message: dict[str, Any]) -> bytes:
     return TaskPacket.from_payload(message, PACKET_FLAGS.message, kind=PayloadKind.message).to_bytes()
 
 
-def decode(packet: Any, sender: str) -> dict[str, Any]:
-    """A received packet as a validated message from ``sender``."""
+def decode(packet: Any, sender: str, max_payload: int = MAX_DECOMPRESSED_BYTES) -> dict[str, Any]:
+    """A received packet as a validated message from ``sender``, decompressing at most ``max_payload`` bytes."""
     if not isinstance(packet, TaskPacket) or packet.packet_type is not PACKET_FLAGS.message:
         raise ProtocolError("expected a message packet")
     try:
-        payload = packet.unpack_payload()
+        payload = packet.unpack_payload(max_payload)
     except ValueError as exc:
         raise ProtocolError(str(exc)) from None
     return validate(payload, sender)

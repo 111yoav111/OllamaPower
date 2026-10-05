@@ -236,6 +236,25 @@ async def test_big_frame_before_auth_is_refused(setup):
     assert await until(lambda: any(e["kind"] == "auth_failed" for e in setup.hub.recent_events))
 
 
+async def test_bomb_hello_is_refused_quickly_and_counted(setup):
+    import zstandard as zstd
+
+    from ollamapower.core.packets import PACKET_FLAGS, PayloadKind, TaskPacket
+
+    pkt = TaskPacket.from_payload({}, PACKET_FLAGS.message, kind=PayloadKind.message)
+    pkt.raw_payload = zstd.ZstdCompressor(level=19).compress(b"\xdd" + (10**7).to_bytes(4, "big") + b"\x80" * 10**7)
+    ch = await _raw_connect(setup.hub.control.port)
+    start = time.monotonic()
+    ch.writer.write(ch.crypto.encrypt(pkt.to_bytes()))
+    await ch.writer.drain()
+    try:
+        assert await asyncio.wait_for(ch.reader.read(), 2) == b""
+    except ConnectionResetError:
+        pass
+    assert time.monotonic() - start < 1.0  # was ~3 s of a blocked event loop and 720 MB
+    assert await until(lambda: any(e["kind"] == "auth_failed" for e in setup.hub.recent_events))
+
+
 async def test_silent_node_times_out(tmp_path, hub_key):
     s = Setup(tmp_path, hub_key, heartbeat_timeout=1.0)
     await s.start()

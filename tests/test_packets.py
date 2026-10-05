@@ -155,3 +155,51 @@ async def test_plaintext_path_accepts_only_control_packets():
     assert (await read_one_packet(reader)).packet_type is p.PACKET_FLAGS.ctrl_hello
     with pytest.raises(ValueError):
         await read_one_packet(reader)
+
+
+# ----- review regressions: zstd/msgpack bomb -----------------------------------------------
+
+
+def _empty_maps_bomb(count: int) -> p.TaskPacket:
+    """An array of ``count`` empty maps: 1 byte each on the wire, ~64 bytes each once decoded."""
+    raw = b"\xdd" + count.to_bytes(4, "big") + b"\x80" * count
+    return _packet_with_raw_payload(zstd.ZstdCompressor(level=19).compress(raw))
+
+
+def test_tiny_bomb_is_refused_fast_and_without_memory_under_a_small_cap():
+    import time
+    import tracemalloc
+
+    pkt = _empty_maps_bomb(10_000_000)
+    assert pkt.payload_size < 1000  # the reviewer's PoC: a ~400-byte hello
+    tracemalloc.start()
+    start = time.monotonic()
+    try:
+        with pytest.raises(ValueError):
+            pkt.unpack_payload(64 * 1024)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert time.monotonic() - start < 0.5
+    assert peak < 2 * 1024 * 1024  # was ~720 MB
+
+
+def test_container_budget_refuses_many_small_maps_under_the_size_cap():
+    with pytest.raises(ValueError, match="invalid TaskPacket payload"):
+        _empty_maps_bomb(5_000).unpack_payload(64 * 1024)  # 5 KB, under the cap, but 5000 dicts
+    with pytest.raises(ValueError, match="must be a dict"):
+        _empty_maps_bomb(500).unpack_payload(64 * 1024)  # within budget: decoded, then refused as not a dict
+
+
+def test_payload_cap_applies_to_the_decompressed_size():
+    pkt = p.parse_packet(p.build_task_packet({"x": b"\x00" * 100_000}))
+    assert pkt.payload_size < 1000
+    with pytest.raises(ValueError, match="invalid TaskPacket payload"):
+        pkt.unpack_payload(64 * 1024)
+    assert pkt.unpack_payload(200_000)["x"] == b"\x00" * 100_000
+
+
+def test_declared_msgpack_lengths_beyond_the_cap_are_refused():
+    raw = b"\x81\xa1k\xdb" + (10**9).to_bytes(4, "big")  # {"k": <a 1 GB string>}, header only
+    with pytest.raises(ValueError, match="invalid TaskPacket payload"):
+        _packet_with_raw_payload(zstd.ZstdCompressor().compress(raw)).unpack_payload(64 * 1024)

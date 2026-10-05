@@ -161,6 +161,33 @@ async def test_pre_auth_frame_limit():
         await hub.recv()
 
 
+async def test_bomb_message_before_auth_is_refused_by_the_channel():
+    import zstandard as zstd
+
+    from ollamapower.core.packets import PACKET_FLAGS, PayloadKind, TaskPacket
+
+    key = b"k" * 32
+    pkt = TaskPacket.from_payload({}, PACKET_FLAGS.message, kind=PayloadKind.message)
+    pkt.raw_payload = zstd.ZstdCompressor(level=19).compress(b"\xdd" + (10**7).to_bytes(4, "big") + b"\x80" * 10**7)
+    reader = asyncio.StreamReader()
+    reader.feed_data(SessionCrypto(key, "node").encrypt(pkt.to_bytes()))
+    hub = Channel(reader, None, SessionCrypto(key, "hub"))  # type: ignore[arg-type]
+    hub.limit_frames(64 * 1024)
+    assert hub.max_payload == 64 * 1024
+    with pytest.raises(p.ProtocolError):
+        await hub.recv()
+
+
+async def test_large_messages_after_auth_still_decode():
+    key = b"k" * 32
+    reader = asyncio.StreamReader()
+    message = p.make("net_test_data", "node", test_id="t1", seq=0, data=b"\x01" * (4 * 1024 * 1024))
+    reader.feed_data(SessionCrypto(key, "node").encrypt(p.encode(message)))
+    hub = Channel(reader, None, SessionCrypto(key, "hub"))  # type: ignore[arg-type]
+    hub.limit_frames(30 * 1024 * 1024)
+    assert (await hub.recv())["data"] == message["data"]
+
+
 @pytest.mark.parametrize("purpose,ok", [("rpc", True), ("bench", True), ("shell", False)])
 def test_rpc_start_purpose(purpose, ok):
     m = {
