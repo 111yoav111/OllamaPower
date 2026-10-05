@@ -477,3 +477,25 @@ def test_tunnel_test_refuses_an_older_agent(cluster):
     c.node.protocol = "1.0"
     with pytest.raises(AdminError, match="older agent"):
         c.admin("nodes.tunnel_test", ref="desk")
+
+
+def test_web_pages_ollama_would_refuse_cannot_use_split_mode(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    body = {"model": "tiny", "messages": [{"role": "user", "content": "hi"}]}
+    r = client.post(c.url + "/api/chat", json=body, headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403 and r.json() == {"error": "origin not allowed"}
+    assert not c.call(lambda: c.hub.split.holds("tiny"))  # nothing was started for it
+    r = client.post(c.url + "/api/chat", json=body, headers={"Origin": "http://localhost:3000"})
+    assert r.status_code == 200 and r.headers["access-control-allow-origin"] == "http://localhost:3000"
+    r = client.post(c.url + "/v1/chat/completions", json=body)
+    assert "access-control-allow-origin" not in r.headers  # llama-server's "allow everyone" never leaks out
+
+
+def test_any_inference_for_a_split_model_hands_the_gpu_back_first(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    assert chat(client, c).status_code == 200 and c.call(lambda: c.hub.split.holds("tiny"))
+    r = client.post(c.url + "/api/embed", json={"model": "tiny", "input": "x"})
+    assert r.status_code == 200 and c.rec.last["path"] == "/api/embed"
+    assert not c.call(lambda: c.hub.split.holds("tiny"))  # Ollama didn't load it next to llama-server

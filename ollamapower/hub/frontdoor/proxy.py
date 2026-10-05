@@ -246,6 +246,7 @@ class ProxyStreamResponse(Response):
         transform: Transform | None = None,
         first: bytes = b"",
         chunks: AsyncIterator[bytes] | None = None,
+        cors_origin: str | None = None,
     ) -> None:
         self.upstream = upstream
         self.stream = stream
@@ -254,6 +255,7 @@ class ProxyStreamResponse(Response):
         self.transform = transform
         self.first = first  # already read from upstream (split mode waits for it before answering)
         self.chunks = chunks
+        self.cors_origin = cors_origin  # split mode: we answer for Ollama, so we set its CORS headers
         self.background = None
         self.status_code = upstream.status_code
         self.content_type = transform.content_type if transform else upstream.headers.get("content-type", "")
@@ -262,6 +264,12 @@ class ProxyStreamResponse(Response):
         headers = response_headers(self.upstream)
         if self.transform is not None:
             headers["content-type"] = self.content_type
+        if self.transform is not None or self.cors_origin is not None:
+            # llama-server allows every origin; its CORS headers must never reach a browser.
+            headers = {k: v for k, v in headers.items() if not k.startswith("access-control-")}
+            if self.cors_origin:
+                headers["access-control-allow-origin"] = self.cors_origin
+                headers["vary"] = "Origin"
         return [(k.encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()]
 
     async def _send_body(self, chunk: bytes, send: Send) -> None:

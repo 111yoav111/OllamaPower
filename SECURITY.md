@@ -30,9 +30,14 @@ an attacker who already runs code as the owner on the Hub or a helper.
   replaces Ollama's own local port, and remote access belongs to OllamaGate.
 - **Web pages can't use it.** Requests whose `Host` isn't a local name are
   refused with `403` (DNS rebinding: a page under `evil.example` re-pointed at
-  127.0.0.1), using Ollama's own rules. `Origin` is forwarded, so Ollama's CORS
-  policy (`OLLAMA_ORIGINS`) still decides which web origins may call it, and
-  its CORS answers are passed back unchanged.
+  127.0.0.1), using Ollama's own rules (and, like Ollama, only while the front
+  door listens on loopback). `Origin` is forwarded, so Ollama's CORS policy
+  (`OLLAMA_ORIGINS`) still decides which web origins may call it, and its
+  CORS answers are passed back unchanged. Requests served in split mode never
+  reach Ollama, so the front door applies Ollama's origin policy itself
+  (defaults plus `OLLAMA_ORIGINS` from the hub's environment): other origins
+  get `403`, and llama-server's own "allow every origin" headers are never
+  passed on.
 - **Ollama stays local.** `ollama.url` must be a loopback address and may not
   be the front door's own port. `doctor` flags Ollama's port answering on any
   non-loopback interface and a non-loopback `OLLAMA_HOST`.

@@ -169,6 +169,13 @@ class SplitEngine:
         self._warnings: deque[tuple[float, str]] = deque(maxlen=20)
         self._tasks: set[asyncio.Task[Any]] = set()
 
+    def holds(self, model: str) -> bool:
+        """Is a session for ``model`` starting or running (holding, or about to hold, the GPU)?"""
+        from ..runtime import model_key
+
+        s = self.session
+        return s is not None and s.model == model_key(model) and s.state in ("starting", "ready")
+
     def is_running(self, model: str) -> bool:
         from ..runtime import model_key
 

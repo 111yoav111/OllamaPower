@@ -316,3 +316,40 @@ def test_untagged_model_name_matches_latest(frontdoor, client):
         return next((m["last_gen_tps"] for m in models if m["name"] == "plain:latest"), None)
 
     assert wait_for(lambda: tps() == 20.0, 8)
+
+
+@pytest.mark.parametrize(
+    "origin,ok",
+    [
+        ("http://localhost", True),
+        ("http://localhost:3000", True),
+        ("https://127.0.0.1:8443", True),
+        ("app://obsidian.md", True),
+        ("vscode-webview://abc", True),
+        ("https://evil.example", False),
+        ("http://localhost.evil.example", False),
+    ],
+)
+def test_origin_policy_matches_ollamas_defaults(origin, ok):
+    from ollamapower.hub.frontdoor.hostcheck import allowed_origins, origin_allowed
+
+    assert origin_allowed(origin, allowed_origins({})) is ok
+
+
+def test_ollama_origins_env_is_honoured():
+    from ollamapower.hub.frontdoor.hostcheck import allowed_origins, origin_allowed
+
+    assert origin_allowed("chrome-extension://abc", allowed_origins({"OLLAMA_ORIGINS": "chrome-extension://*"}))
+
+
+async def test_host_check_is_off_for_a_lan_listener_like_ollama():
+    from ollamapower.hub.frontdoor.hostcheck import LocalHostOnlyMiddleware
+
+    seen = []
+
+    async def app(scope, receive, send):
+        seen.append(scope["path"])
+
+    scope = {"type": "http", "path": "/api/tags", "headers": [(b"host", b"mypc.lan:11434")]}
+    await LocalHostOnlyMiddleware(app, enforce=False)(scope, None, None)
+    assert seen == ["/api/tags"]

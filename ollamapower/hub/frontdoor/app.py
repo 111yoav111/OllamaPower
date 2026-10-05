@@ -43,6 +43,7 @@ from fastapi.responses import JSONResponse, Response
 from starlette.requests import ClientDisconnect
 
 from ...aio import reap, wait_for
+from ...config import is_loopback_host
 from ...scheduling.request_queue import QueueFull, Ticket
 from ...scheduling.task_pool import TaskPriority
 from ...textsafe import safe_text
@@ -58,7 +59,7 @@ from ..engines.translate import (
 )
 from ..plans import SplitSpec
 from ..runtime import ENGINE_LOCAL, Hub
-from .hostcheck import LocalHostOnlyMiddleware
+from .hostcheck import LocalHostOnlyMiddleware, allowed_origins, origin_allowed
 from .proxy import (
     ClientGone,
     GenerationTap,
@@ -82,6 +83,9 @@ INFERENCE_ENDPOINTS = frozenset(
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/embeddings",
+        "/v1/messages",  # Anthropic API (e.g. Claude Code through Ollama)
+        "/v1/responses",
+        "/v1/responses/compact",
     }
 )
 # Native endpoints whose final chunk carries Ollama's timings.
@@ -159,8 +163,14 @@ def keep_alive_zero(value: Any) -> bool:
     return isinstance(value, str) and value.strip().rstrip("smh") in ("0", "0.0")
 
 
+def cors(origin: str | None) -> dict[str, str] | None:
+    """The CORS headers Ollama would add for an allowed ``origin`` (split-mode answers)."""
+    return {"access-control-allow-origin": origin, "vary": "Origin"} if origin else None
+
+
 def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
     config = hub.config
+    origins = allowed_origins()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -222,7 +232,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     hub.record_generation(stream.model, stats)
             hub.finish_stream(stream, status, outcome)
 
-        async def serve_split(body: bytes, spec: SplitSpec, strict: bool) -> Response | None:
+        async def serve_split(body: bytes, spec: SplitSpec, strict: bool, origin: str | None) -> Response | None:
             """Serve from the split engine. None means "let Ollama serve it" (never for a benchmark: ``strict``)."""
 
             def unavailable(reason: str) -> Response | None:
@@ -251,14 +261,14 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                         return unavailable(str(exc))
                     hub.split.release(session)
                 finish("complete", 200)
-                return JSONResponse(load_reply(path, str(parsed.get("model", "")), unload))
+                return JSONResponse(load_reply(path, str(parsed.get("model", "")), unload), headers=cors(origin))
             try:
                 translated = (
                     chat_request(parsed) if path == "/api/chat" else generate_request(parsed) if native else None
                 )
             except UnsupportedRequest as exc:
                 finish("rejected", 400)
-                return error(path, 400, str(exc))
+                return error(path, 400, str(exc), cors(origin))
             try:
                 session = await race_kill(hub.split.acquire(stream.model, spec), stream, request.receive)
             except SplitUnavailable as exc:
@@ -338,7 +348,14 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 else None
             )
             return ProxyStreamResponse(
-                upstream, stream, done, tap=tap if native else None, transform=transform, first=first, chunks=chunks
+                upstream,
+                stream,
+                done,
+                tap=tap if native else None,
+                transform=transform,
+                first=first,
+                chunks=chunks,
+                cors_origin=origin or "",  # "" = drop llama-server's CORS headers, add none
             )
 
         handed_off = False
@@ -373,21 +390,26 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     finish("rejected", 503)
                     return error(path, 503, "server busy, try again shortly", {"Retry-After": "10"})
                 stream.queued_ms = int((time.monotonic() - queued_at) * 1000)
+                spec = None
                 if path in SPLIT_ENDPOINTS:
-                    if forced == "local":
-                        spec = None
-                    elif forced == "split":
+                    if forced == "split":
                         spec = bench_spec(request.headers)
-                    else:
+                    elif forced != "local":
                         spec = hub.plans.route(stream.model)
-                    if spec is not None:
-                        served = await serve_split(body, spec, strict=bench)
-                        if served is not None:
-                            handed_off = isinstance(served, ProxyStreamResponse)
-                            return served
-                    if hub.split.is_running(stream.model):
-                        # Ollama serves this model now: llama-server must give the GPU back first.
-                        await hub.split.stop(stream.model, "Ollama serves this model now", drain=True)
+                if spec is not None:
+                    origin = request.headers.get("origin")
+                    if origin and not origin_allowed(origin, origins):
+                        # Ollama would refuse this web page; split mode never asks Ollama, so we refuse it.
+                        finish("rejected", 403)
+                        return error(path, 403, "origin not allowed")
+                    served = await serve_split(body, spec, strict=bench, origin=origin)
+                    if served is not None:
+                        handed_off = isinstance(served, ProxyStreamResponse)
+                        return served
+                if hub.split.holds(stream.model):
+                    # Ollama serves this model now (or an endpoint split mode doesn't handle, like
+                    # embeddings): llama-server must give the GPU back first.
+                    await hub.split.stop(stream.model, "Ollama serves this model now", drain=True)
                 upstream_request = http.build_request(
                     method, target, content=body, headers=build_upstream_headers(request.headers)
                 )
@@ -456,5 +478,5 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
     async def not_found(request: Request, exc: Exception) -> Response:
         return error(request.url.path, 404, "not found")
 
-    app.add_middleware(LocalHostOnlyMiddleware)
+    app.add_middleware(LocalHostOnlyMiddleware, enforce=is_loopback_host(config.hub.host))
     return app
