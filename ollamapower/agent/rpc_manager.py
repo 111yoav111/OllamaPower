@@ -62,6 +62,17 @@ class RpcRefused(Exception):
     """The helper won't (or can't) start this session; the message goes back to the hub."""
 
 
+# Why this helper doesn't lend right now ("" while it does). A callable, not a snapshot:
+# the answer can change while a session is starting.
+NotLending = Callable[[], str]
+
+
+def _check_lending(not_lending: NotLending) -> None:
+    reason = not_lending()
+    if reason:
+        raise RpcRefused(f"this helper isn't lending right now: {reason}")
+
+
 @dataclass
 class RpcSession:
     session_id: str
@@ -223,16 +234,21 @@ class RpcManager:
         hub_ip: str,
         bind_ip: str,
         rules: LendingRules,
-        not_lending: str,
+        not_lending: NotLending,
     ) -> dict[str, Any]:
-        """Start a session for ``rpc_start``; returns the endpoint for ``rpc_ready``."""
+        """Start a session for ``rpc_start``; returns the endpoint for ``rpc_ready``.
+
+        ``not_lending`` is asked again after every slow step: starting can take
+        a minute and a half, and the owner may pause (or the schedule end) in
+        the meantime. A session that is no longer allowed is stopped here, before
+        the hub hears of it, instead of being handed over and torn down after.
+        """
         async with self._lock:
             if self.status != "ready" or self.binaries is None or self.binaries.rpc_server is None:
                 raise RpcRefused(
                     f"llama.cpp is not ready on this helper ({self.status}{': ' + self.error if self.error else ''})"
                 )
-            if not_lending:
-                raise RpcRefused(f"this helper isn't lending right now: {not_lending}")
+            _check_lending(not_lending)
             tunnel = _Tunnel.from_message(message, rules)
             if self.session is not None:
                 await self._stop(self.session, "replaced by a new session")
@@ -249,8 +265,12 @@ class RpcManager:
             cache = bool(message.get("cache")) and rules.disk_cache
             try:
                 await self._launch(session, cache)
+                _check_lending(not_lending)
                 session.relay = tunnel.relay(session.port, hub_ip)
                 await session.relay.start(bind_ip)
+                # No await between this check and publishing the session below, so a
+                # pause either finds ``self.session`` set or makes this check fail.
+                _check_lending(not_lending)
             except BaseException:
                 await self._stop(session, "failed to start")
                 raise
@@ -348,11 +368,10 @@ class RpcManager:
     # ----- tunnel test -------------------------------------------------------------------
 
     async def start_bench(
-        self, message: dict[str, Any], hub_ip: str, bind_ip: str, rules: LendingRules, not_lending: str
+        self, message: dict[str, Any], hub_ip: str, bind_ip: str, rules: LendingRules, not_lending: NotLending
     ) -> dict[str, Any]:
         """A relay in front of an echo server, so the hub can time the tunnel itself."""
-        if not_lending:
-            raise RpcRefused(f"this helper isn't lending right now: {not_lending}")
+        _check_lending(not_lending)
         tunnel = _Tunnel.from_message(message, rules)
         session_id = message["session_id"]
         if len(self.benches) >= 2:
@@ -380,6 +399,22 @@ class RpcManager:
         return True
 
     # ----- stop --------------------------------------------------------------------------
+
+    async def stop_current(self, reason: str) -> str | None:
+        """Stop the session that is running or starting; returns its id, or None if there was none.
+
+        Taking the lock waits for an ``rpc_start`` in progress: reading
+        ``self.session`` without it misses a session that is about to exist, so
+        the owner's pause wouldn't stop it.
+        """
+        async with self._lock:
+            session = self.session
+            if session is None:
+                return None
+            self.session = None
+            await self._stop(session, reason)
+            self.note(f"stopped lending to the hub ({reason})")
+            return session.session_id
 
     async def stop(self, session_id: str | None = None, reason: str = "stopped") -> bool:
         """Stop the session (if ``session_id`` is given, only when it matches)."""

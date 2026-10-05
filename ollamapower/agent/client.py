@@ -39,7 +39,7 @@ from ..core.encrypt_layer import CryptoError, SessionCrypto
 from ..files import write_private
 from ..telemetry import Telemetry, network_info
 from ..textsafe import safe_text
-from .config import AgentConfig, load_agent_config, save_agent_config
+from .config import AgentConfig, LendingRules, load_agent_config, save_agent_config
 from .lending import TUNNEL_QUIET, LendingGuard
 from .pinning import KnownHubs, format_fingerprint, normalize_fingerprint
 from .rpc_manager import RpcManager, RpcRefused
@@ -327,8 +327,8 @@ class AgentClient:
             if peer is None or local is None:
                 raise RpcRefused("the connection to the hub is gone")
             start = self.rpc.start_bench if m.get("purpose") == "bench" else self.rpc.start
-            not_lending = self.state.lend_reason if self.state.lend_state != "lending" else ""
-            endpoint = await start(m, peer[0], local[0], self.config.lending, not_lending)
+            rules = self.config.lending
+            endpoint = await start(m, peer[0], local[0], rules, lambda: self._not_lending(rules))
         except RpcRefused as exc:
             self.state.note(f"split session refused: {exc}")
             with contextlib.suppress(Exception):
@@ -354,11 +354,26 @@ class AgentClient:
             with contextlib.suppress(Exception):
                 await channel.send("rpc_error", session_id=session_id, error=error[:1000])
 
+    def _not_lending(self, rules: LendingRules) -> str:
+        """Why a session started under ``rules`` may not go ahead ("" if it may), asked during the start.
+
+        ``state.paused`` is checked directly: ``set_paused`` sets it before it
+        stops anything, while ``lend_state`` only follows once that is done.
+        """
+        if self.state.paused:
+            return "paused by the helper's owner"
+        if self.state.lend_state != "lending":
+            return self.state.lend_reason
+        if self.config.lending is not rules:
+            return "the helper's owner changed the lending rules"
+        return ""
+
     async def _end_session(self, reason: str) -> None:
         """The owner changed something: stop lending now and tell the hub why."""
-        session = self.rpc.session
-        if session is not None and await self.rpc.stop(session.session_id, reason):
-            await self._rpc_failed(session.session_id, reason)
+        # stop_current waits for a session that is still starting, so it can't slip through.
+        session_id = await self.rpc.stop_current(reason)
+        if session_id is not None:
+            await self._rpc_failed(session_id, reason)
 
     async def _on_test_data(self, channel: Channel, m: dict[str, Any]) -> None:
         test = self._tests.get(m["test_id"])
