@@ -149,21 +149,19 @@ def agent(
             typer.secho(str(exc), fg=typer.colors.RED, err=True)
             return 1
         try:
+            if not no_tui and await _run_agent_tui(client, log_lines):
+                return 0
             if no_tui:
                 log.info("helper %s connecting to the hub at %s:%d", cfg.display_name, address, port)
-                try:
-                    await client.run()
-                except AgentStopped as exc:
-                    typer.secho(f"Stopped: {exc}", fg=typer.colors.RED, err=True)
-                    return 4
-            else:
-                from .tui.app import AgentTUI
-
-                app = AgentTUI(client)
-                await app.run_async()
-                if app.stopped_reason:
-                    typer.secho(f"Stopped: {app.stopped_reason}", fg=typer.colors.RED, err=True)
-                    return 4
+            client.confirm = ask_in_terminal
+            try:
+                await client.run()
+            except AgentStopped as exc:
+                typer.secho(f"Stopped: {exc}", fg=typer.colors.RED, err=True)
+                return 1
+        except _TUIStopped as exc:
+            typer.secho(f"Stopped: {exc}", fg=typer.colors.RED, err=True)
+            return 1
         finally:
             await control.close()
         return 0
@@ -173,6 +171,35 @@ def agent(
     except KeyboardInterrupt:
         code = 0
     raise typer.Exit(code)
+
+
+class _TUIStopped(Exception):
+    """The agent stopped for good while its TUI ran (wrong token, changed hub key, ...)."""
+
+
+async def _run_agent_tui(client: Any, log_lines: deque[str]) -> bool:
+    """Run the TUI. True when the owner quit; False when it crashed and the agent should go on headless."""
+    from .tui.app import AgentTUI
+
+    app = AgentTUI(client)
+    crashed = None
+    try:
+        await app.run_async()
+    except Exception as exc:  # noqa: BLE001 - the helper must survive a TUI bug
+        crashed = exc
+    if app.stopped_reason:
+        raise _TUIStopped(app.stopped_reason)
+    if app.quit_confirmed:
+        return True
+    configure_logging("info")
+    for line in log_lines:
+        typer.echo(line, err=True)
+    typer.secho(
+        f"The TUI stopped unexpectedly ({crashed!r}); the agent keeps running headless. Press Ctrl+C to stop it.",
+        fg=typer.colors.RED,
+        err=True,
+    )
+    return False
 
 
 # ----- control a running agent ---------------------------------------------------------

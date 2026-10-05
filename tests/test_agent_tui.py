@@ -89,3 +89,67 @@ async def test_invalid_rules_are_explained(tmp_path, hub_key):  # noqa: F811
             assert agent.config.lending.max_vram_percent == 0  # refused by validation, toast shown
     finally:
         await s.close()
+
+
+async def test_failing_save_is_a_toast_not_a_crash(tmp_path, hub_key, monkeypatch):  # noqa: F811
+    """An OSError writing agent.toml (or any other action bug) must not take the TUI and the agent down."""
+    s = Setup(tmp_path, hub_key)
+    await s.start()
+    agent = s.agent(name="laptop")
+
+    def disk_full(rules):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(agent, "_save_rules", disk_full)
+    app = AgentTUI(agent)
+    try:
+        async with app.run_test(size=(150, 45)) as pilot:
+            assert await app._admin("agent.rules", max_vram_gb=4.0) is None
+            assert agent.config.lending.max_vram_gb == 0.0
+
+            async def boom(cmd, args):
+                raise RuntimeError("bug")
+
+            monkeypatch.setattr(app.admin, "dispatch", boom)
+            assert await app._admin("agent.pause") is None
+            await pilot.pause()
+            assert app.is_running
+    finally:
+        await s.close()
+
+
+async def test_agent_admin_turns_oserror_into_admin_error(tmp_path, hub_key, monkeypatch):  # noqa: F811
+    import pytest
+
+    from ollamapower.admin.ipc import AdminError
+    from ollamapower.agent.service import AgentAdmin
+
+    s = Setup(tmp_path, hub_key)
+    await s.start()
+    agent = s.agent(name="laptop")
+
+    def denied(rules):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(agent, "_save_rules", denied)
+    try:
+        with pytest.raises(AdminError, match="could not save"):
+            await AgentAdmin(agent).dispatch("agent.rules", {"max_vram_gb": 4.0})
+    finally:
+        await s.close()
+
+
+async def test_a_crashed_tui_leaves_the_agent_running_headless(monkeypatch, capsys):
+    from collections import deque
+    from types import SimpleNamespace
+
+    from ollamapower.agent import cli as agent_cli
+
+    async def crash(self):
+        raise RuntimeError("drawing bug")
+
+    monkeypatch.setattr(AgentTUI, "run_async", crash)
+    keep_going = await agent_cli._run_agent_tui(SimpleNamespace(), deque(["earlier log line"]))
+    assert keep_going is False
+    err = capsys.readouterr().err
+    assert "keeps running headless" in err and "earlier log line" in err

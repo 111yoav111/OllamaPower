@@ -136,6 +136,8 @@ class AgentTUI(App[None]):
         self.admin = AgentAdmin(client)
         self.run_client = run_client
         self.stopped_reason = ""
+        # Set when the owner quits; any other exit is a crash and the agent goes on headless.
+        self.quit_confirmed = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -332,6 +334,10 @@ class AgentTUI(App[None]):
         except AdminError as exc:
             self.say(str(exc), severity="error")
             return None
+        except Exception:  # noqa: BLE001 - a failed action must never take the agent down
+            log.exception("admin action %s failed in the TUI", cmd)
+            self.say("That action failed unexpectedly (see the log).", severity="error")
+            return None
         self.refresh_view()
         return result
 
@@ -364,6 +370,7 @@ class AgentTUI(App[None]):
     def action_quit_agent(self) -> None:
         def done(yes: bool | None) -> None:
             if yes:
+                self.quit_confirmed = True
                 self.exit()
 
         self.push_screen(ConfirmScreen("Quit? The hub stops using this PC."), done)

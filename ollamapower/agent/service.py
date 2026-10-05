@@ -73,4 +73,6 @@ class AgentAdmin:
                 return await self.client.update_rules(**changes)
             except (ConfigError, TypeError) as exc:
                 raise AdminError(str(exc)) from None
+            except OSError as exc:  # agent.toml couldn't be written: tell the owner, keep lending
+                raise AdminError(f"could not save the lending rules to agent.toml: {exc}") from None
         raise AdminError(f"unknown command {cmd!r}")

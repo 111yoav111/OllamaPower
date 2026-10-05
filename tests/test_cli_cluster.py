@@ -169,7 +169,7 @@ def test_agent_refuses_unknown_key_headless(tmp_path):
             timeout=30,
             stdin=subprocess.DEVNULL,
         )
-        assert r.returncode == 4 and "--hub-fingerprint" in r.stderr
+        assert r.returncode == 1 and "--hub-fingerprint" in r.stderr
         events = cli("logs", "--kind", "auth_failed", env=hub_env).stdout
         assert "auth_failed" not in events  # the wrong token was never sent
     finally:
