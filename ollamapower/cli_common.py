@@ -41,7 +41,8 @@ def call(config_dir: Path, cmd: str, *, name: str = "run", timeout: float = 10.0
         typer.secho(f"{message}. Start it with `ollamapower {what}`.", fg=typer.colors.RED, err=True)
         raise typer.Exit(3) from None
     except AdminError as exc:
-        typer.secho(f"Error: {exc}", fg=typer.colors.RED, err=True)
+        message = str(exc).replace("the OllamaPower hub", f"the OllamaPower {what}")
+        typer.secho(f"Error: {message}", fg=typer.colors.RED, err=True)
         raise typer.Exit(1) from None
 
 

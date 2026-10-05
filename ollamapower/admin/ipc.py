@@ -317,7 +317,14 @@ class ControlClient:
             assert self._sock is not None
             self._sock.sendall(payload)
             reply = self._readline()
-        except OSError as exc:  # timeouts, resets, broken pipes
+        except TimeoutError:
+            # A slow answer is not a dead hub: e.g. stopping a split session waits for a model load.
+            self.close()
+            raise AdminError(
+                f"the OllamaPower hub didn't answer within {self.timeout:g} s "
+                "(it may be busy, e.g. loading a split model); try again in a moment"
+            ) from None
+        except OSError as exc:  # resets, broken pipes
             self.close()
             raise NotRunning(f"lost connection to the OllamaPower hub ({type(exc).__name__})") from exc
         if reply.get("error") == "unauthorized" and "proof" not in reply:

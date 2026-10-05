@@ -106,3 +106,43 @@ def test_impostor_never_sees_the_secret(tmp_path):
     t.join(5)
     server.close()
     assert secret.encode() not in received[0]
+
+
+async def test_slow_hub_is_busy_not_down(tmp_path):
+    """A reply slower than the timeout means "busy", not "not running" (the CLI must not say "start it")."""
+
+    async def slow(cmd, args):
+        await asyncio.sleep(1.0)
+        return "late"
+
+    control = await ipc.start_control_server(tmp_path, slow)
+    try:
+
+        def use():
+            with ipc.ControlClient(tmp_path, timeout=0.2) as c:
+                with pytest.raises(ipc.AdminError, match="didn't answer within 0.2 s"):
+                    c.call("models.unpin")
+
+        await asyncio.to_thread(use)
+    finally:
+        await control.close()
+
+
+async def test_cli_reports_a_busy_hub_with_exit_1(tmp_path, monkeypatch, capsys):
+    import typer
+
+    from ollamapower.cli_common import call
+
+    async def slow(cmd, args):
+        await asyncio.sleep(1.0)
+        return "late"
+
+    control = await ipc.start_control_server(tmp_path, slow)
+    try:
+        with pytest.raises(typer.Exit) as exc:
+            await asyncio.to_thread(call, tmp_path, "models.unplan", timeout=0.2)
+    finally:
+        await control.close()
+    assert exc.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "busy" in err and "Start it" not in err

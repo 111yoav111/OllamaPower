@@ -602,6 +602,11 @@ def render_models(models: list[dict[str, Any]]) -> Lines:
     return lines
 
 
+def _split_wait(config: Any) -> float:
+    """Admin timeout for commands that may stop a split session: stopping waits for a load in progress."""
+    return config.split.load_timeout + 60
+
+
 @models_cli.command("list")
 def models_list(
     config_path: Path | None = ConfigOption,
@@ -734,21 +739,24 @@ def models_pin(
     config_path: Path | None = ConfigOption,
 ) -> None:
     """Always use one engine for a model (overrides the benchmark; `unpin` goes back to automatic)."""
-    d = call(load(config_path).config_dir, "models.pin", model=model, engine=engine, ctx=ctx, timeout=60)
+    config = load(config_path)
+    d = call(config.config_dir, "models.pin", model=model, engine=engine, ctx=ctx, timeout=_split_wait(config))
     typer.echo(f"{safe(d['model'])}: pinned to {engine} - now served by {d['engine']}.")
 
 
 @models_cli.command("unpin")
 def models_unpin(model: str, config_path: Path | None = ConfigOption) -> None:
     """Let the benchmark decide again (automatic mode)."""
-    d = call(load(config_path).config_dir, "models.unpin", model=model)
+    config = load(config_path)
+    d = call(config.config_dir, "models.unpin", model=model, timeout=_split_wait(config))
     typer.echo(f"{safe(d['model'])}: automatic - served by {d['engine']} ({safe(d['why'])}).")
 
 
 @models_cli.command("force-local")
 def models_force_local(model: str, config_path: Path | None = ConfigOption) -> None:
     """Always serve a model with plain Ollama, whatever the benchmark says."""
-    d = call(load(config_path).config_dir, "models.force_local", model=model)
+    config = load(config_path)
+    d = call(config.config_dir, "models.force_local", model=model, timeout=_split_wait(config))
     typer.echo(f"{safe(d['model'])}: forced to local Ollama.")
 
 
@@ -799,7 +807,7 @@ def models_plan(
 def models_unplan(model: str, config_path: Path | None = ConfigOption) -> None:
     """Forget a model's plan and benchmark decision (automatic mode, nothing decided yet)."""
     config = load(config_path)
-    d = call(config.config_dir, "models.unplan", model=model)
+    d = call(config.config_dir, "models.unplan", model=model, timeout=_split_wait(config))
     typer.echo(f"Removed the plan for {safe(d['model'])}{' and stopped its split session' if d['stopped'] else ''}.")
 
 
