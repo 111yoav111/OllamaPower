@@ -167,3 +167,16 @@ def test_oversized_manifest_is_ignored(tmp_path):
     path.parent.mkdir(parents=True)
     path.write_text(" " * (2 * 1024 * 1024))
     assert read_manifest(tmp_path, "x") is None
+
+
+@pytest.mark.parametrize("value", [2**40, 2**63 + 5, 5000])
+def test_hostile_block_count_is_refused_before_allocating(tmp_path, value):
+    path = write_tiny_llama(tmp_path / "m.gguf", extra_kv={"llama.block_count": value})
+    with pytest.raises(GGUFError, match="implausible block_count"):
+        read_gguf(path)
+
+
+def test_hostile_context_length_is_refused(tmp_path):
+    path = write_tiny_llama(tmp_path / "m.gguf", ctx=1 << 30)
+    with pytest.raises(GGUFError, match="implausible context_length"):
+        read_gguf(path)

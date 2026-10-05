@@ -27,6 +27,8 @@ MAX_STRING = 16 * 1024 * 1024
 MAX_ARRAY = 64 * 1024 * 1024
 MAX_DIMS = 8
 DEFAULT_ALIGNMENT = 32
+MAX_BLOCKS = 4096  # the largest real models have ~200 layers
+MAX_DIMENSION = 1 << 26  # context length, widths and head counts beyond this are corrupt or hostile
 # Arrays longer than this (token vocabularies) are skipped, not kept.
 KEEP_ARRAY = 1024
 
@@ -203,6 +205,20 @@ def read_gguf(path: Path) -> GGUFInfo:
         split_count=max(1, _int(meta.get("split.count"))),
         metadata={k: v for k, v in meta.items() if not isinstance(v, list) and not k.startswith("tokenizer.")},
     )
+
+    # The header is untrusted: these feed allocations and the planner's arithmetic.
+    if not 0 <= info.block_count <= min(MAX_BLOCKS, max(len(tensors), 1)):
+        raise GGUFError(f"implausible block_count {info.block_count}")
+    for field_name in (
+        "context_length",
+        "embedding_length",
+        "head_count",
+        "head_count_kv",
+        "key_length",
+        "value_length",
+    ):
+        if getattr(info, field_name) > MAX_DIMENSION:
+            raise GGUFError(f"implausible {field_name} {getattr(info, field_name)}")
 
     ordered = sorted(tensors, key=lambda t: t[1])
     layers = [0] * info.block_count

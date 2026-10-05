@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 ALIGN = 32
-U32, I32, F32, STRING, ARRAY = 4, 5, 6, 8, 9
+U32, I32, F32, STRING, ARRAY, U64 = 4, 5, 6, 8, 9, 10
 
 
 def _str(value: str) -> bytes:
@@ -28,6 +28,8 @@ def _kv(key: str, value: Any) -> bytes:
     if isinstance(value, float):
         return out + struct.pack("<If", F32, value)
     if isinstance(value, int):
+        if value >= 2**32:
+            return out + struct.pack("<IQ", U64, value)
         return out + struct.pack("<II", U32, value)
     if isinstance(value, tuple):  # (item type, items)
         kind, items = value
