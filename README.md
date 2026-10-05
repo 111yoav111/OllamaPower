@@ -363,9 +363,18 @@ config directory:
 | macOS | `~/Library/Application Support/ollamapower/` |
 | Windows | `%APPDATA%\ollamapower\` |
 
-Every value can be overridden with `OLLAMAPOWER_<SECTION>__<KEY>` env vars,
-e.g. `OLLAMAPOWER_HUB__MAX_CONCURRENCY=2`; `OLLAMAPOWER_CONFIG_DIR` moves the
-directory. The cluster token lives only in `.env` (or the `OLLAMAPOWER_TOKEN`
+Every value in `config.toml` and a helper's `agent.toml` can be overridden
+with `OLLAMAPOWER_<SECTION>__<KEY>` env vars, e.g.
+`OLLAMAPOWER_HUB__MAX_CONCURRENCY=2` on the hub or
+`OLLAMAPOWER_LENDING__MAX_VRAM_GB=8` on a helper; `OLLAMAPOWER_CONFIG_DIR`
+moves the directory. Both files read the same environment, so each one skips
+the variables that belong to the other (`[hub]` and `[llamacpp]` exist in both
+with different keys); a name neither file knows is an error, as is an unknown
+key in a file. A value set by an env var wins over the file while it is set:
+editing that rule in the agent TUI or with `agent rules` changes the running
+agent but is not written to `agent.toml`. Values are checked strictly: whole
+numbers stay whole (`2.5` is refused, not truncated), TOML strings are not read
+as numbers, and `ollama.url` needs an explicit port. The cluster token lives only in `.env` (or the `OLLAMAPOWER_TOKEN`
 env var). On disk, all owner-only: `config.toml`, `.env`, `hub_key.pem`,
 `state.json` (+ `.bak`), `logs/`, and while running `run/`. A helper keeps
 `agent.toml`, `.env`, `known_hub` and `node_id` in the same kind of directory

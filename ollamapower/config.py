@@ -185,9 +185,11 @@ class Config:
             raise ConfigError(f"invalid ollama.url {self.ollama.url!r}")
         if not is_loopback_host(up.hostname):
             raise ConfigError("ollama.url must point at a loopback address (Ollama must stay local)")
-        default_port = 443 if up.scheme == "https" else 80
+        if up_port is None:
+            # Ollama's own default is 11434 but a URL's is 80/443; an explicit port leaves no doubt.
+            raise ConfigError(f"ollama.url needs an explicit port, e.g. http://{up.netloc}:11435")
         serves_loopback = is_loopback_host(h.host) or h.host in ("0.0.0.0", "::", "")
-        if serves_loopback and (up_port or default_port) == h.port:
+        if serves_loopback and up_port == h.port:
             raise ConfigError(
                 f"ollama.url uses port {h.port}, which is the front door's own port; move Ollama "
                 "to another port (default 11435, see `ollamapower doctor`)"
@@ -205,6 +207,11 @@ class Config:
             raise ConfigError("control.max_nodes, ban_failures, ban_window and ban_seconds must be positive")
         if c.max_ban_seconds < c.ban_seconds:
             raise ConfigError("control.max_ban_seconds must be at least control.ban_seconds")
+        if c.enabled and not c.allowed_networks:
+            raise ConfigError(
+                "control.allowed_networks is empty, so no helper could connect: list your LAN ranges "
+                "(see config.example.toml) or set control.enabled = false"
+            )
         for cidr in c.allowed_networks:
             try:
                 ipaddress.ip_network(cidr, strict=False)
@@ -232,6 +239,7 @@ class Config:
                 raise ConfigError(f"planner.{name} must be a positive number")
         if not 16 <= pl.prompt_tokens <= 32768 or not 8 <= pl.gen_tokens <= 4096:
             raise ConfigError("planner.prompt_tokens must be 16-32768 and planner.gen_tokens 8-4096")
+        self.logging.level = self.logging.level.lower()
         if self.logging.level not in ("debug", "info", "warning", "error"):
             raise ConfigError("logging.level must be debug, info, warning or error")
         if self.logging.file_max_bytes < 64 * 1024 or self.logging.file_backups < 1:
@@ -272,38 +280,46 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
-def _coerce(value: typing.Any, hint: typing.Any, where: str) -> typing.Any:
-    """Coerce a TOML or env-string value to the dataclass field type."""
+def _coerce(value: typing.Any, hint: typing.Any, where: str, from_env: bool = False) -> typing.Any:
+    """Coerce a TOML value or an env string to the dataclass field type.
+
+    TOML values must already have the right type (``port = "9000"`` is a mistake worth reporting); only
+    env strings are parsed. Floats are never truncated into integer fields.
+    """
     origin = typing.get_origin(hint)
     if origin is list:
         item = (typing.get_args(hint) or (str,))[0]
-        if isinstance(value, str):
+        if from_env and isinstance(value, str):
             value = [v.strip() for v in value.split(",") if v.strip()]
         if not isinstance(value, list):
             raise ConfigError(f"{where} must be a list")
-        return [_coerce(v, item, where) for v in value]
+        return [_coerce(v, item, where, from_env) for v in value]
     if hint is bool:
         if isinstance(value, bool):
             return value
-        if isinstance(value, str) and value.lower() in ("1", "true", "yes", "on"):
+        if from_env and isinstance(value, str) and value.lower() in ("1", "true", "yes", "on"):
             return True
-        if isinstance(value, str) and value.lower() in ("0", "false", "no", "off"):
+        if from_env and isinstance(value, str) and value.lower() in ("0", "false", "no", "off"):
             return False
-        raise ConfigError(f"{where} must be a boolean")
+        raise ConfigError(f"{where} must be a boolean (true or false)")
     if hint is int:
-        if isinstance(value, bool):
-            raise ConfigError(f"{where} must be an integer")
-        try:
-            return int(value)
-        except (TypeError, ValueError) as exc:
-            raise ConfigError(f"{where} must be an integer") from exc
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if from_env and isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                pass
+        raise ConfigError(f"{where} must be a whole number")
     if hint is float:
-        if isinstance(value, bool):
-            raise ConfigError(f"{where} must be a number")
-        try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
             return float(value)
-        except (TypeError, ValueError) as exc:
-            raise ConfigError(f"{where} must be a number") from exc
+        if from_env and isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                pass
+        raise ConfigError(f"{where} must be a number")
     if hint is str:
         if not isinstance(value, str):
             raise ConfigError(f"{where} must be a string")
@@ -311,13 +327,13 @@ def _coerce(value: typing.Any, hint: typing.Any, where: str) -> typing.Any:
     raise ConfigError(f"unsupported config type for {where}")
 
 
-def _apply(section_obj: typing.Any, data: dict, section: str) -> None:
+def _apply(section_obj: typing.Any, data: dict, section: str, from_env: bool = False) -> None:
     hints = typing.get_type_hints(type(section_obj))
     known = {f.name for f in fields(section_obj)}
     for key, value in data.items():
         if key not in known:
             raise ConfigError(f"unknown config key {section}.{key}")
-        setattr(section_obj, key, _coerce(value, hints[key], f"{section}.{key}"))
+        setattr(section_obj, key, _coerce(value, hints[key], f"{section}.{key}", from_env))
 
 
 SECTIONS = ("hub", "ollama", "control", "llamacpp", "split", "planner", "logging")
@@ -331,25 +347,63 @@ def load_config(path: Path | None = None, env: typing.Mapping[str, str] | None =
     cfg = Config()
     if env.get(ENV_PREFIX + "CONFIG_DIR"):
         cfg.config_dir = Path(env[ENV_PREFIX + "CONFIG_DIR"])
-    if path is None:
-        candidate = cfg.config_dir / "config.toml"
-        path = candidate if candidate.exists() else None
-    if path is not None:
-        try:
-            with open(path, "rb") as fh:
-                data = tomllib.load(fh)
-        except tomllib.TOMLDecodeError as exc:
-            raise ConfigError(f"{path}: {exc}") from None
+    explicit = path is not None
+    path = path or cfg.config_dir / "config.toml"
+    try:
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    except FileNotFoundError:
+        if explicit:
+            raise ConfigError(f"{path} does not exist") from None
+        data = None  # no config file: the defaults apply
+    except OSError as exc:  # a directory, no permission, ...
+        raise ConfigError(f"cannot read {path}: {exc.strerror or exc}") from None
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"{path}: {exc}") from None
+    if data is not None:
         for section, values in data.items():
             if section not in SECTIONS or not isinstance(values, dict):
                 raise ConfigError(f"unknown config section [{section}]")
             _apply(getattr(cfg, section), values, section)
+    from .agent.config import SECTIONS as AGENT_SECTIONS
+    from .agent.config import AgentConfig
+
+    apply_env(cfg, SECTIONS, section_keys(AgentConfig(), AGENT_SECTIONS), env)
+    cfg.validate()
+    return cfg
+
+
+def section_keys(cfg: typing.Any, sections: typing.Iterable[str]) -> dict[str, set[str]]:
+    """The keys each section of a config object knows."""
+    return {s: {f.name for f in fields(getattr(cfg, s))} for s in sections}
+
+
+def apply_env(
+    cfg: typing.Any,
+    sections: typing.Iterable[str],
+    other: dict[str, set[str]],
+    env: typing.Mapping[str, str],
+) -> list[tuple[str, str]]:
+    """Apply the ``OLLAMAPOWER_<SECTION>__<KEY>`` overrides meant for ``cfg``; returns the (section, key)s set.
+
+    The hub's config.toml and a helper's agent.toml read the same environment (and both have a ``[hub]``
+    and a ``[llamacpp]`` section, with different keys), so a variable that belongs to the ``other`` file is
+    skipped instead of failing every command on a machine that runs both. A name neither file knows is
+    still an error: a typo must not silently do nothing.
+    """
+    own = section_keys(cfg, sections)
+    applied = []
     for name, value in env.items():
         if not name.startswith(ENV_PREFIX) or name in NON_CONFIG_ENV or "__" not in name:
             continue
         section, _, key = name[len(ENV_PREFIX) :].lower().partition("__")
-        if section not in SECTIONS:
+        if key in own.get(section, ()):
+            _apply(getattr(cfg, section), {key: value}, section, from_env=True)
+            applied.append((section, key))
+        elif key in other.get(section, ()) or (section in other and section not in own):
+            continue
+        elif section in own:
+            raise ConfigError(f"unknown config key {section}.{key} in env var {name}")
+        else:
             raise ConfigError(f"unknown config section in env var {name}")
-        _apply(getattr(cfg, section), {key: value}, section)
-    cfg.validate()
-    return cfg
+    return applied

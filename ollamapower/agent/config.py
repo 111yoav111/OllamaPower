@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import platform
 import tomllib
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..config import ConfigError, _apply, default_config_dir
+from ..config import ConfigError, _apply, apply_env, default_config_dir, section_keys
 from ..files import write_private
 
 AGENT_FILE = "agent.toml"
@@ -96,6 +98,8 @@ class AgentConfig:
     lending: LendingRules = field(default_factory=LendingRules)
     llamacpp: AgentLlamaCpp = field(default_factory=AgentLlamaCpp)
     config_dir: Path = field(default_factory=default_config_dir)
+    # (section, key) pairs taken from OLLAMAPOWER_<SECTION>__<KEY>: saving keeps the file's own value for them.
+    env_overrides: list[tuple[str, str]] = field(default_factory=list, compare=False, repr=False)
 
     @property
     def path(self) -> Path:
@@ -132,20 +136,38 @@ class AgentConfig:
 SECTIONS = ("hub", "agent", "lending", "llamacpp")
 
 
-def load_agent_config(config_dir: Path | None = None, path: Path | None = None) -> AgentConfig:
+def _read_toml(path: Path) -> dict[str, Any] | None:
+    """The parsed file, or None if there is none. Unreadable or broken files are config errors."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"cannot read {path}: {getattr(exc, 'strerror', None) or exc}") from None
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{path}: {exc}") from None
+
+
+def load_agent_config(
+    config_dir: Path | None = None, path: Path | None = None, env: Mapping[str, str] | None = None
+) -> AgentConfig:
+    """Load agent.toml, then apply ``OLLAMAPOWER_<SECTION>__<KEY>`` env overrides, then validate."""
+    from ..config import SECTIONS as HUB_SECTIONS
+    from ..config import Config
+
+    env = os.environ if env is None else env
     cfg = AgentConfig()
     if config_dir is not None:
         cfg.config_dir = config_dir
     path = path or cfg.path
-    if path.exists():
-        try:
-            data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except tomllib.TOMLDecodeError as exc:
-            raise ConfigError(f"{path}: {exc}") from None
-        for section, values in data.items():
-            if section not in SECTIONS or not isinstance(values, dict):
-                raise ConfigError(f"unknown section [{section}] in {path.name}")
-            _apply(getattr(cfg, section), values, section)
+    data = _read_toml(path)
+    for section, values in (data or {}).items():
+        if section not in SECTIONS or not isinstance(values, dict):
+            raise ConfigError(f"unknown section [{section}] in {path.name}")
+        _apply(getattr(cfg, section), values, section)
+    cfg.env_overrides = apply_env(cfg, SECTIONS, section_keys(Config(), HUB_SECTIONS), env)
     cfg.validate()
     return cfg
 
@@ -165,10 +187,18 @@ def _toml_value(value: Any) -> str:
 def save_agent_config(cfg: AgentConfig) -> None:
     """Write agent.toml (owner-only), e.g. after the owner edited the lending rules."""
     cfg.validate()
+    # A value that came from an env var is not the owner's file setting: keep what the file says.
+    on_disk = AgentConfig()
+    if cfg.env_overrides:
+        for section, values in (_read_toml(cfg.path) or {}).items():
+            if section in SECTIONS and isinstance(values, dict):
+                _apply(getattr(on_disk, section), values, section)
     lines = ["# OllamaPower agent settings. Edit here, in the agent TUI (E) or with the CLI.", ""]
     for section in SECTIONS:
         lines.append(f"[{section}]")
         for key, value in asdict(getattr(cfg, section)).items():
+            if (section, key) in cfg.env_overrides:
+                value = getattr(getattr(on_disk, section), key)
             lines.append(f"{key} = {_toml_value(value)}")
         lines.append("")
     write_private(cfg.path, "\n".join(lines).encode("utf-8"))
