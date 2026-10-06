@@ -79,7 +79,12 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("content-type", "text/event-stream"); self.end_headers()
         def ev(obj): self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n"); self.wfile.flush()
         for word in ["Hello", " from", " split"]:
-            ev({"choices": [{"index": 0, "delta": {"content": word}, "finish_reason": None}]})
+            choice = {"index": 0, "delta": {"content": word}, "finish_reason": None}
+            if body.get("logprobs"):
+                top = [{"id": 1, "token": "x", "bytes": [120], "logprob": -2.0}] * body.get("top_logprobs", 0)
+                entry = {"id": 0, "token": word, "bytes": list(word.encode()), "logprob": -0.5, "top_logprobs": top}
+                choice["logprobs"] = {"content": [entry]}
+            ev({"choices": [choice]})
             if last == "die":
                 print("GGML_ASSERT failed: fake crash", flush=True)
                 os._exit(1)

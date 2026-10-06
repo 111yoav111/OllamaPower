@@ -176,6 +176,54 @@ def test_tool_calls_get_ids_indexes_and_object_arguments():
     assert lines[-1]["done"] is True and lines[-1]["done_reason"] == "stop"
 
 
+def test_logprobs_are_forwarded_and_checked():
+    body = chat_request({"messages": [], "logprobs": True, "top_logprobs": 3})
+    assert body["logprobs"] is True and body["top_logprobs"] == 3
+    body = generate_request({"prompt": "x", "top_logprobs": 3})
+    assert "logprobs" not in body and "top_logprobs" not in body
+    assert "top_logprobs" not in chat_request({"messages": [], "logprobs": True, "top_logprobs": 0})
+    for bad in (-1, 21, "3", True):
+        with pytest.raises(UnsupportedRequest, match="top_logprobs must be between 0 and 20"):
+            chat_request({"messages": [], "logprobs": True, "top_logprobs": bad})
+
+
+def lp(token: str, logprob: float, top: list | None = None) -> dict:
+    entry = {"id": 7, "token": token, "bytes": list(token.encode()), "logprob": logprob}
+    if top is not None:
+        entry["top_logprobs"] = top
+    return entry
+
+
+def test_logprobs_come_back_in_ollamas_shape():
+    raw = sse(
+        {"choices": [{"index": 0, "delta": {"role": "assistant", "content": None}}]},
+        {
+            "choices": [
+                {"index": 0, "delta": {"content": "Hi"}, "logprobs": {"content": [lp("Hi", -0.1, [lp("Yo", -2)])]}}
+            ]
+        },
+        {"choices": [{"index": 0, "delta": {"content": "!"}, "logprobs": {"content": [lp("!", -0.2, [])]}}]},
+        {"choices": [{"index": 0, "delta": {}, "logprobs": None, "finish_reason": "stop"}]},
+        FINAL,
+    )
+    first = {
+        "token": "Hi",
+        "logprob": -0.1,
+        "bytes": [72, 105],
+        "top_logprobs": [{"token": "Yo", "logprob": -2.0, "bytes": [89, 111]}],
+    }
+    second = {"token": "!", "logprob": -0.2, "bytes": [33]}
+
+    t = OllamaStream("m", "/api/chat", stream=True)
+    lines = [json.loads(x) for x in (t.feed(raw) + t.finish()).splitlines()]
+    assert [x.get("logprobs") for x in lines] == [[first], [second], None]
+
+    t = OllamaStream("m", "/api/generate", stream=False)
+    t.feed(raw)
+    obj = json.loads(t.finish())
+    assert obj["response"] == "Hi!" and obj["logprobs"] == [first, second]
+
+
 @pytest.mark.parametrize("think", ["max", "true", "", 1])
 def test_unknown_think_values_are_refused_like_ollama(think):
     with pytest.raises(UnsupportedRequest, match="invalid think value"):

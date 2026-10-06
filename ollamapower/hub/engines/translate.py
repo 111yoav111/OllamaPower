@@ -44,6 +44,7 @@ NO_IMAGES = (
     "images are not supported in split mode yet (the vision part of the model isn't loaded); "
     "remove the split plan to use this model with images"
 )
+MAX_TOP_LOGPROBS = 20  # Ollama's limit
 ID_CHARS = string.ascii_lowercase + string.digits
 MAX_PENDING = 16 * 1024 * 1024  # an SSE line longer than this is dropped
 
@@ -71,6 +72,13 @@ def _options(body: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(fmt, dict):
         out["response_format"] = {"type": "json_schema", "json_schema": {"name": "response", "schema": fmt}}
     out.update(_think(body.get("think")))
+    top = body.get("top_logprobs")
+    if top is not None and (isinstance(top, bool) or not isinstance(top, int) or not 0 <= top <= MAX_TOP_LOGPROBS):
+        raise UnsupportedRequest(f"top_logprobs must be between 0 and {MAX_TOP_LOGPROBS}")
+    if body.get("logprobs") is True:
+        out["logprobs"] = True
+        if top:
+            out["top_logprobs"] = top  # llama-server, like OpenAI, only takes it together with logprobs
     return out
 
 
@@ -187,6 +195,7 @@ class OllamaStream:
         self._pending = bytearray()
         self._content: list[str] = []
         self._thinking: list[str] = []
+        self._logprobs: list[dict[str, Any]] = []
         self._tools: dict[int, dict[str, str]] = {}
         self._finish = "stop"
         self._timings: dict[str, Any] = {}
@@ -258,13 +267,18 @@ class OllamaStream:
                 slot["arguments"] += str(fn.get("arguments") or "")
         content = delta.get("content") or ""
         thinking = delta.get("reasoning_content") or ""
-        if not content and not thinking:
+        logprobs = _logprobs(choice.get("logprobs"))
+        if not content and not thinking and not logprobs:
             return b""
         if not self.stream:
             self._content.append(content)
             self._thinking.append(thinking)
+            self._logprobs.extend(logprobs)
             return b""
-        return self._dump(self._piece(content, thinking, done=False))
+        piece = self._piece(content, thinking, done=False)
+        if logprobs:
+            piece["logprobs"] = logprobs
+        return self._dump(piece)
 
     def _piece(self, content: str, thinking: str, done: bool) -> dict[str, Any]:
         obj: dict[str, Any] = {"model": self.model, "created_at": _now()}
@@ -343,7 +357,38 @@ class OllamaStream:
         final = self._piece("".join(self._content), "".join(self._thinking), done=True)
         if calls and self.key == "message":
             final["message"]["tool_calls"] = calls
+        if self._logprobs:
+            final["logprobs"] = self._logprobs
         return json.dumps({**final, **self._final()}, ensure_ascii=False).encode()
+
+
+def _token_logprob(entry: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {"token": str(entry.get("token", ""))}
+    try:
+        out["logprob"] = float(entry.get("logprob", 0.0))
+    except (TypeError, ValueError):
+        out["logprob"] = 0.0
+    raw = entry.get("bytes")
+    if isinstance(raw, list) and raw and all(isinstance(b, int) for b in raw):
+        out["bytes"] = raw
+    return out
+
+
+def _logprobs(value: Any) -> list[dict[str, Any]]:
+    """llama-server's (OpenAI's) ``logprobs.content`` -> Ollama's ``logprobs`` list."""
+    entries = value.get("content") if isinstance(value, dict) else None
+    if not isinstance(entries, list):
+        return []
+    out = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        item = _token_logprob(entry)
+        top = entry.get("top_logprobs")
+        if isinstance(top, list) and top:
+            item["top_logprobs"] = [_token_logprob(t) for t in top if isinstance(t, dict)]
+        out.append(item)
+    return out
 
 
 def _int(value: Any) -> int:

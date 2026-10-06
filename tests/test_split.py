@@ -239,6 +239,13 @@ def test_non_streaming_generate_tools_and_ps(cluster, client):
     sent = json.loads((c.hub_bin / "last_request.json").read_text())["body"]
     assert sent["temperature"] == 0.1 and sent["max_tokens"] == 9 and sent["tools"] == tools
 
+    r = chat(client, c, logprobs=True, top_logprobs=2)
+    lines = [json.loads(x) for x in r.text.splitlines()]
+    assert [x["logprobs"][0]["token"] for x in lines if "logprobs" in x] == ["Hello", " from", " split"]
+    assert len(lines[0]["logprobs"][0]["top_logprobs"]) == 2
+    sent = json.loads((c.hub_bin / "last_request.json").read_text())["body"]
+    assert sent["logprobs"] is True and sent["top_logprobs"] == 2
+
     ps = client.get(c.url + "/api/ps").json()["models"]
     assert [(m["name"], m["ollamapower"]["engine"]) for m in ps] == [("tiny:latest", "split")]
 
