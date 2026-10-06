@@ -165,6 +165,50 @@ async def test_stop_current_waits_for_a_session_that_is_starting(agent):
     assert endpoint["port"] and agent.rpc.session is None
 
 
+# ----- which device a session gets -----------------------------------------------------
+
+IGPU = "Vulkan0", "Intel(R) UHD Graphics 770", 32768, 30000  # llama.cpp lists the iGPU first, with shared RAM
+DGPU = "Vulkan1", "NVIDIA GeForce RTX 3060", 12288, 11000
+TELEMETRY = [{"index": 0, "name": "NVIDIA GeForce RTX 3060", "vendor": "nvidia", "vram_total": 12288 * 1024 * 1024}]
+
+
+def manager(tmp_path, devices, gpus=TELEMETRY, ram_mib=6000, monkeypatch=None):
+    from ollamapower.agent import rpc_manager
+    from ollamapower.agent.rpc_manager import RpcManager
+    from ollamapower.llamacpp.binaries import Device
+
+    rpc = RpcManager(AgentConfig(config_dir=tmp_path), lambda text: None)
+    rpc.binaries = types.SimpleNamespace(probe=lambda: None, devices=[Device(*d) for d in devices])
+    rpc.gpus = gpus
+    if monkeypatch is not None:
+        monkeypatch.setattr(rpc_manager, "cpu_cap_mib", lambda rules: ram_mib)
+    return rpc
+
+
+async def test_the_gpu_allow_list_uses_the_owners_gpu_numbers(tmp_path, monkeypatch):
+    from ollamapower.agent.config import LendingRules
+
+    rpc = manager(tmp_path, [IGPU, DGPU], monkeypatch=monkeypatch)
+    # "GPU 0" in the agent's views is the RTX 3060, even though llama.cpp calls it device 1.
+    assert (await rpc._choose("", LendingRules(gpus=[0])))[0] == "Vulkan1"
+    with pytest.raises(RpcRefused):
+        await rpc._choose("", LendingRules(gpus=[1]))  # no GPU 1 here, and the iGPU isn't one the owner listed
+
+
+async def test_a_dedicated_gpu_wins_over_an_integrated_one_with_more_shared_memory(tmp_path, monkeypatch):
+    from ollamapower.agent.config import LendingRules
+
+    rpc = manager(tmp_path, [IGPU, DGPU], monkeypatch=monkeypatch)
+    assert await rpc._choose("", LendingRules()) == ("Vulkan1", 11000, 12288)
+
+
+async def test_an_integrated_gpu_lends_no_more_than_the_ram_cpu_lending_would(tmp_path, monkeypatch):
+    from ollamapower.agent.config import LendingRules
+
+    rpc = manager(tmp_path, [IGPU], gpus=[], ram_mib=6000, monkeypatch=monkeypatch)
+    assert await rpc._choose("", LendingRules()) == ("Vulkan0", 6000, 32768)
+
+
 async def test_start_rechecks_lending_after_launching(agent):
     reasons = iter(["", "outside the lending schedule"])
     message = {"session_id": "s1", "tunnel": {"mode": "secure", "cert": HUB_CERT}}

@@ -353,8 +353,8 @@ class AgentClient:
     # ----- split mode ------------------------------------------------------------------
 
     async def _prepare_llamacpp(self) -> None:
-        vendors = [g.get("vendor", "") for g in self.state.static.get("gpus", []) if isinstance(g, dict)]
-        await self.rpc.prepare([v for v in vendors if v])
+        gpus = [g for g in self.state.static.get("gpus", []) if isinstance(g, dict)]
+        await self.rpc.prepare([v for g in gpus if (v := g.get("vendor", ""))], gpus)
         self.state.version += 1
         channel = self.channel
         if channel is not None and not channel.closed and self.state.connection == "connected":

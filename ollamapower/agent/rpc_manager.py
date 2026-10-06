@@ -30,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import socket
 import time
 from collections import deque
@@ -41,7 +40,7 @@ from typing import Any
 
 from ..aio import reap, wait_for
 from ..core.tunnel import TunnelError, TunnelIdentity, cert_fingerprint, check_cert_pem
-from ..llamacpp.binaries import Device, LlamaCpp
+from ..llamacpp.binaries import Device, LlamaCpp, llamacpp_env, telemetry_indexes
 from ..llamacpp.manager import LlamaCppUnavailable, ensure
 from ..textsafe import safe_text
 from .config import AgentConfig, LendingRules
@@ -110,8 +109,13 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def device_cap_mib(device: Device, index: int, rules: LendingRules) -> int | None:
-    """MiB of ``device`` the owner lends right now, or None if it isn't lent at all."""
+def device_cap_mib(device: Device, index: int | None, rules: LendingRules) -> int | None:
+    """MiB of ``device`` the owner lends right now, or None if it isn't lent at all.
+
+    ``index`` is the GPU's index as the owner sees it (telemetry's, see
+    ``telemetry_indexes``), which is what the ``gpus`` allow-list holds; a device
+    without one is lent only when the allow-list is empty (all GPUs).
+    """
     if rules.gpus and index not in rules.gpus:
         return None
     cap = device.free_mib
@@ -150,6 +154,7 @@ class RpcManager:
         self.error = ""
         self.progress: tuple[int, int] | None = None
         self.session: RpcSession | None = None
+        self.gpus: list[dict[str, Any]] = []  # the agent's telemetry GPUs: what the owner's GPU indexes refer to
         self.benches: dict[str, tuple[HelperRelay, EchoTarget, asyncio.TimerHandle]] = {}
         self._lock = asyncio.Lock()
 
@@ -159,9 +164,10 @@ class RpcManager:
 
     # ----- install -----------------------------------------------------------------------
 
-    async def prepare(self, gpu_vendors: list[str]) -> None:
+    async def prepare(self, gpu_vendors: list[str], gpus: list[dict[str, Any]] | None = None) -> None:
         """Install (or find) the pinned llama.cpp in the background; never raises."""
         self.status, self.error = "installing", ""
+        self.gpus = list(gpus or [])
 
         def progress(name: str, done: int, total: int) -> None:
             self.progress = (done, total)
@@ -212,17 +218,25 @@ class RpcManager:
     async def _choose(self, wanted: str, rules: LendingRules) -> tuple[str, int, int]:
         """(device name, MiB lent, MiB total) for the requested device, or the best one allowed."""
         devices = await self._fresh_devices()
-        lent = [(d, cap) for i, d in enumerate(devices) if (cap := device_cap_mib(d, i, rules)) is not None]
+        indexes = telemetry_indexes(devices, self.gpus)
+        lent = [
+            (d, cap) for d, i in zip(devices, indexes, strict=True) if (cap := device_cap_mib(d, i, rules)) is not None
+        ]
+        if any(d.integrated for d, _ in lent):
+            # An integrated GPU's memory is the system's RAM: lend no more of it than CPU lending would.
+            ram = await asyncio.to_thread(cpu_cap_mib, rules)
+            lent = [(d, min(cap, ram) if d.integrated else cap) for d, cap in lent]
         if wanted and wanted != "CPU":
             match = [(d, cap) for d, cap in lent if d.name == wanted]
             if not match:
                 raise RpcRefused(f"device {safe_text(wanted, 40)} is not lent by this helper")
             d, cap = match[0]
             return d.name, cap, d.total_mib
-        if wanted != "CPU" and lent:
-            d, cap = max(lent, key=lambda x: x[1])
-            if cap > 0:
-                return d.name, cap, d.total_mib
+        usable = [(d, cap) for d, cap in lent if cap > 0]
+        if wanted != "CPU" and usable:
+            # A dedicated GPU first, even a smaller one: an integrated GPU competes with the owner's programs for RAM.
+            d, cap = max([x for x in usable if not x[0].integrated] or usable, key=lambda x: x[1])
+            return d.name, cap, d.total_mib
         if rules.allow_cpu:
             cap = await asyncio.to_thread(cpu_cap_mib, rules)
             return "CPU", cap, cap
@@ -303,7 +317,7 @@ class RpcManager:
         if cache:
             self.cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             args.append("-c")
-        env = {**os.environ, "LLAMA_CACHE": str(self.cache_dir)}
+        env = {**llamacpp_env(), "LLAMA_CACHE": str(self.cache_dir)}
         last_error = ""
         for _ in range(3):  # another program may grab the port between choosing and binding it
             session.port = _free_port()

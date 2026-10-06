@@ -34,7 +34,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import secrets
 import socket
 import time
@@ -47,7 +46,8 @@ import httpx
 
 from ...aio import reap, wait_for
 from ...core.tunnel import TunnelError, TunnelIdentity, check_cert_pem
-from ...llamacpp.binaries import LlamaCpp
+from ...llamacpp import binaries as llamacpp_binaries
+from ...llamacpp.binaries import LlamaCpp, llamacpp_env, preferred
 from ...llamacpp.install import Pins
 from ...llamacpp.manager import LlamaCppUnavailable, ensure
 from ...ollama.blobs import ModelFiles, ModelUnavailable, resolve
@@ -156,6 +156,25 @@ class SplitSession:
 def _count(value: Any) -> bool:
     """A positive int (helpers' answers are untrusted)."""
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+SHARED_RAM_SHARE = 0.75  # at most this much of the RAM counts as an integrated GPU's memory (like Metal's limit)
+SHARED_RAM_KEEP = 2 * 1024 * MIB  # and RAM the system keeps for itself and the CPU layers
+
+
+def _shared_ram(free: bool) -> int:
+    import psutil
+
+    vm = psutil.virtual_memory()
+    return max(0, int(vm.available) - SHARED_RAM_KEEP) if free else int(vm.total * SHARED_RAM_SHARE)
+
+
+def _hub_device(d: llamacpp_binaries.Device, free: bool) -> Device:
+    """A hub GPU for the planner; an integrated GPU counts no more than the RAM it shares."""
+    size = (d.free_mib if free else d.total_mib) * MIB
+    if d.integrated:
+        size = min(size, _shared_ram(free))
+    return Device(f"hub {d.name}", size, device=d.name)
 
 
 def _free_port() -> int:
@@ -305,7 +324,7 @@ class SplitEngine:
         await self._release_ollama()
         # Measure free memory now, right before planning and launching (Ollama just let go).
         await asyncio.to_thread(binaries.probe)
-        hub_devices = [Device(f"hub {d.name}", d.free_mib * MIB, device=d.name) for d in binaries.devices]
+        hub_devices = [_hub_device(d, free=True) for d in preferred(binaries.devices)]
         by_node = {x.node.node_id: x for x in s.leases}
         devices = [
             Device(
@@ -371,7 +390,7 @@ class SplitEngine:
         will use), the hub's hardware facts before that.
         """
         if self.binaries is not None and self.binaries.devices:
-            return [Device(f"hub {d.name}", d.total_mib * MIB, device=d.name) for d in self.binaries.devices]
+            return [_hub_device(d, free=False) for d in preferred(self.binaries.devices)]
         return [
             Device(f"hub {g.get('name', 'GPU')}", int(g.get("vram_total") or 0))
             for g in self.hub.local_static.get("gpus", [])
@@ -536,7 +555,7 @@ class SplitEngine:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=str(binaries.llama_server.parent),
-            env={**os.environ, "LLAMA_API_KEY": s.api_key},
+            env={**llamacpp_env(), "LLAMA_API_KEY": s.api_key},
         )
         self._spawn(self._drain(s))
         s.client = httpx.AsyncClient(

@@ -184,6 +184,72 @@ def test_pins_file_covers_every_variant():
     assert used == set(pins.archives)
 
 
+@pytest.mark.parametrize(
+    "description,integrated",
+    [
+        ("NVIDIA GeForce RTX 4090", False),
+        ("AMD Radeon RX 7900 XTX (RADV NAVI31)", False),
+        ("AMD Radeon RX 6800M", False),
+        ("Intel(R) Arc(TM) A770 Graphics", False),
+        ("Intel(R) UHD Graphics 770", True),
+        ("Intel(R) Iris(R) Xe Graphics", True),
+        ("Intel(R) Arc(TM) Graphics", True),  # Meteor Lake's iGPU has no model number
+        ("AMD Radeon Graphics (RADV GFX1103_R1)", True),
+        ("AMD Radeon 780M Graphics", True),
+        ("AMD Radeon(TM) 8060S Graphics", True),
+        ("NVIDIA GB10", True),
+        ("Apple M2 Max", True),
+    ],
+)
+def test_integrated_gpus_are_recognised(description, integrated):
+    from ollamapower.llamacpp.binaries import Device
+
+    assert Device("Vulkan0", description, 16384, 16000).integrated is integrated
+
+
+def test_llama_cpp_devices_are_matched_to_the_owners_gpu_numbers():
+    from ollamapower.llamacpp.binaries import Device, telemetry_indexes
+
+    gib = 1024**3
+    # CUDA (without PCI order) puts the fastest first; NVML numbers by PCI bus.
+    devices = [
+        Device("CUDA0", "NVIDIA GeForce RTX 4090", 24076, 23000),
+        Device("CUDA1", "NVIDIA GeForce RTX 3060", 12002, 11000),
+    ]
+    nvml = [
+        {"index": 0, "name": "NVIDIA GeForce RTX 3060", "vram_total": 12 * gib},
+        {"index": 1, "name": "NVIDIA GeForce RTX 4090", "vram_total": 24 * gib},
+    ]
+    assert telemetry_indexes(devices, nvml) == [1, 0]
+    # AMD's sysfs name differs from Vulkan's: the memory size decides.
+    devices = [
+        Device("Vulkan0", "AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO)", 30000, 29000),
+        Device("Vulkan1", "AMD Radeon RX 7900 XTX (RADV NAVI31)", 24560, 24000),
+    ]
+    sysfs = [{"index": 0, "name": "AMD GPU", "vram_total": 24 * gib}]
+    assert telemetry_indexes(devices, sysfs) == [None, 0]
+    # No telemetry GPUs: the dedicated devices in llama.cpp's order.
+    assert telemetry_indexes(devices, []) == [None, 0]
+
+
+def test_llama_cpp_runs_with_pci_device_order(tmp_path, monkeypatch):
+    import subprocess
+
+    from ollamapower.llamacpp.binaries import LlamaCpp
+
+    seen = {}
+
+    def run(args, **kw):
+        seen.update(kw["env"])
+        return subprocess.CompletedProcess(args, 0, "version: x (build 7, commit y)\n", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    (tmp_path / "llama-server").write_text("")
+    (tmp_path / "rpc-server").write_text("")
+    LlamaCpp.find(tmp_path).probe()
+    assert seen["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"  # CUDA numbers GPUs like NVML and the owner's views
+
+
 def test_backend_choice():
     assert resolve_backend("auto", "macos", "arm64", []) == "metal"
     assert resolve_backend("auto", "macos", "x64", []) == "cpu"
