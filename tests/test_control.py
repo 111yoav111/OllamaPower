@@ -486,6 +486,40 @@ async def test_stopping_the_agent_ends_its_background_work(setup):
     assert all(t.done() for t in background)  # nothing the hub asked for outlives the agent
 
 
+async def _tunnel_test_started(setup, agent) -> tuple:
+    got = []
+    setup.hub.control.on_rpc = lambda node, m: got.append(m)
+    await setup.node().channel.send(
+        "rpc_start",
+        session_id="bench-0001",
+        device="",
+        vram_cap_mb=0,
+        cache=False,
+        tunnel={"mode": "direct"},
+        purpose="bench",
+    )
+    assert await until(lambda: got)
+    assert got[0]["type"] == "rpc_ready"
+    relay, target, _ = agent.rpc.benches["bench-0001"]
+    return relay, target
+
+
+@pytest.mark.parametrize("how", ["agent stops", "hub connection lost"])
+async def test_tunnel_tests_end_with_the_agent_or_the_connection(setup, how):
+    agent = setup.agent(allow_direct=True)
+    task = setup.run(agent)
+    assert await until(lambda: setup.node() is not None and setup.node().connected)
+    relay, target = await _tunnel_test_started(setup, agent)
+    if how == "agent stops":
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    else:
+        await setup.hub.control.kick(setup.node())
+        assert await until(lambda: agent.state.connection != "connected")
+    assert await until(lambda: not agent.rpc.benches, 2)  # not left listening until the two-minute expiry
+    assert relay.closed and not target.server.is_serving()
+
+
 async def test_outside_allowed_networks_is_dropped(tmp_path, hub_key):
     s = Setup(tmp_path, hub_key, allowed_networks=["10.0.0.0/8"])
     await s.start()

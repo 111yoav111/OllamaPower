@@ -437,6 +437,12 @@ class RpcManager:
             self.note(f"stopped lending to the hub ({reason})")
             return True
 
+    async def stop_all(self, reason: str) -> None:
+        """Stop the split session and every tunnel test: the hub that asked for them is gone."""
+        for session_id in list(self.benches):
+            self.stop_bench(session_id)
+        await self.stop(reason=reason)
+
     async def _stop(self, session: RpcSession, reason: str) -> None:
         session.stopping = True
         if session.relay is not None:

@@ -228,6 +228,14 @@ async def test_rpc_server_dying_while_the_session_starts_is_reported_once(agent)
     assert agent.channel.kinds("s1") == ["rpc_error"]
 
 
+async def test_a_tunnel_test_started_as_the_hub_leaves_is_stopped(agent):
+    agent.client.config.lending.allow_direct = True
+    agent.channel.closed = True  # gone before rpc_ready can be sent
+    message = {"type": "rpc_start", "session_id": "b1", "purpose": "bench", "tunnel": {"mode": "direct"}}
+    await wait_for(agent.client._rpc_start(agent.channel, message), 5)
+    assert agent.rpc.benches == {}
+
+
 async def test_a_slow_rpc_stop_does_not_hold_up_the_receive_loop(agent):
     start = agent.start()
     await agent.launching.wait()

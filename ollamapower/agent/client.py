@@ -170,8 +170,8 @@ class AgentClient:
                 await self._reap_background()
                 raise
             finally:
-                # Without the hub there is no one to lend to: end any split session.
-                await asyncio.shield(self.rpc.stop(reason="hub connection lost"))
+                # Without the hub there is no one to lend to: end any split session and tunnel test.
+                await self._stop_lending("hub connection lost")
                 if self.channel is not None:
                     await self.channel.close()
                     self.channel = None
@@ -179,6 +179,16 @@ class AgentClient:
             self.state.connection = "retrying"
             self.state.version += 1
             await asyncio.sleep(delay)
+
+    async def _stop_lending(self, reason: str) -> None:
+        """Stop every rpc-server and relay, and finish doing so even if we are cancelled meanwhile."""
+        task = asyncio.ensure_future(self.rpc.stop_all(reason))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                await task  # bounded by STOP_GRACE; then let the cancellation continue
+            raise
 
     async def _connect_and_serve(self) -> float:
         self.state.connection = "connecting"
@@ -374,7 +384,8 @@ class AgentClient:
         try:
             await channel.send("rpc_ready", session_id=m["session_id"], endpoint=endpoint)
         except Exception:  # noqa: BLE001 - the hub is gone: don't keep lending
-            await self.rpc.stop(m["session_id"], "hub connection lost")
+            if not self.rpc.stop_bench(m["session_id"]):
+                await self.rpc.stop(m["session_id"], "hub connection lost")
 
     async def _rpc_failed(self, session_id: str, error: str) -> None:
         self.state.version += 1
