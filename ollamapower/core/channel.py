@@ -28,6 +28,8 @@ PRE_AUTH_MAX_FRAME = 64 * 1024
 # Decompressed size of one message from an authenticated peer: 4x the largest legitimate one
 # (a 4 MiB network-test chunk), far below what would hurt the hub.
 MAX_PAYLOAD = 16 * 1024 * 1024
+# Compressed payloads up to this size are decoded on the loop (bounded by the container budget).
+INLINE_DECODE = 4096
 BYE_GRACE = 1.0  # seconds a peer gets to hang up after our bye
 
 
@@ -66,8 +68,9 @@ class Channel:
         packet = await read_one_packet(self.reader, self.crypto)
         if packet is None:
             return None
-        if self.max_payload <= PRE_AUTH_MAX_FRAME:
-            return protocol.decode(packet, self.peer_role, self.max_payload)  # small enough to do inline
+        if self.max_payload <= PRE_AUTH_MAX_FRAME or len(getattr(packet, "raw_payload", b"")) <= INLINE_DECODE:
+            # Small enough to do inline: a thread hop per heartbeat would only add latency.
+            return protocol.decode(packet, self.peer_role, self.max_payload)
         return await asyncio.to_thread(protocol.decode, packet, self.peer_role, self.max_payload)
 
     async def close(self, reason: str | None = None) -> None:
