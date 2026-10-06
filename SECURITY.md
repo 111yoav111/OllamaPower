@@ -42,8 +42,8 @@ an attacker who already runs code as the owner on the Hub or a helper.
   be the front door's own port. `doctor` flags Ollama's port answering on any
   non-loopback interface and a non-loopback `OLLAMA_HOST`.
 - **Header hygiene.** Requests reach Ollama with the client's headers except
-  hop-by-hop ones, `Host`, `Content-Length`, cookies and every
-  `X-OllamaPower-*` header; Ollama needs the rest (Origin for its CORS check,
+  hop-by-hop ones, `Host`, `Content-Length`, `Accept-Encoding`, `Expect`,
+  cookies and every `X-OllamaPower-*` header; Ollama needs the rest (Origin for its CORS check,
   Authorization and Content-Encoding for its Codex and cloud proxies).
   Responses come back with Ollama's headers except hop-by-hop ones,
   `Set-Cookie`, `Server` and `Date`. No docs/OpenAPI routes, unknown paths `404`.
@@ -56,7 +56,7 @@ an attacker who already runs code as the owner on the Hub or a helper.
 - **Owner-only files.** `.env`, `state.json`, its backup and the logs are
   `0600` in a `0700` directory, written atomically; symlinked or foreign-owned
   directories are refused. `doctor` checks the permissions. `hub` refuses to
-  run as root.
+  run as root unless started with `--allow-root`.
 - **Admin channel.** `status` reaches the hub only over a local channel (Unix
   socket `0600`, or `127.0.0.1` on Windows) keyed by a 256-bit secret in an
   owner-only file. The secret never crosses the channel: the hub sends a fresh
@@ -72,8 +72,10 @@ as it could use Ollama directly before.
 - **Who may connect.** The control port (9000) drops connections from outside
   `control.allowed_networks` (private ranges, loopback and CGNAT/Tailscale by
   default) before sending a single byte; `doctor` warns if public ranges are
-  added. At most `max_nodes` handshakes run at once and each must finish
-  within 10 s.
+  added. At most `max_nodes` handshakes run at once, at most
+  `max_pending_per_ip` (4) of them from one IP, and each must finish (RSA
+  exchange and hello) within `handshake_timeout` (10 s) of the connection
+  being accepted.
 - **The hub can't be impersonated.** The hub's RSA key is persistent
   (`hub_key.pem`, owner-only) and agents pin its SHA-256 fingerprint on first
   use (`known_hub`), after the owner compared it with what the hub prints, or
@@ -83,13 +85,17 @@ as it could use Ollama directly before.
 - **Token.** Checked in constant time inside the encrypted session; a wrong
   token stops the agent (no retry loop).
 - **Failed logins are banned.** 5 failures (bad token, malformed or oversized
-  handshake, timeout) from one IP in 10 minutes ban it for 10 minutes,
+  handshake, timeout, a handshake abandoned before the hello, going over the
+  per-IP handshake limit) from one IP in 10 minutes ban it for 10 minutes,
   doubling on repeat up to a day. Banned IPs are dropped before the handshake.
+  A successful login clears that IP's count (not an active ban), so a helper
+  that hangs up once to ask its owner about the hub's key isn't penalised.
 - **Nothing large before authentication.** Frames are capped at 64 KB until
   the token checks out.
 - **Strict protocol.** One module defines every message, its direction and
   field types; anything else drops the connection. Protocol majors must match
-  (an outdated helper is shown as incompatible, with the fix).
+  (an outdated helper is shown as incompatible, with the fix; a helper newer
+  than its hub says the hub needs updating).
 - **Agent reports are untrusted.** Capabilities, telemetry and test results
   are bounded in size and depth and made terminal-safe before the hub stores
   or shows them. Agents can't make the hub run anything.
@@ -101,7 +107,7 @@ as it could use Ollama directly before.
   Hub's engine (split mode). There is no way for the Hub to make a helper run
   Ollama or any other program than the pinned, hash-checked `rpc-server`, and
   the Hub chooses none of its arguments beyond one of the devices the owner
-  lends.
+  lends and, only if the owner allows it (`disk_cache`), the disk cache.
 
 ### Split mode (Phase 3)
 
@@ -118,7 +124,8 @@ as it could use Ollama directly before.
   that listens only on the interface the hub connects from and only during a
   session, accepts at most 8 connections, and drops any connection that
   doesn't come from the hub's address **on the raw socket, before reading a
-  byte or doing any TLS work**.
+  byte or doing any TLS work**. The limit counts each connection from accept
+  (TLS handshake included) until it is closed.
 - **The helper's owner keeps control.** The agent checks every `rpc_start`
   itself against its own rules (paused, GPU allow-list, CPU lending, direct
   mode, VRAM cap) instead of trusting the Hub. Pausing or changing the rules
@@ -162,7 +169,7 @@ as it could use Ollama directly before.
   the tunnel. On Linux the relay checks (via `/proc/net/tcp`) that each
   connection comes from a process of the user running the hub and refuses
   anyone else, so other local users can't reach a helper's `rpc-server`
-  through it.
+  through it. It relays at most 16 connections at once.
 - **Overhead is measured, not guessed.** `nodes tunnel-test` measures the real
   path in both modes so the owner can decide; see `docs/BENCHMARKS.md`.
 
@@ -208,19 +215,27 @@ as it could use Ollama directly before.
 - **Encrypted control plane.** Every packet after the handshake is one
   AES-256-GCM frame with a fresh random 96-bit nonce (tested for uniqueness);
   tampered or truncated frames, and frames from another session, fail
-  authentication and drop the connection. The session key is sent to the Hub
-  with RSA-2048 OAEP-SHA256.
+  authentication and drop the connection. The helper picks a random 256-bit
+  secret and sends it to the Hub with RSA-2048 OAEP-SHA256; the session key
+  is derived from it with HKDF-SHA256, salted with a fresh random nonce from
+  each side (control protocol 2).
 - **No replay, reordering or reflection.** Each frame is bound (as GCM
   associated data) to its sender's role and a per-direction counter, so a
   frame re-sent, reordered or bounced back to its sender is rejected. Frames
   are encrypted under the connection's write lock, so concurrent senders can't
-  put them on the wire out of order.
-- **Nothing large before authentication.** Until the token is checked only the
-  fixed 12-byte control packets are read in plaintext.
+  put them on the wire out of order. Because the Hub's nonce goes into every
+  session key, a whole recorded session replayed to the Hub later gets a
+  different key and fails on its first frame (counted as a failed login).
+  Protocol-1 helpers, which don't use the nonce, are only ever told to
+  update, never admitted.
+- **Nothing large before authentication.** Until the token is checked the hub
+  reads one plaintext handshake blob of at most 10 KB, then encrypted frames
+  of at most 64 KB whose decompressed payload is also capped at 64 KB.
 - **Safe deserialisation.** Payloads are msgpack dicts (never pickle);
-  extension types stay inert data. Decompressed payloads are capped at 64 MB,
-  so a small zstd "bomb" can't exhaust memory, and every size field is
-  bounded before anything is allocated.
+  extension types stay inert data. Decompressed payloads are capped (64 KB
+  before authentication, 16 MB on the control channel after it, 64 MB for any
+  packet), so a small zstd "bomb" can't exhaust memory, and every size field
+  is bounded before anything is allocated.
 - **Token auth.** Helpers prove membership with a 256-bit token from
   `secrets`, sent only inside the encrypted session and compared in constant
   time. Empty or short tokens are refused.
@@ -231,6 +246,14 @@ as it could use Ollama directly before.
   moment a helper connects for the very first time *and* the owner confirms
   without comparing fingerprints, the helper trusts the wrong hub. Compare the
   fingerprint, or pass it with `--hub-fingerprint`.
+- **No forward secrecy on the control plane.** Session keys come from a secret
+  wrapped with the hub's long-term RSA key, so someone who recorded control
+  traffic *and* later steals `hub_key.pem` can decrypt it, cluster token
+  included. Keep `hub_key.pem` owner-only; if it leaks, make a new key and
+  token. (Split-mode TLS 1.3 uses ephemeral keys and is not affected.)
+- **Per-IP handshake limits are per address.** A LAN host that can use many
+  IPv6 addresses gets that many allowances; the global `max_nodes` cap on
+  unfinished handshakes still applies.
 - **Network-test throughput** runs over the encrypted control channel, so it
   understates a fast link; `nodes tunnel-test` measures the split-mode path.
 - **Direct mode is unencrypted by design.** When both owners opt in, model
