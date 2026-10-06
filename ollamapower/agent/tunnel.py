@@ -29,6 +29,7 @@ import ssl
 import time
 
 from ..core.tunnel import TLS_HANDSHAKE_TIMEOUT, TunnelError, check_peer, splice
+from ..netsock import listen_socket
 
 log = logging.getLogger("ollamapower.agent.tunnel")
 
@@ -76,11 +77,7 @@ class HelperRelay:
     async def start(self, bind_ip: str) -> int:
         # Our own accept loop instead of asyncio.start_server: the peer's address is
         # checked on the raw socket, and TLS starts on a socket nobody has read from yet.
-        family = socket.AF_INET6 if ":" in bind_ip else socket.AF_INET
-        listener = socket.socket(family, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((bind_ip, 0))
-        listener.listen(MAX_CONNECTIONS)
+        listener = listen_socket(bind_ip, 0, backlog=MAX_CONNECTIONS)  # exclusive on Windows
         listener.setblocking(False)
         self.listener = listener
         self.port = listener.getsockname()[1]

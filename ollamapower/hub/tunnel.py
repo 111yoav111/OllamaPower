@@ -36,6 +36,7 @@ from ..core.tunnel import (
     same_user_on_loopback,
     splice,
 )
+from ..netsock import listen_socket
 
 log = logging.getLogger("ollamapower.tunnel")
 
@@ -101,7 +102,7 @@ class HubRelay:
         self.last_error = ""
 
     async def start(self) -> int:
-        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.server = await asyncio.start_server(self._handle, sock=listen_socket("127.0.0.1", 0))
         self.port = self.server.sockets[0].getsockname()[1]
         return self.port
 

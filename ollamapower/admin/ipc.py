@@ -41,6 +41,7 @@ from typing import Any
 
 from ..aio import wait_for
 from ..files import private_dir, write_private
+from ..netsock import listen_socket
 
 log = logging.getLogger("ollamapower.admin")
 
@@ -238,7 +239,7 @@ async def start_control_server(config_dir: Path, handler: Handler, name: str = "
         info: dict[str, Any] = {"transport": "unix", "path": str(sock_path)}
     else:
         sock_path = None
-        server = await asyncio.start_server(on_connect, host="127.0.0.1", port=0, limit=MAX_MESSAGE)
+        server = await asyncio.start_server(on_connect, sock=listen_socket("127.0.0.1", 0), limit=MAX_MESSAGE)
         info = {"transport": "tcp", "port": server.sockets[0].getsockname()[1]}
     info.update(secret=secret, pid=os.getpid())
     write_private(info_path, json.dumps(info).encode())

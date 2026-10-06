@@ -154,6 +154,7 @@ def hub(
     from .hub.frontdoor.app import create_app
     from .hub.frontdoor.server import build_server
     from .hub.runtime import Hub
+    from .netsock import address_in_use, listen_socket
     from .state import StateError, StateStore
 
     config = load(config_path)
@@ -198,8 +199,13 @@ def hub(
     app = create_app(the_hub)
     server = build_server(the_hub, app, own_logging=False)
     try:
-        sock = server.config.bind_socket()  # bind now so "address in use" is reported clearly
-    except SystemExit:
+        # Bind now so "address in use" is reported clearly. Not uvicorn's bind_socket():
+        # its SO_REUSEADDR lets Windows bind a port Ollama is still listening on.
+        sock = listen_socket(config.hub.host, config.hub.port)
+    except OSError as exc:
+        if not address_in_use(exc):
+            typer.secho(f"Cannot listen on {config.frontdoor_url}: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(1) from None
         typer.secho(
             f"Cannot listen on {config.frontdoor_url}: the port is in use. If Ollama still runs there, "
             "run `ollamapower doctor` for the steps to move it to port 11435.",
@@ -256,10 +262,11 @@ def _control_socket(host: str, port: int) -> Any:
     """Listen for helpers. "All interfaces" means IPv4 *and* IPv6 where the OS allows one dual-stack socket."""
     import socket
 
+    from .netsock import listen_socket
+
     if host in ("0.0.0.0", "::", "") and socket.has_dualstack_ipv6():
-        return socket.create_server(("::", port), family=socket.AF_INET6, dualstack_ipv6=True)
-    family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    return socket.create_server((host, port), family=family)
+        return listen_socket("::", port, dualstack=True)
+    return listen_socket(host, port)
 
 
 async def _run_hub_tui(the_hub: Any, server: Any, server_task: Any, log_lines: deque[str], level: str) -> None:
