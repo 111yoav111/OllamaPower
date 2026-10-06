@@ -56,7 +56,9 @@ an attacker who already runs code as the owner on the Hub or a helper.
 - **Owner-only files.** `.env`, `state.json`, its backup and the logs are
   `0600` in a `0700` directory, written atomically; symlinked or foreign-owned
   directories are refused. `doctor` checks the permissions. `hub` refuses to
-  run as root unless started with `--allow-root`.
+  run as root unless started with `--allow-root`. On Windows the files rely on
+  the user profile's ACL instead; `doctor` warns when `OLLAMAPOWER_CONFIG_DIR`
+  moves them outside it.
 - **Admin channel.** `status` reaches the hub only over a local channel (Unix
   socket `0600`, or `127.0.0.1` on Windows) keyed by a 256-bit secret in an
   owner-only file. The secret never crosses the channel: the hub sends a fresh

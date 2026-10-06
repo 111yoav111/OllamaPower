@@ -13,6 +13,7 @@ import os
 import socket
 import sys
 from dataclasses import dataclass
+from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 
 import httpx
@@ -218,9 +219,33 @@ def check_token(config: Config) -> list[Finding]:
     return [Finding("ok", f"{TOKEN_ENV} is set and strong")]
 
 
-def check_permissions(config: Config) -> list[Finding]:
-    if sys.platform == "win32":
-        return [Finding("ok", "File permissions: per-user profile folder (not checked on Windows)")]
+def windows_dir_is_private(config_dir: Path | str, home: Path | str) -> bool:
+    """Is ``config_dir`` inside the user's profile (``C:\\Users\\<name>``)?
+
+    Windows doesn't use the POSIX modes ``write_private`` sets. Files are private
+    because the profile folder's ACL admits only its owner (and admins), and new
+    files inherit that. A config dir moved elsewhere with ``OLLAMAPOWER_CONFIG_DIR``
+    (``D:\\OllamaPower``, ``C:\\OllamaPower``) inherits that drive's ACL, which
+    usually lets every local user read the token and the hub key.
+    """
+    d, h = PureWindowsPath(config_dir), PureWindowsPath(home)  # compared case-insensitively
+    return d == h or h in d.parents
+
+
+def check_permissions(config: Config, platform: str = sys.platform, home: Path | None = None) -> list[Finding]:
+    if platform == "win32":
+        d = config.config_dir
+        full = d if PureWindowsPath(d).is_absolute() else os.path.abspath(d)
+        if windows_dir_is_private(full, home or Path.home()):
+            return [Finding("ok", "File permissions: inside your user profile, which only you can read")]
+        return [
+            Finding(
+                "warn",
+                f"{d} is outside your user profile: other users of this PC may be able to read the token and keys",
+                "Use the default config dir (unset OLLAMAPOWER_CONFIG_DIR), or restrict this one: "
+                f'icacls "{d}" /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"',
+            )
+        ]
     findings = []
     d = config.config_dir
     paths = [

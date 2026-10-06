@@ -89,6 +89,28 @@ def test_permission_checks(make_config):
     assert bad[0].level == "error" and "chmod 600" in bad[0].fix
 
 
+@pytest.mark.parametrize(
+    ("config_dir", "private"),
+    [
+        (r"C:\Users\Ann\AppData\Roaming\ollamapower", True),
+        (r"c:\users\ann\AppData\Roaming\ollamapower", True),  # NTFS paths are case-insensitive
+        (r"C:\Users\Ann", True),
+        (r"C:\Users\Annabel\ollamapower", False),  # another user's profile, not a subfolder of ours
+        (r"D:\OllamaPower", False),
+        (r"C:\OllamaPower", False),
+    ],
+)
+def test_windows_config_dir_must_stay_in_the_profile(make_config, config_dir, private):
+    from pathlib import Path
+
+    assert doctor.windows_dir_is_private(config_dir, r"C:\Users\Ann") is private
+    cfg = make_config("http://127.0.0.1:11435")
+    cfg.config_dir = Path(config_dir)
+    [finding] = doctor.check_permissions(cfg, "win32", Path(r"C:\Users\Ann"))
+    assert finding.level == ("ok" if private else "warn")
+    assert private or "icacls" in finding.fix
+
+
 def test_control_checks(make_config):
     cfg = make_config("http://127.0.0.1:11435")
     assert [f.level for f in doctor.check_control(cfg)] == ["ok", "warn"]  # no hub key yet
