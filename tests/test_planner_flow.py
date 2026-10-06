@@ -145,6 +145,43 @@ def test_phase3_plans_still_mean_split(book):
     assert spec is not None and spec.ctx == 2048 and spec.helpers is None
 
 
+def test_the_facts_and_split_mode_use_one_fits_on_hub_check(book):
+    """The facts' verdict (worth benchmarking?) and split mode's start check (Ollama is faster?) must agree."""
+    from ollamapower.hub.planner import GIB, fits_on_hub
+    from ollamapower.llamacpp.binaries import Device as LlamaDevice
+    from ollamapower.llamacpp.binaries import LlamaCpp
+    from ollamapower.ollama.gguf import GGUFInfo
+
+    plans, hub, _ = book
+    info = GGUFInfo(
+        path=None,  # type: ignore[arg-type]
+        file_size=0,
+        version=3,
+        architecture="llama",
+        block_count=40,
+        embedding_length=8192,
+        head_count=64,
+        head_count_kv=8,
+        feed_forward_length=28672,
+        layer_bytes=[GIB // 4] * 40,
+        output_bytes=GIB // 2,
+    )
+    base = {"splittable": True, "weights": info.weights_bytes, "reason": ""}
+    plans.gguf_cache["d1"] = info
+    margin, ctx = hub.config.planner.memory_margin, plans.ctx_for("big:70b")
+    verdicts = set()
+    for vram_gib in [x / 4 for x in range(36, 64)]:
+        hub.local_static = {"gpus": [{"name": "G", "vram_total": int(vram_gib * GIB)}]}
+        facts = plans._with_vram(base, "big:70b")
+        assert facts["fits"] == fits_on_hub(info, ctx, hub.split.hub_devices(), margin), vram_gib
+        verdicts.add(facts["fits"])
+    assert verdicts == {True, False}  # the sweep crosses the boundary
+    # Once llama.cpp is installed its device list is what both checks look at.
+    hub.split.binaries = LlamaCpp(root=None, devices=[LlamaDevice("CUDA0", "big", 80 * 1024, 70 * 1024)])  # type: ignore[arg-type]
+    assert plans._with_vram(base, "big:70b")["fits"] is True
+    assert [d.device for d in hub.split.hub_devices()] == ["CUDA0"]
+
+
 def test_benchmark_prompt_is_unique_and_sized():
     a, b = make_prompt(512), make_prompt(512)
     assert a != b and 300 < len(a.split()) < 450

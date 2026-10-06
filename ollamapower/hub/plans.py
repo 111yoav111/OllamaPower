@@ -39,6 +39,7 @@ from ..llamacpp.install import Pins
 from ..ollama.blobs import ModelUnavailable, resolve
 from ..ollama.gguf import GGUFInfo
 from ..textsafe import safe_text
+from .planner import fits_on_hub, hub_need
 
 if TYPE_CHECKING:
     from .runtime import Hub
@@ -282,16 +283,15 @@ class PlanBook:
         from .runtime import model_key
 
         out = dict(base)
-        hub_vram = sum(int(g.get("vram_total") or 0) for g in self.hub.local_static.get("gpus", []))
-        out["hub_vram"] = hub_vram
+        hub = self.hub.split.hub_devices()
+        out["hub_vram"] = sum(d.free for d in hub)
         ctx = self.ctx_for(model)
-        if base.get("splittable"):
-            info = self.gguf_cache.get(self.digest_of(model) or model)
-            kv = info.kv_bytes_total(ctx) if info is not None else 0
-            out["kv"] = kv
-            needed = int((base["weights"] + kv) * (1 + self.config.planner.memory_margin))
-            out["needed"] = needed
-            out["fits"] = hub_vram > 0 and needed <= hub_vram
+        info = self.gguf_cache.get(self.digest_of(model) or model)
+        if base.get("splittable") and info is not None:
+            margin = self.config.planner.memory_margin
+            out["kv"] = info.kv_bytes_total(ctx)
+            out["needed"] = hub_need(info, ctx, margin)
+            out["fits"] = fits_on_hub(info, ctx, hub, margin)  # the same check split mode starts with
         else:
             out["fits"] = None
         loaded = next((m for m in self.hub.ollama.models if model_key(m.name) == model_key(model)), None)

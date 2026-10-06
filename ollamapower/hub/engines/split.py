@@ -283,8 +283,7 @@ class SplitEngine:
         info = s.files.gguf
         assert info is not None
         binaries = await self._ensure_llamacpp()
-        hub_devices = [Device(f"hub {d.name}", d.total_mib * MIB, device=d.name) for d in binaries.devices]
-        if fits_on_hub(info, s.ctx, hub_devices):
+        if fits_on_hub(info, s.ctx, self.hub_devices(), self.config.planner.memory_margin):
             raise SplitUnavailable(f"{s.model} fits on the hub's GPU alone, so Ollama runs it faster without helpers")
 
         helpers, reasons = self.candidates()
@@ -318,7 +317,7 @@ class SplitEngine:
             for x in s.leases
         ]
         try:
-            s.plan = plan_split(s.model, info, s.ctx, hub_devices, devices)
+            s.plan = plan_split(s.model, info, s.ctx, hub_devices, devices, self.config.planner.memory_margin)
         except PlanError as exc:
             raise SplitUnavailable(str(exc)) from None
         # Helpers that got no layers are released now; the rest in llama.cpp's device order (= --rpc order).
@@ -364,6 +363,20 @@ class SplitEngine:
         if self.binaries.llama_server is None:
             raise SplitUnavailable("llama-server is missing from the hub's llama.cpp")
         return self.binaries
+
+    def hub_devices(self) -> list[Device]:
+        """The hub's GPUs at their total memory: what "fits on the hub" is judged against, everywhere.
+
+        llama.cpp's own device list once it is installed (that is what llama-server
+        will use), the hub's hardware facts before that.
+        """
+        if self.binaries is not None and self.binaries.devices:
+            return [Device(f"hub {d.name}", d.total_mib * MIB, device=d.name) for d in self.binaries.devices]
+        return [
+            Device(f"hub {g.get('name', 'GPU')}", int(g.get("vram_total") or 0))
+            for g in self.hub.local_static.get("gpus", [])
+            if isinstance(g, dict) and int(g.get("vram_total") or 0) > 0
+        ]
 
     def candidates(self) -> tuple[list[Node], list[str]]:
         """Helpers that may take part now (best first), and why the others can't."""

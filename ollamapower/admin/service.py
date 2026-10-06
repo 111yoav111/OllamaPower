@@ -12,7 +12,7 @@ from typing import Any
 
 from ..hub.control_server import NetTestError
 from ..hub.nodes import TUNNEL_MODES, Node
-from ..hub.planner import MIB, Device, fits_on_hub
+from ..hub.planner import MIB, fits_on_hub
 from ..hub.runtime import Hub, model_key
 from ..ollama.blobs import ModelUnavailable, resolve
 from .ipc import AdminError
@@ -38,7 +38,7 @@ class Admin:
 
     def models(self) -> list[dict[str, Any]]:
         """Installed models: size, whether they fit the hub's VRAM, the engine that serves them and why."""
-        hub_vram = sum(g.get("vram_total", 0) for g in self.hub.local_static.get("gpus", []))
+        hub_vram = sum(d.free for d in self.hub.split.hub_devices())
         loaded = {model_key(m.name): m for m in self.hub.ollama.models}
         plans = self.hub.plans
         out = []
@@ -132,14 +132,10 @@ class Admin:
         ctx = ctx or hub.config.split.default_ctx
         key = model_key(model)
         hub.plans.pin(key, "split", ctx)
-        hub_gpus = [
-            Device(f"hub {g.get('name', 'GPU')}", int(g.get("vram_total", 0)))
-            for g in hub.local_static.get("gpus", [])
-            if isinstance(g, dict)
-        ]
+        hub_gpus = split.hub_devices()
         helpers, reasons = split.candidates()
         notes = []
-        if hub_gpus and fits_on_hub(info, ctx, hub_gpus):
+        if fits_on_hub(info, ctx, hub_gpus, hub.config.planner.memory_margin):
             notes.append("it fits on the hub's GPU alone, so Ollama keeps serving it (split mode would be slower)")
         if files.vision:
             notes.append("images won't work while it runs in split mode (text only)")

@@ -163,17 +163,29 @@ def _fill(units: list[int], devices: list[Device]) -> tuple[list[tuple[Device, i
     return placed, top
 
 
-def fits_on_hub(info: GGUFInfo, ctx: int, hub: list[Device]) -> bool:
-    _, cpu = _fill(unit_sizes(info, ctx), with_reserve(hub, info, ctx))
+def hub_need(info: GGUFInfo, ctx: int, margin: float = 0.0) -> int:
+    """GPU memory ``info`` needs at ``ctx`` on one device: layers, caches, reserve, with ``margin`` on top."""
+    return int(sum(unit_sizes(info, ctx)) * (1 + margin)) + device_reserve(info, ctx)
+
+
+def fits_on_hub(info: GGUFInfo, ctx: int, hub: list[Device], margin: float = 0.0) -> bool:
+    """THE check "does the model fit on the hub's GPUs alone?" - the facts, the split start and the
+    planner all use it, so they never disagree (a model one says fits and another says doesn't would be
+    benchmarked, refused, and benchmarked again). ``margin`` (planner.memory_margin) is added to every
+    layer, as safety against the estimate being low."""
+    units = [int(u * (1 + margin)) for u in unit_sizes(info, ctx)]
+    _, cpu = _fill(units, with_reserve(hub, info, ctx))
     return bool(hub) and cpu == 0
 
 
-def plan_split(model: str, info: GGUFInfo, ctx: int, hub: list[Device], helpers: list[Device]) -> SplitPlan:
+def plan_split(
+    model: str, info: GGUFInfo, ctx: int, hub: list[Device], helpers: list[Device], margin: float = 0.0
+) -> SplitPlan:
     """Place ``model``: the hub's GPUs first, then ``helpers`` in the given order of preference."""
     if ctx <= 0:
         raise PlanError("the context size must be positive")
     units = unit_sizes(info, ctx)
-    if fits_on_hub(info, ctx, hub):
+    if fits_on_hub(info, ctx, hub, margin):
         raise PlanError(f"{model} fits on the hub's GPU alone; Ollama runs it faster without helpers")
     order = with_reserve([*reversed(helpers), *hub], info, ctx)  # the best helper sits next to the hub's GPUs
     placed, cpu = _fill(units, order)
