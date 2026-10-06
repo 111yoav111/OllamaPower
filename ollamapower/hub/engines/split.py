@@ -764,11 +764,15 @@ class SplitEngine:
         finally:
             # Shutdown: abandon starts in progress (not a plan failure), finish background
             # stops and drains, then stop what is left - under the lock, like every stop.
-            await reap(*self._acquire_tasks, *self._tasks)
-            async with self._lock:
-                s = self.session
-                if s is not None:
-                    await self._stop(s, "hub shutting down")
+            try:
+                await reap(*self._acquire_tasks, *self._tasks)
+            finally:
+                # reap re-raises our own cancellation once the tasks are done: the stop
+                # must still happen, or llama-server and the helpers' VRAM outlive the hub.
+                async with self._lock:
+                    s = self.session
+                    if s is not None:
+                        await self._stop(s, "hub shutting down")
 
     # ----- views -------------------------------------------------------------------------
 

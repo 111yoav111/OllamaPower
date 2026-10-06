@@ -499,3 +499,21 @@ def test_any_inference_for_a_split_model_hands_the_gpu_back_first(cluster, clien
     r = client.post(c.url + "/api/embed", json={"model": "tiny", "input": "x"})
     assert r.status_code == 200 and c.rec.last["path"] == "/api/embed"
     assert not c.call(lambda: c.hub.split.holds("tiny"))  # Ollama didn't load it next to llama-server
+
+
+async def test_hub_shutdown_stops_the_session_even_with_background_work_pending():
+    import types
+
+    from ollamapower.config import Config
+    from ollamapower.hub.engines.split import SplitEngine, SplitSession
+
+    hub = types.SimpleNamespace(config=Config(), streams={}, event=lambda *a, **k: None)
+    engine = SplitEngine(hub)
+    session = SplitSession(model="m", ctx=0, state="ready")
+    engine.session = session
+    engine._spawn(asyncio.sleep(3600))  # e.g. a drain waiting for an answer to finish
+    run = asyncio.ensure_future(engine.run())
+    await asyncio.sleep(0)
+    run.cancel()
+    await asyncio.gather(run, return_exceptions=True)
+    assert session.state == "stopped" and engine.session is None  # llama-server and helpers released
