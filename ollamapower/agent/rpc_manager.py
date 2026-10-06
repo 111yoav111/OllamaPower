@@ -251,7 +251,10 @@ class RpcManager:
             _check_lending(not_lending)
             tunnel = _Tunnel.from_message(message, rules)
             if self.session is not None:
-                await self._stop(self.session, "replaced by a new session")
+                # Cleared first: if the new session then fails to start, the old one must
+                # not stay "the session", to be reported and stopped again later.
+                old, self.session = self.session, None
+                await self._stop(old, "replaced by a new session")
             device, cap_mib, total_mib = await self._choose(message.get("device", ""), rules)
             if message.get("vram_cap_mb", 0) > 0:
                 cap_mib = min(cap_mib, int(message["vram_cap_mb"]))
@@ -268,9 +271,13 @@ class RpcManager:
                 _check_lending(not_lending)
                 session.relay = tunnel.relay(session.port, hub_ip)
                 await session.relay.start(bind_ip)
-                # No await between this check and publishing the session below, so a
-                # pause either finds ``self.session`` set or makes this check fail.
+                # No await between these checks and publishing the session below, so a
+                # pause either finds ``self.session`` set or makes this check fail, and
+                # an rpc-server that died meanwhile is never handed to the hub.
                 _check_lending(not_lending)
+                if session.stopping:
+                    last = session.output[-1] if session.output else ""
+                    raise RpcRefused("rpc-server exited while starting" + (f": {last}" if last else ""))
             except BaseException:
                 await self._stop(session, "failed to start")
                 raise
@@ -352,10 +359,13 @@ class RpcManager:
         last = session.output[-1] if session.output else ""
         error = f"rpc-server exited with code {code}" + (f": {last}" if last else "")
         self.note(error)
+        # Only a published session is the hub's to hear about; one still starting is
+        # refused by ``start`` itself, which sees ``stopping`` before publishing it.
+        published = self.session is session
+        if published:
+            self.session = None  # before any await: nobody may stop or report it again
         await self._stop(session, "rpc-server exited")
-        if self.session is session:
-            self.session = None
-        if self.on_failure is not None:
+        if published and self.on_failure is not None:
             await self.on_failure(session.session_id, error)
 
     def tunnel_quiet(self, seconds: float) -> bool:

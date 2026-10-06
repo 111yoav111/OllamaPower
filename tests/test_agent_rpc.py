@@ -174,6 +174,60 @@ async def test_start_rechecks_lending_after_launching(agent):
     assert agent.rpc.session is None
 
 
+async def test_a_failed_replacement_leaves_no_stale_session(agent):
+    await agent.started("s1")
+    agent.launch_error = RpcRefused("no luck")
+    agent.release.set()
+    await wait_for(agent.start("s2"), 5)
+    assert agent.rpc.session is None  # s1 was stopped for s2: it must not still be "the session"
+    await agent.client.set_paused(True)
+    assert agent.channel.kinds("s1") == ["rpc_ready"]  # not reported (or stopped) a second time
+    assert agent.channel.kinds("s2") == ["rpc_error"]
+
+
+class FakeProcess:
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.exited = asyncio.Event()
+
+    def exit(self, code: int) -> None:
+        if self.returncode is None:
+            self.returncode = code
+        self.exited.set()
+
+    async def wait(self) -> int:
+        await self.exited.wait()
+        assert self.returncode is not None
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.exit(-15)
+
+    kill = terminate
+
+
+async def test_rpc_server_dying_while_the_session_starts_is_reported_once(agent):
+    proc = FakeProcess()
+
+    async def launch(session: Any, cache: bool) -> None:
+        session.process = proc
+        reader = asyncio.get_running_loop().create_future()
+        reader.set_result(None)
+        session.watcher = asyncio.ensure_future(agent.rpc._watch(session, proc, reader))
+        agent.launching.set()
+        await agent.release.wait()
+
+    agent.rpc._launch = launch
+    start = agent.start()
+    await agent.launching.wait()
+    proc.exit(1)  # crashes right after it came up, before the relay is ready
+    await asyncio.sleep(0.05)
+    agent.release.set()
+    await wait_for(start, 5)
+    assert agent.rpc.session is None  # a dead session must not be handed to the hub
+    assert agent.channel.kinds("s1") == ["rpc_error"]
+
+
 async def test_a_slow_rpc_stop_does_not_hold_up_the_receive_loop(agent):
     start = agent.start()
     await agent.launching.wait()
