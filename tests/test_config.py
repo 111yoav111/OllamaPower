@@ -160,10 +160,13 @@ def test_agent_example_is_the_default(tmp_path):
     from dataclasses import asdict
     from pathlib import Path
 
+    from ollamapower import config as c
     from ollamapower.agent.config import AgentConfig, load_agent_config
 
     root = Path(__file__).resolve().parent.parent
-    loaded = load_agent_config(tmp_path, path=root / "agent.example.toml")
+    packaged = Path(c.__file__).parent / "agent.example.toml"
+    assert (root / "agent.example.toml").read_text() == packaged.read_text()
+    loaded = load_agent_config(tmp_path, path=packaged)
     default = AgentConfig(config_dir=tmp_path)
     for section in ("hub", "agent", "lending", "llamacpp"):
         assert asdict(getattr(loaded, section)) == asdict(getattr(default, section)), section

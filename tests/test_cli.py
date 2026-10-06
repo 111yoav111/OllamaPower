@@ -40,6 +40,15 @@ def test_no_args_shows_help():
     assert "Usage" in run().output
 
 
+def test_agent_example_config_prints_the_packaged_example():
+    from pathlib import Path
+
+    result = run("agent", "example-config")
+    root = Path(__file__).resolve().parent.parent
+    assert result.exit_code == 0
+    assert result.output == (root / "agent.example.toml").read_text(encoding="utf-8")
+
+
 def test_init_creates_everything_once(cfg_env):
     result = run("init")
     assert result.exit_code == 0, result.output

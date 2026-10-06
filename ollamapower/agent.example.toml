@@ -1,0 +1,47 @@
+# OllamaPower helper (agent) settings. Copy to agent.toml in the helper's config dir
+# (Linux ~/.config/ollamapower/, macOS ~/Library/Application Support/ollamapower/,
+# Windows %APPDATA%\ollamapower\). The agent TUI (E) and `ollamapower agent rules`
+# edit [lending] for you. The cluster token goes in .env next to it, never here.
+# `ollamapower agent example-config` prints this file, e.g. to `> agent.toml`.
+
+[hub]
+# The hub's LAN address (or pass --hub). Port 9000 unless the hub changed it.
+address = ""
+port = 9000
+# Optional: the hub key fingerprint to trust on first connect, as `ollamapower hub`
+# prints it. Without it the agent asks before trusting a new hub.
+fingerprint = ""
+
+[agent]
+# How this helper appears on the hub (default: the computer's name).
+name = ""
+
+[lending]
+# You decide what the hub may use; the hub can't change any of this.
+# Most VRAM to lend, in GB and/or % of the GPU (0 = no cap).
+max_vram_gb = 0.0
+max_vram_percent = 0
+# GPU indexes to lend, e.g. [0]; empty = all.
+gpus = []
+# Lend CPU/RAM when there is no GPU.
+allow_cpu = false
+# Allow unencrypted trusted-LAN direct mode (the hub's owner must choose it too).
+allow_direct = false
+# Keep received model weights on disk so later loads skip the network.
+disk_cache = true
+# When to lend, local time; windows may cross midnight. Empty = always.
+# e.g. ["22:00-08:00"] or ["09:00-12:00", "20:00-23:00"]
+schedule = []
+# Step back when you use the GPU yourself (a game, a render): when it is busier
+# than yield_gpu_percent for yield_seconds while the hub isn't using it.
+auto_yield = true
+yield_gpu_percent = 60
+yield_seconds = 20
+
+[llamacpp]
+# auto | cpu | metal | vulkan | cuda12 | cuda13 | rocm (see `ollamapower llamacpp install --help`).
+backend = "auto"
+# Your own llama.cpp build instead of the download (it must be the pinned build).
+path = ""
+# Download the pinned build when the agent starts (12-33 MB; CUDA/ROCm much more).
+auto_install = true

@@ -361,6 +361,14 @@ def agent_rules(
         typer.echo(f"{key:18} {safe(value)}")
 
 
+@agent_cli.command("example-config")
+def agent_example_config() -> None:
+    """Print an agent.toml listing every setting (save it with `> agent.toml` in the config dir)."""
+    from importlib import resources
+
+    typer.echo(resources.files("ollamapower").joinpath("agent.example.toml").read_text(encoding="utf-8"), nl=False)
+
+
 @agent_cli.command("forget-hub")
 def agent_forget_hub(
     hub: str = typer.Option(

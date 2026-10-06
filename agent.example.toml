@@ -2,6 +2,7 @@
 # (Linux ~/.config/ollamapower/, macOS ~/Library/Application Support/ollamapower/,
 # Windows %APPDATA%\ollamapower\). The agent TUI (E) and `ollamapower agent rules`
 # edit [lending] for you. The cluster token goes in .env next to it, never here.
+# `ollamapower agent example-config` prints this file, e.g. to `> agent.toml`.
 
 [hub]
 # The hub's LAN address (or pass --hub). Port 9000 unless the hub changed it.

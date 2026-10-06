@@ -170,7 +170,9 @@ split mode needs a cable.
 
 The helper's owner controls lending in the agent TUI (`E`), with
 `ollamapower agent rules`, or in `agent.toml`
-([`agent.example.toml`](agent.example.toml) lists every setting):
+([`agent.example.toml`](agent.example.toml) lists every setting;
+`ollamapower agent example-config > agent.toml` in the config directory
+writes it on a machine that installed OllamaPower without this repository):
 
 | Rule | Default | Effect |
 |---|---|---|
@@ -204,6 +206,7 @@ ollamapower agent status [--json] [--watch]
 ollamapower agent pause | resume
 ollamapower agent rules --max-vram-gb 8 --gpus 0
 ollamapower agent net-test
+ollamapower agent example-config      # every agent.toml setting, commented
 ollamapower agent forget-hub [--hub 192.168.1.10[:9000] | --hub [fd00::1]:9000]
                                       # only after you replaced the hub's key yourself (default: all)
 ```

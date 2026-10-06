@@ -51,7 +51,7 @@ ollamapower = "ollamapower.__main__:main"
 include = ["ollamapower*"]
 
 [tool.setuptools.package-data]
-ollamapower = ["config.example.toml"]
+ollamapower = ["config.example.toml", "agent.example.toml"]
 "ollamapower.llamacpp" = ["pins.json"]
 "ollamapower.tui" = ["*.tcss"]
 
