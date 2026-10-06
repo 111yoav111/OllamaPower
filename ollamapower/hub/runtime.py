@@ -228,6 +228,7 @@ class Hub:
                 hint = (
                     "it will be benchmarked with helpers while the hub is idle"
                     if self.config.planner.auto_benchmark
+                    and not self.plans.stopped_text(m.name, self.plans.record(m.name))
                     else f"`ollamapower models benchmark {m.name}` checks whether helpers make it faster"
                 )
                 warnings.append(

@@ -140,6 +140,85 @@ def test_degraded_until_retry_after_and_helpers_back(book, monkeypatch):
     assert plans.record("big:70b")["degraded"] is None
 
 
+@pytest.fixture
+def auto(book, monkeypatch):
+    """Automatic benchmarks on a fake clock, with a fake benchmark whose split runs give ``outcome``."""
+    plans, hub, helpers = book
+    now = [1_000_000.0]
+    monkeypatch.setattr("ollamapower.hub.plans.time.time", lambda: now[0])
+    outcome: dict[str, Any] = {"ok": False, "error": "llama-server exited with code 1"}
+    calls: list[bool] = []
+
+    async def fake_benchmark(hub_: Any, model: str, ctx: int | None = None, automatic: bool = False) -> dict:
+        calls.append(automatic)
+        split = run(30.0, helpers=helpers) if outcome["ok"] else {"ok": False, "error": outcome["error"]}
+        plans.decide(model, run(10.0), [split])
+        if split["ok"]:
+            plans.bench_succeeded(model)
+        return {"splits": [split], "decided": True}
+
+    async def facts(model: str, refresh: bool = False) -> dict[str, Any]:
+        return {"worth_splitting": True}
+
+    monkeypatch.setattr("ollamapower.hub.benchmark.benchmark_model", fake_benchmark)
+    monkeypatch.setattr(plans, "facts", facts)
+
+    def cycle() -> list[str]:
+        """One look of the planner loop (minus the idle wait): what was due, after benchmarking it."""
+
+        async def go() -> list[str]:
+            plans.last_request["big:70b"] = now[0]
+            due = await plans.pending()
+            if due:
+                await plans.auto_benchmark(due[0])
+            return due
+
+        return asyncio.run(go())
+
+    return plans, hub, helpers, now, outcome, calls, cycle
+
+
+def test_auto_benchmark_gives_up_after_repeated_split_failures(auto):
+    plans, hub, helpers, now, outcome, calls, cycle = auto
+    for attempt in range(plans_mod.AUTO_BENCH_MAX_FAILURES):
+        assert cycle() == ["big:70b"], attempt
+        assert plans.record("big:70b")["choice"] == "local"
+        assert cycle() == []  # backing off: not again right away
+        now[0] += plans_mod.FAILED_BENCH_BACKOFF + 1
+    assert cycle() == [] and len(calls) == plans_mod.AUTO_BENCH_MAX_FAILURES  # given up: no endless loop
+    ab = plans.record("big:70b")["auto_bench"]
+    assert ab["stopped"] and ab["failures"] == 3 and "exited with code 1" in ab["error"]
+    stopped = [w for w in plans.warnings() if "automatic benchmarks of big:70b stopped after 3" in w]
+    assert stopped and "models benchmark big:70b" in stopped[0]
+    assert "stopped after 3" in plans.describe("big:70b")["why"]
+    assert [e for e in hub.recent_events if e["kind"] == "auto_benchmark_stopped"]
+    now[0] += 10 * plans_mod.FAILED_BENCH_BACKOFF
+    assert cycle() == []  # time alone doesn't bring it back
+
+    # Something in the key changes (here: a helper fewer): worth another try.
+    gone = helpers.pop()
+    assert cycle() == ["big:70b"]
+    helpers.append(gone)
+
+    # A split run that works (e.g. a manual `models benchmark`) clears the count.
+    outcome["ok"] = True
+    plans.bench_succeeded("big:70b")
+    assert plans.record("big:70b")["auto_bench"] is None
+    assert not [w for w in plans.warnings() if "stopped after" in w]
+    assert cycle() == ["big:70b"] and plans.record("big:70b")["choice"] == "split"
+    assert cycle() == []  # decided under the current conditions
+
+
+def test_auto_benchmark_failures_only_count_in_a_row(auto):
+    plans, _, _, now, outcome, _, cycle = auto
+    for _ in range(plans_mod.AUTO_BENCH_MAX_FAILURES - 1):
+        cycle()
+        now[0] += plans_mod.FAILED_BENCH_BACKOFF + 1
+    outcome["ok"] = True
+    cycle()
+    assert plans.record("big:70b")["auto_bench"] is None
+
+
 def test_phase3_plans_still_mean_split(book):
     plans, hub, _ = book
     hub.state.data["plans"]["old:latest"] = {"mode": "split", "ctx": 2048}
@@ -377,6 +456,24 @@ def test_benchmark_waits_for_a_busy_split_session(cluster, monkeypatch):
     with pytest.raises(AdminError, match="busy"):
         c.admin("models.benchmark", model="tiny")
     assert c.call(lambda: c.hub.split.is_running("tiny"))  # nobody's answer was cut off
+
+
+@pytestmark_e2e
+def test_manual_benchmark_runs_after_automatic_ones_gave_up(cluster):
+    c = cluster
+    split_speed(c, 30.0)
+
+    def give_up() -> None:
+        c.hub.plans._update(
+            "tiny:latest",
+            auto_bench={"key": c.hub.plans._attempt_key("tiny:latest"), "failures": 3, "error": "x", "stopped": True},
+        )
+
+    c.call(give_up)
+    assert c.call(lambda: c.hub.plans.describe("tiny")["auto_benchmark_stopped"])
+    r = c.admin("models.benchmark", model="tiny")
+    assert r["choice"] == "split"
+    assert c.call(lambda: c.hub.plans.record("tiny")["auto_bench"]) is None
 
 
 @pytestmark_e2e

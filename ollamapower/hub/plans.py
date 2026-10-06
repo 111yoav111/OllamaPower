@@ -10,6 +10,10 @@ canonical name):
 * ``exclude``: helpers the owner doesn't want used for this model.
 * ``degraded``: set when split mode failed; Ollama serves the model until
   ``planner.retry_after`` has passed *and* every helper of the plan is back.
+* ``auto_bench``: automatic benchmarks that failed in a row under one attempt
+  key (model, context, helpers). After ``AUTO_BENCH_MAX_FAILURES`` of them
+  the hub stops benchmarking that model by itself until something in the key
+  changes, and says why; ``models benchmark`` still runs it on request.
 
 **Golden rule - never slower.** In automatic mode a model runs split only if
 a benchmark showed split generating at least ``planner.min_gain`` faster than
@@ -50,6 +54,7 @@ PINS = ("split", "local")
 AUTO_CHECK = 30.0  # seconds between looks for something to benchmark
 RECENT_USE = 24 * 3600.0  # only models used in the last day are benchmarked automatically
 FAILED_BENCH_BACKOFF = 3600.0  # a benchmark that failed isn't retried with the same key for an hour
+AUTO_BENCH_MAX_FAILURES = 3  # failed automatic benchmarks in a row (same key) before the hub stops trying
 WARNING_TTL = 600.0
 
 
@@ -72,6 +77,7 @@ def _default_record() -> dict[str, Any]:
         "chosen_at": None,
         "key": None,
         "degraded": None,
+        "auto_bench": None,
     }
 
 
@@ -357,19 +363,67 @@ class PlanBook:
             facts = await self.facts(model)
             if not facts["worth_splitting"]:
                 continue
-            if now - self._failed_keys.get(self._attempt_key(model), 0.0) < FAILED_BENCH_BACKOFF:
+            attempt = self._attempt_key(model)
+            if self.auto_bench_stopped(rec, attempt):
+                continue  # failed too often under these conditions: only a manual benchmark tries again
+            if now - self._failed_keys.get(attempt, 0.0) < FAILED_BENCH_BACKOFF:
                 continue
             out.append(model)
         return out
 
+    @staticmethod
+    def auto_bench_stopped(rec: dict[str, Any], attempt: str) -> bool:
+        """Did automatic benchmarks of ``rec``'s model give up under ``attempt`` (the current key)?"""
+        ab = rec.get("auto_bench")
+        return isinstance(ab, dict) and bool(ab.get("stopped")) and ab.get("key") == attempt
+
+    def bench_failed(self, model: str, attempt: str, error: str) -> None:
+        """An automatic benchmark of ``model`` got no working split run: count it, stop after too many."""
+        self._failed_keys[attempt] = time.time()
+        if self.hub.state is None:
+            return
+        ab = self.record(model)["auto_bench"]
+        failures = ab.get("failures", 0) if isinstance(ab, dict) and ab.get("key") == attempt else 0
+        failures = (failures if isinstance(failures, int) else 0) + 1
+        stopped = failures >= AUTO_BENCH_MAX_FAILURES
+        error = safe_text(error, 300)
+        self._update(
+            model,
+            auto_bench={"key": attempt, "failures": failures, "error": error, "at": time.time(), "stopped": stopped},
+        )
+        if stopped:
+            message = self._stopped_message(model, failures, error)  # warnings() shows it while it lasts
+            self.hub.event("auto_benchmark_stopped", model=model, failures=failures, error=error)
+            log.warning("%s", message)
+
+    def bench_succeeded(self, model: str) -> None:
+        """A split run of ``model`` worked: forget its failed automatic benchmarks."""
+        if self.hub.state is not None and self.record(model)["auto_bench"] is not None:
+            self._update(model, auto_bench=None)
+
+    @staticmethod
+    def _stopped_message(model: str, failures: int, error: str) -> str:
+        return (
+            f"automatic benchmarks of {model} stopped after {failures} failed attempts"
+            + (f" (last: {error})" if error else "")
+            + f"; `ollamapower models benchmark {model}` tries again"
+        )
+
+    def stopped_text(self, model: str, rec: dict[str, Any]) -> str:
+        """The "stopped" message for ``model`` if its automatic benchmarks gave up under the current key."""
+        if rec["pin"] is not None or not self.auto_bench_stopped(rec, self._attempt_key(model)):
+            return ""
+        ab = rec["auto_bench"]
+        return self._stopped_message(model, int(ab.get("failures") or 0), str(ab.get("error") or ""))
+
     def _attempt_key(self, model: str) -> str:
+        from .runtime import model_key
+
         ids = ",".join(sorted(f"{n.node_id}/{n.tunnel_effective}" for n in self.current_helpers(model)))
-        return f"{model}|{self.digest_of(model)}|{self.ctx_for(model)}|{ids}"
+        return f"{model_key(model)}|{self.digest_of(model)}|{self.ctx_for(model)}|{self.pins.build}|{ids}"
 
     async def run(self) -> None:
         """Benchmark models that would benefit, while the hub is idle (if ``planner.auto_benchmark``)."""
-        from .benchmark import benchmark_model
-
         while True:
             await asyncio.sleep(AUTO_CHECK)
             if not self.config.planner.auto_benchmark or self.bench_lock.locked():
@@ -383,23 +437,33 @@ class PlanBook:
                 continue
             if not models:
                 continue
-            model = models[0]
-            attempt = self._attempt_key(model)
-            self.auto_task = asyncio.ensure_future(benchmark_model(self.hub, model, automatic=True))
-            try:
-                result = await self.auto_task
-                if not result.get("decided"):
-                    self._failed_keys[attempt] = time.time()
-            except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None and current.cancelling():
-                    raise
-                self.hub.event("benchmark_abandoned", model=model, reason="a request arrived")
-            except Exception as exc:  # noqa: BLE001 - one failed benchmark must not stop the planner
-                log.warning("automatic benchmark of %s failed: %s", model, type(exc).__name__)
-                self._failed_keys[attempt] = time.time()
-            finally:
-                self.auto_task = None
+            await self.auto_benchmark(models[0])
+
+    async def auto_benchmark(self, model: str) -> None:
+        """One automatic benchmark of ``model``; a failure counts against its attempt key."""
+        from .benchmark import BenchmarkError, benchmark_model
+
+        attempt = self._attempt_key(model)
+        self.auto_task = asyncio.ensure_future(benchmark_model(self.hub, model, automatic=True))
+        try:
+            result = await self.auto_task
+            splits = result.get("splits") or []
+            if not any(s.get("ok") for s in splits):
+                # The model is now "decided local" without a key, which pending() reads as "no
+                # benchmark yet": without counting, it would be benchmarked again and again.
+                self.bench_failed(model, attempt, str(splits[-1].get("error") or "") if splits else "no split run")
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            self.hub.event("benchmark_abandoned", model=model, reason="a request arrived")
+        except BenchmarkError:
+            self._failed_keys[attempt] = time.time()  # not split mode failing (busy, no helper): just wait
+        except Exception as exc:  # noqa: BLE001 - one failed benchmark must not stop the planner
+            log.warning("automatic benchmark of %s failed: %s", model, type(exc).__name__)
+            self.bench_failed(model, attempt, f"internal error ({type(exc).__name__})")
+        finally:
+            self.auto_task = None
 
     async def stop(self) -> None:
         if self.auto_task is not None:
@@ -440,6 +504,9 @@ class PlanBook:
             why = f"benchmark no longer applies ({problem})"
         else:
             why = rec["reason"] or "no benchmark yet"
+        stopped = self.stopped_text(model, rec)
+        if stopped and spec is None and not isinstance(rec["degraded"], dict):
+            why = f"{why}; {stopped}"
         latest = self.latest(model)
         return {
             "engine": "split" if spec is not None else "local-ollama",
@@ -449,13 +516,17 @@ class PlanBook:
             "ctx": self.ctx_for(model),
             "exclude": rec["exclude"],
             "degraded": rec["degraded"],
+            "auto_benchmark_stopped": stopped,
             "local_tps": latest["local"]["gen_tps"] if latest["local"] else None,
             "split_tps": latest["split"]["gen_tps"] if latest["split"] else None,
         }
 
     def warnings(self) -> list[str]:
         now = time.monotonic()
-        return list(dict.fromkeys(m for t, m in self._warnings if now - t < WARNING_TTL))
+        out = [m for t, m in self._warnings if now - t < WARNING_TTL]
+        # Lasting, unlike the messages above: shown for as long as the hub has given up on the model.
+        out += [m for model, rec in self.records().items() if (m := self.stopped_text(model, rec))]
+        return list(dict.fromkeys(out))
 
     def snapshot(self) -> dict[str, Any]:
         return {

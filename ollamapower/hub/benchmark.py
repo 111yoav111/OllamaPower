@@ -195,6 +195,8 @@ async def benchmark_model(hub: Hub, model: str, ctx: int | None = None, automati
                 await hub.split.stop(reason="benchmark")
         finally:
             plans.benchmarking = None
+        if any(s.get("ok") for s in splits):
+            plans.bench_succeeded(model)  # automatic benchmarks may run again (after a manual one, too)
         out: dict[str, Any] = {"model": model, "ctx": ctx, "local": local, "splits": splits, "decided": False}
         if ctx != plans.ctx_for(model):
             plans._update(model, ctx=ctx)  # measured at this context: that's the context the plan runs at
