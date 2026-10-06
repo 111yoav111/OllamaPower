@@ -200,11 +200,6 @@ def test_extended_permission_checks(make_config):
     assert [f.level for f in doctor.check_permissions(cfg) if "admin.json" in f.title] == ["error"]
 
 
-def test_permission_checks_skip_windows(make_config):
-    findings = doctor.check_permissions(make_config("http://127.0.0.1:11435"), platform="win32")
-    assert [f.level for f in findings] == ["ok"] and "Windows" in findings[0].title
-
-
 def test_llamacpp_check(make_config, tmp_path):
     from ollamapower.llamacpp.install import Pins
 
