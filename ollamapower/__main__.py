@@ -864,11 +864,19 @@ def models_unplan(model: str, config_path: Path | None = ConfigOption) -> None:
 # ----- llama.cpp -----------------------------------------------------------------------
 
 
-def _agent_or_hub_llamacpp(config_path: Path | None) -> tuple[Path, str, str]:
+LlamaCppDirOption = typer.Option(
+    None,
+    "--config-dir",
+    file_okay=False,
+    help="Config directory (a hub's config.toml or a helper's agent.toml); llama.cpp is installed under it",
+)
+
+
+def _agent_or_hub_llamacpp(config_path: Path | None, config_dir: Path | None) -> tuple[Path, str, str]:
     """(config dir, backend, custom path): a helper's agent.toml wins on a machine without a hub config."""
     from .agent.config import load_agent_config
 
-    config = load(config_path)
+    config = load(config_path, config_dir)
     hub_file = config.config_dir / "config.toml"
     if config_path is None and not hub_file.exists() and (config.config_dir / "agent.toml").exists():
         agent = load_agent_config(config.config_dir).llamacpp
@@ -880,13 +888,14 @@ def _agent_or_hub_llamacpp(config_path: Path | None) -> tuple[Path, str, str]:
 def llamacpp_install(
     backend: str | None = typer.Option(None, "--backend", help="auto, cpu, metal, vulkan, cuda12, cuda13 or rocm"),
     config_path: Path | None = ConfigOption,
+    config_dir: Path | None = LlamaCppDirOption,
 ) -> None:
     """Download and verify the pinned llama.cpp build for this machine (hub or helper)."""
     from .llamacpp.install import Pins
     from .llamacpp.manager import LlamaCppUnavailable, ensure, gpu_vendors
     from .llamacpp.variants import BACKENDS
 
-    base, configured, custom = _agent_or_hub_llamacpp(config_path)
+    base, configured, custom = _agent_or_hub_llamacpp(config_path, config_dir)
     backend = backend or configured
     if backend not in BACKENDS:
         typer.secho(f"--backend must be one of {', '.join(BACKENDS)}", fg="red", err=True)
@@ -915,11 +924,15 @@ def llamacpp_install(
 
 
 @llamacpp_cli.command("status")
-def llamacpp_status(config_path: Path | None = ConfigOption, as_json: bool = typer.Option(False, "--json")) -> None:
+def llamacpp_status(
+    config_path: Path | None = ConfigOption,
+    config_dir: Path | None = LlamaCppDirOption,
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
     """Show the installed llama.cpp build and the devices it sees (installs nothing)."""
     from .llamacpp.manager import LlamaCppUnavailable, ensure, gpu_vendors
 
-    base, backend, custom = _agent_or_hub_llamacpp(config_path)
+    base, backend, custom = _agent_or_hub_llamacpp(config_path, config_dir)
     vendors = gpu_vendors()
     try:
         found = ensure(base, backend, custom, vendors, download=False)

@@ -27,7 +27,11 @@ agent_cli = typer.Typer(help="Run this PC as a helper, or control the running he
 RUN_DIR = "agent-run"
 
 ConfigDirOption = typer.Option(
-    None, "--config-dir", help="Directory with agent.toml, .env and known_hub (default: the OllamaPower config dir)"
+    None,
+    "--config-dir",
+    "-c",
+    file_okay=False,
+    help="Directory with agent.toml, .env and known_hub (default: the OllamaPower config dir)",
 )
 
 

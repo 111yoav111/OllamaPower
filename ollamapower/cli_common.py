@@ -56,9 +56,11 @@ def stop_like_ctrl_c() -> Iterator[None]:
             signal.signal(sig, handler)
 
 
-def load(config_path: Path | None) -> Config:
+def load(config_path: Path | None, config_dir: Path | None = None) -> Config:
+    """The hub config; ``config_dir`` stands in for ``OLLAMAPOWER_CONFIG_DIR`` (its config.toml, .env, ...)."""
+    env = None if config_dir is None else {**os.environ, "OLLAMAPOWER_CONFIG_DIR": str(config_dir)}
     try:
-        return load_config(config_path)
+        return load_config(config_path, env=env)
     except ConfigError as exc:
         typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(2) from None

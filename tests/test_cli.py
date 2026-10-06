@@ -121,6 +121,28 @@ def test_forget_hub_parses_the_address_like_agent_hub(cfg_env):
     assert "Forgot 1" in run("agent", "forget-hub", "--yes").output and known.entries() == []
 
 
+def test_config_dir_short_option_and_llamacpp_config_dir(cfg_env, tmp_path):
+    from ollamapower.agent.pinning import KnownHubs
+    from ollamapower.llamacpp.install import Pins
+
+    from .fake_llamacpp import install_fakes
+
+    helper = tmp_path / "helper"
+    helper.mkdir()
+    KnownHubs(helper / "known_hub").pin("10.0.0.2:9000", "ab" * 32)
+    forgot = run("agent", "forget-hub", "-c", str(helper), "--hub", "10.0.0.2", "--yes")
+    assert forgot.exit_code == 0 and "Forgot 1" in forgot.output
+    assert run("agent", "status", "-c", str(helper)).exit_code == 3  # -c reached the agent's run dir
+
+    build = Pins.load().build
+    fakes = install_fakes(tmp_path / "bin", [], build)
+    (helper / "agent.toml").write_text(f'[llamacpp]\npath = "{fakes}"\n')
+    status = run("llamacpp", "status", "--config-dir", str(helper), "--json")
+    assert status.exit_code == 0, status.output
+    assert json.loads(status.output)["build"] == build
+    assert run("llamacpp", "status").exit_code == 1  # the default config dir (cfg_env) has no llama.cpp
+
+
 def test_status_when_not_running(cfg_env):
     result = run("status")
     assert result.exit_code == 3 and "not running" in result.output

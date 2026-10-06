@@ -262,7 +262,7 @@ ollamapower models force-local <model>       # same as `pin <model> local`
 ollamapower models unpin <model>             # automatic again           (TUI: U)
 ollamapower models exclude <model> <helper> [--undo]
 ollamapower models benchmarks [--markdown]   # every result; --markdown for docs/BENCHMARKS.md
-ollamapower llamacpp install | status        # the pinned llama.cpp (also done automatically)
+ollamapower llamacpp install | status [--config-dir DIR]   # the pinned llama.cpp (also done automatically)
 ```
 
 ### How the hub decides
@@ -386,7 +386,8 @@ as numbers, and `ollama.url` needs an explicit port. The cluster token lives onl
 env var). On disk, all owner-only: `config.toml`, `.env`, `hub_key.pem`,
 `state.json` (+ `.bak`), `logs/`, and while running `run/`. A helper keeps
 `agent.toml`, `.env`, `known_hub` and `node_id` in the same kind of directory
-(`--config-dir` to choose another), and `agent-run/` while running.
+(`--config-dir` or `-c` on `agent` commands to choose another; `llamacpp
+install|status --config-dir` too), and `agent-run/` while running.
 
 ## How it works
 

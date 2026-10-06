@@ -113,7 +113,9 @@ recognisable.
 - Typer, `add_completion=False, no_args_is_help=True`; sub-apps added with
   `cli.add_typer(..., name="devices")`. Every command has a one-line docstring
   (it is the `--help` text).
-- `--config/-c` on every command; `--yes/-y` to skip confirmations.
+- `--config/-c` (a `config.toml`) on hub commands, `--config-dir/-c` on `agent`
+  commands (a helper has several files); `llamacpp` takes both (`--config-dir`
+  long only, since `-c` is `--config` there). `--yes/-y` to skip confirmations.
 - Commands other than the server itself talk to the running process over the
   local admin channel (Unix socket `0600` in a `0700` dir, or `127.0.0.1` on
   Windows, plus a secret in an owner-only `admin.json` and an HMAC proof on
