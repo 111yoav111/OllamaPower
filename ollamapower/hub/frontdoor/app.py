@@ -316,6 +316,8 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 if (outcome == "upstream_error" or cut_off) and not strict:
                     # llama-server stopped answering mid-stream (stalled past split.stall_timeout, or died).
                     hub.split.report_failure(session, "llama-server stopped answering mid-answer")
+                elif outcome == "complete" and status < 400 and not cut_off:
+                    hub.split.note_success(session)  # resets the failure backoff (once per session)
                 finish(outcome, status)
 
             upstream: httpx.Response | None = None

@@ -55,7 +55,7 @@ from ...ollama.blobs import ModelFiles, ModelUnavailable, resolve
 from ...ollama.client import PROBE_HEADERS, human_bytes, parse_ps
 from ...textsafe import safe_text
 from ..planner import MIB, Device, PlanError, SplitPlan, fits_on_hub, plan_split
-from ..plans import SplitSpec, layout_problem
+from ..plans import AWAY, PERMANENT, TRANSIENT, SplitSpec, layout_problem
 from ..tunnel import BULK_BYTES, HubRelay, TunnelClient, measure
 
 if TYPE_CHECKING:
@@ -75,15 +75,58 @@ ENGINE_SPLIT = "split"
 
 
 class SplitUnavailable(Exception):
-    """Split mode can't serve this request now; Ollama will (the message says why)."""
+    """Split mode can't serve this request now; Ollama will (the message says why).
+
+    ``kind`` says what the plan book does about it: ``TRANSIENT`` (try again after a growing
+    pause), ``PERMANENT`` (not again until the model, its settings or llama.cpp change) or
+    ``AWAY`` (not a failure at all).
+    """
+
+    kind = TRANSIENT
+
+    def __init__(self, message: str, kind: str | None = None) -> None:
+        super().__init__(message)
+        if kind is not None:
+            self.kind = kind
 
 
 class HelperAway(SplitUnavailable):
     """A helper stopped lending on purpose (pause, schedule, auto-yield): not a failure of the plan."""
 
+    kind = AWAY
+
 
 class PlanStale(SplitUnavailable):
     """The setup changed since the model's benchmark: not a failure, the model is benchmarked again."""
+
+    kind = AWAY
+
+
+# Why llama-server exited, from its last lines. Out of memory first: it also says "failed to load
+# model", and memory may be free next time. PERMANENT_SIGNS: this build can never load this model
+# (or run here at all), so starting it again changes nothing.
+OOM_SIGNS = ("out of memory", "failed to allocate", "unable to allocate", "outofdevicememory", "cudamalloc failed")
+PERMANENT_SIGNS = (
+    "unknown model architecture",
+    "unsupported model",
+    "invalid magic",
+    "failed to read magic",
+    "unknown (magic, version)",
+    "error while loading shared libraries",
+    "glibc_",
+    "illegal instruction",
+)
+PERMANENT_EXIT_CODES = (126, 127, 132, -4)  # not executable, not found, SIGILL (built for another CPU)
+
+
+def exit_kind(returncode: int | None, output: list[str]) -> str:
+    """Is a llama-server that exited worth starting again later (``TRANSIENT``) or not (``PERMANENT``)?"""
+    text = "\n".join(output[-20:]).lower()
+    if any(sign in text for sign in OOM_SIGNS):
+        return TRANSIENT
+    if returncode in PERMANENT_EXIT_CODES or any(sign in text for sign in PERMANENT_SIGNS):
+        return PERMANENT
+    return TRANSIENT
 
 
 @dataclass
@@ -125,6 +168,7 @@ class SplitSession:
     output: deque[str] = field(default_factory=lambda: deque(maxlen=60))
     error: str = ""
     draining: bool = False  # a helper stopped lending: finish the current answers, then stop
+    proven: bool = False  # an answer came through: the plan book's failure count went back to zero
     # llama-server runs with one slot (-np 1): requests queue here, in the hub, so time spent
     # waiting for the slot never counts as llama-server stalling.
     slot: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
@@ -224,6 +268,8 @@ class SplitEngine:
         self._acquire_tasks: set[asyncio.Task[Any]] = set()
         self._acquiring = 0  # _acquire calls in progress (waiting for the lock or starting)
         self._pending_nodes: dict[str, Node] = {}  # rpc_start session id -> helper asked
+        # model -> (kind, time.monotonic()) of its last failed start, for benchmarks to tell why
+        self.last_failure: dict[str, tuple[str, float]] = {}
 
     def holds(self, model: str) -> bool:
         """Is a session for ``model`` starting or running (holding, or about to hold, the GPU)?"""
@@ -303,11 +349,20 @@ class SplitEngine:
                 await self._stop(session, reason, failed=not cancelled)
                 if cancelled:
                     raise  # abandoned (nobody waits, or the hub stops): not a failure of the plan
-                if not isinstance(exc, (HelperAway, PlanStale)):
-                    self.hub.plans.fail(key, reason, tail)
-                raise SplitUnavailable(reason) from None
+                # A timeout or an internal error may well not happen again: transient.
+                kind = exc.kind if isinstance(exc, SplitUnavailable) else TRANSIENT
+                self.last_failure[key] = (kind, time.monotonic())
+                if kind != AWAY:
+                    self.hub.plans.fail(key, reason, tail, kind)
+                raise SplitUnavailable(reason, kind) from None
             session.active += 1
             return session
+
+    def note_success(self, session: SplitSession) -> None:
+        """An answer came through ``session``: split mode works again (once per session, so it costs nothing)."""
+        if not session.proven:
+            session.proven = True
+            self.hub.plans.succeeded(session.model)
 
     def release(self, session: SplitSession) -> None:
         session.active = max(0, session.active - 1)
@@ -324,12 +379,14 @@ class SplitEngine:
         try:
             s.files = await resolve(self.http, s.model)
         except ModelUnavailable as exc:
-            raise SplitUnavailable(str(exc)) from None
+            raise SplitUnavailable(str(exc), PERMANENT) from None
         info = s.files.gguf
         assert info is not None
         binaries = await self._ensure_llamacpp()
         if fits_on_hub(info, s.ctx, self.hub_devices(), self.config.planner.memory_margin):
-            raise SplitUnavailable(f"{s.model} fits on the hub's GPU alone, so Ollama runs it faster without helpers")
+            raise SplitUnavailable(
+                f"{s.model} fits on the hub's GPU alone, so Ollama runs it faster without helpers", PERMANENT
+            )
 
         helpers, reasons = self.candidates()
         helpers = [n for n in helpers if n.node_id not in s.spec.exclude]
@@ -338,10 +395,11 @@ class SplitEngine:
             by_id = {n.node_id: n for n in helpers}
             missing = [h for h in s.spec.helpers if h not in by_id]
             if missing:
-                raise SplitUnavailable(f"a helper of the plan is not available ({', '.join(m[:8] for m in missing)})")
+                # Paused, outside its schedule or gone since routing: like a helper leaving, not a failure.
+                raise HelperAway(f"a helper of the plan is not available ({', '.join(m[:8] for m in missing)})")
             helpers = [by_id[h] for h in s.spec.helpers]
         if not helpers:
-            raise SplitUnavailable("no helper can take part" + (f" ({'; '.join(reasons)})" if reasons else ""))
+            raise HelperAway("no helper can take part" + (f" ({'; '.join(reasons)})" if reasons else ""))
 
         # Lease the helpers first: if none agrees, Ollama keeps its models loaded.
         await self._lease(s, helpers)
@@ -410,9 +468,9 @@ class SplitEngine:
                 self.pins,
             )
         except LlamaCppUnavailable as exc:
-            raise SplitUnavailable(f"llama.cpp on the hub: {exc}") from None
+            raise SplitUnavailable(f"llama.cpp on the hub: {exc}", PERMANENT if exc.permanent else TRANSIENT) from None
         if self.binaries.llama_server is None:
-            raise SplitUnavailable("llama-server is missing from the hub's llama.cpp")
+            raise SplitUnavailable("llama-server is missing from the hub's llama.cpp", PERMANENT)
         return self.binaries
 
     def hub_devices(self) -> list[Device]:
@@ -589,7 +647,7 @@ class SplitEngine:
             cwd=str(binaries.llama_server.parent),
             env={**llamacpp_env(), "LLAMA_API_KEY": s.api_key},
         )
-        self._spawn(self._drain(s))
+        drained = self._spawn(self._drain(s))
         s.client = httpx.AsyncClient(
             base_url=f"http://127.0.0.1:{s.port}",
             headers={"authorization": f"Bearer {s.api_key}"},
@@ -599,8 +657,13 @@ class SplitEngine:
         )
         while True:
             if s.process.returncode is not None:
+                with contextlib.suppress(TimeoutError):  # its last words tell why (and whether to try again)
+                    await wait_for(asyncio.shield(drained), 2.0)
                 last = s.output[-1] if s.output else ""
-                raise SplitUnavailable(f"llama-server exited with code {s.process.returncode}: {last}")
+                raise SplitUnavailable(
+                    f"llama-server exited with code {s.process.returncode}: {last}",
+                    exit_kind(s.process.returncode, list(s.output)),
+                )
             with contextlib.suppress(httpx.HTTPError):
                 r = await s.client.get("/health", timeout=2.0)
                 if r.status_code == 200:
@@ -613,10 +676,11 @@ class SplitEngine:
         while line := await proc.stdout.readline():
             s.output.append(safe_text(line.decode("utf-8", "replace").rstrip(), 300))
 
-    def _spawn(self, coro: Any) -> None:
+    def _spawn(self, coro: Any) -> asyncio.Task[Any]:
         task = asyncio.ensure_future(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return task
 
     # ----- tunnel test -------------------------------------------------------------------
 
@@ -691,7 +755,7 @@ class SplitEngine:
             reason = f"{node.name}: {safe_text(str(message.get('error', '')), 200)}"
         self.report_failure(s, reason)
 
-    def report_failure(self, s: SplitSession, reason: str) -> asyncio.Task[Any] | None:
+    def report_failure(self, s: SplitSession, reason: str, kind: str = TRANSIENT) -> asyncio.Task[Any] | None:
         """A running session broke (helper gone, stalled, crashed): stop it, Ollama takes over.
 
         Returns the stopping task, so a caller about to hand the model to Ollama can wait
@@ -700,7 +764,7 @@ class SplitEngine:
         if s.state not in ("ready", "starting") or s.error:
             return None
         s.error = reason
-        self.hub.plans.fail(s.model, reason, list(s.output))
+        self.hub.plans.fail(s.model, reason, list(s.output), kind)
         task = asyncio.ensure_future(self._stop_and_cut(s, reason))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -821,7 +885,8 @@ class SplitEngine:
                 if s is None or s.state != "ready":
                     continue
                 if s.process is not None and s.process.returncode is not None:
-                    self.report_failure(s, f"llama-server exited with code {s.process.returncode}")
+                    code = s.process.returncode
+                    self.report_failure(s, f"llama-server exited with code {code}", exit_kind(code, list(s.output)))
                 elif not s.active and time.monotonic() - s.last_used > self.config.split.keep_alive:
                     await self.stop(s.model, "idle")
         finally:

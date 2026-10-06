@@ -8,8 +8,16 @@ canonical name):
 * ``choice``: what the last benchmark decided for automatic mode, with the
   ``reason`` and the ``key`` it was measured under.
 * ``exclude``: helpers the owner doesn't want used for this model.
-* ``degraded``: set when split mode failed; Ollama serves the model until
-  ``planner.retry_after`` has passed *and* every helper of the plan is back.
+* ``degraded``: set when split mode failed; Ollama serves the model until it
+  may be tried again *and* every helper of the plan is back. A *transient*
+  failure (a helper disconnected, a timeout, out of memory while loading) is
+  retried after ``planner.retry_after``, doubling with every failure in a row
+  up to ``RETRY_CAP`` (``failures`` counts them; an answer that comes through
+  split mode resets it). A *permanent* one (the model can't be split or
+  llama.cpp can't load it, llama.cpp missing or the wrong build) is not
+  retried until the model, the context, the llama.cpp settings or build
+  change, or the hub restarts. A helper stepping away on purpose is never a
+  failure.
 * ``auto_bench``: automatic benchmarks that failed in a row under one attempt
   key (model, context, helpers). After ``AUTO_BENCH_MAX_FAILURES`` of them
   the hub stops benchmarking that model by itself until something in the key
@@ -61,7 +69,14 @@ RECENT_USE = 24 * 3600.0  # only models used in the last day are benchmarked aut
 FAILED_BENCH_BACKOFF = 3600.0  # a benchmark that failed isn't retried with the same key for an hour
 AUTO_BENCH_MAX_FAILURES = 3  # failed automatic benchmarks in a row (same key) before the hub stops trying
 WARNING_TTL = 600.0
+RETRY_CAP = 3600.0  # the longest pause before split mode is tried again after transient failures
 
+# How a split failure is handled (``SplitUnavailable.kind``).
+TRANSIENT = "transient"  # may work next time: back off, then try again
+PERMANENT = "permanent"  # won't work until the model, the settings or llama.cpp change
+AWAY = "away"  # not a failure (a helper stepped away, the setup changed): nothing to back off from
+
+BOOT = f"{time.time():.6f}"  # a permanent failure is tried again after a restart (new settings, new llama.cpp)
 
 KEY_VERSION = 2  # benchmark keys with each helper's device and memory, and the placement
 LENT_SLACK_GIB = 1  # a helper's lent memory (rounded to GiB) may differ this much from its benchmark's
@@ -123,6 +138,7 @@ def _default_record() -> dict[str, Any]:
         "key": None,
         "degraded": None,
         "auto_bench": None,
+        "failures": 0,
     }
 
 
@@ -267,7 +283,10 @@ class PlanBook:
         ctx = self.ctx_for(model)
         degraded = rec["degraded"]
         if isinstance(degraded, dict):
-            if time.time() < float(degraded.get("until", 0)):
+            if degraded.get("kind") == PERMANENT:
+                if degraded.get("while") == self._setup(model):
+                    return None  # nothing it depends on changed: it would fail again
+            elif time.time() < float(degraded.get("until") or 0):
                 return None
             if rec["pin"] != "split" and self.key_problem(model, rec):
                 return None  # a plan's helper is still missing; keep serving locally
@@ -295,21 +314,49 @@ class PlanBook:
         self.hub.event("plan_stale", model=model, reason=problem)
         log.info("the benchmark of %s no longer applies: %s", model, problem)
 
-    def fail(self, model: str, reason: str, tail: list[str] | None = None) -> None:
+    def _setup(self, model: str) -> str:
+        """What a permanent failure of ``model`` depends on: when this changes, split is tried again."""
+        from .runtime import model_key
+
+        lc = self.config.llamacpp
+        parts = (model_key(model), self.digest_of(model), str(self.ctx_for(model)), str(self.pins.build))
+        return "|".join((*parts, lc.backend, lc.path, BOOT))
+
+    def retry_delay(self, failures: int) -> float:
+        """The pause after ``failures`` transient failures in a row: retry_after, doubling, capped."""
+        base = self.config.planner.retry_after
+        return min(max(RETRY_CAP, base), base * 2.0 ** min(max(failures, 1) - 1, 32))
+
+    def fail(self, model: str, reason: str, tail: list[str] | None = None, kind: str = TRANSIENT) -> None:
         """Split mode failed for ``model``: Ollama serves it until the plan can recover."""
-        until = time.time() + self.config.planner.retry_after
+        reason = safe_text(reason, 300)
+        now = time.time()
+        changes: dict[str, Any]
+        if kind == PERMANENT:
+            changes = {
+                "degraded": {"reason": reason, "at": now, "kind": kind, "until": None, "while": self._setup(model)}
+            }
+            retry = "split isn't tried again until the model, its context or llama.cpp change"
+        else:
+            failures = (int(self.record(model)["failures"] or 0) if self.hub.state is not None else 0) + 1
+            delay = self.retry_delay(failures)
+            degraded = {"reason": reason, "at": now, "kind": TRANSIENT, "until": now + delay, "failures": failures}
+            changes = {"degraded": degraded, "failures": failures}
+            retry = f"split is retried after {int(delay)} s, once its helpers are back"
         if self.hub.state is not None:
-            self._update(model, degraded={"reason": safe_text(reason, 300), "at": time.time(), "until": until})
-        message = (
-            f"split mode for {model} failed: {reason}; Ollama serves it "
-            f"(split is retried after {int(self.config.planner.retry_after)} s, once its helpers are back)"
-        )
+            self._update(model, **changes)
+        message = f"split mode for {model} failed: {reason}; Ollama serves it ({retry})"
         self._warn(message)
-        fields: dict[str, Any] = {"model": model, "reason": safe_text(reason, 300)}
+        fields: dict[str, Any] = {"model": model, "reason": reason, "failure": kind}
         if tail:
             fields["tail"] = [safe_text(line, 200) for line in tail[-5:]]
         self.hub.event("split_failed", **fields)
         log.warning("%s", message)
+
+    def succeeded(self, model: str) -> None:
+        """An answer came through split mode: the next transient failure waits retry_after again."""
+        if self.hub.state is not None and self.record(model)["failures"]:
+            self._update(model, failures=0)
 
     def _warn(self, message: str) -> None:
         self._warnings.append((time.monotonic(), message))
@@ -439,23 +486,29 @@ class PlanBook:
         ab = rec.get("auto_bench")
         return isinstance(ab, dict) and bool(ab.get("stopped")) and ab.get("key") == attempt
 
-    def bench_failed(self, model: str, attempt: str, error: str) -> None:
-        """An automatic benchmark of ``model`` got no working split run: count it, stop after too many."""
+    def bench_failed(self, model: str, attempt: str, error: str, permanent: bool = False) -> None:
+        """An automatic benchmark of ``model`` got no working split run: count it, stop after too many.
+
+        A permanent failure stops at once: under the same key it would only fail again.
+        """
         self._failed_keys[attempt] = time.time()
         if self.hub.state is None:
             return
         ab = self.record(model)["auto_bench"]
         failures = ab.get("failures", 0) if isinstance(ab, dict) and ab.get("key") == attempt else 0
         failures = (failures if isinstance(failures, int) else 0) + 1
-        stopped = failures >= AUTO_BENCH_MAX_FAILURES
-        error = safe_text(error, 300)
-        self._update(
-            model,
-            auto_bench={"key": attempt, "failures": failures, "error": error, "at": time.time(), "stopped": stopped},
-        )
-        if stopped:
-            message = self._stopped_message(model, failures, error)  # warnings() shows it while it lasts
-            self.hub.event("auto_benchmark_stopped", model=model, failures=failures, error=error)
+        ab = {
+            "key": attempt,
+            "failures": failures,
+            "error": safe_text(error, 300),
+            "at": time.time(),
+            "stopped": permanent or failures >= AUTO_BENCH_MAX_FAILURES,
+            "permanent": permanent,
+        }
+        self._update(model, auto_bench=ab)
+        if ab["stopped"]:
+            message = self._stopped_message(model, ab)  # warnings() shows it while it lasts
+            self.hub.event("auto_benchmark_stopped", model=model, failures=failures, error=ab["error"])
             log.warning("%s", message)
 
     def bench_succeeded(self, model: str) -> None:
@@ -464,10 +517,16 @@ class PlanBook:
             self._update(model, auto_bench=None)
 
     @staticmethod
-    def _stopped_message(model: str, failures: int, error: str) -> str:
+    def _stopped_message(model: str, ab: dict[str, Any]) -> str:
+        error = str(ab.get("error") or "")
+        why = (
+            "split mode can't work under these conditions"
+            if ab.get("permanent")
+            else f"{int(ab.get('failures') or 0)} failed attempts"
+        )
         return (
-            f"automatic benchmarks of {model} stopped after {failures} failed attempts"
-            + (f" (last: {error})" if error else "")
+            f"automatic benchmarks of {model} stopped after {why}"
+            + (f" ({error})" if error else "")
             + f"; `ollamapower models benchmark {model}` tries again"
         )
 
@@ -475,8 +534,7 @@ class PlanBook:
         """The "stopped" message for ``model`` if its automatic benchmarks gave up under the current key."""
         if rec["pin"] is not None or not self.auto_bench_stopped(rec, self._attempt_key(model)):
             return ""
-        ab = rec["auto_bench"]
-        return self._stopped_message(model, int(ab.get("failures") or 0), str(ab.get("error") or ""))
+        return self._stopped_message(model, rec["auto_bench"])
 
     def _attempt_key(self, model: str) -> str:
         from .runtime import model_key
@@ -510,10 +568,14 @@ class PlanBook:
         try:
             result = await self.auto_task
             splits = result.get("splits") or []
-            if not any(s.get("ok") for s in splits):
+            kinds = {s.get("failure", TRANSIENT) for s in splits}
+            if splits and kinds == {AWAY}:
+                pass  # a helper stepped away mid-benchmark: not split mode failing, nothing to count
+            elif not any(s.get("ok") for s in splits):
                 # The model is now "decided local" without a key, which pending() reads as "no
                 # benchmark yet": without counting, it would be benchmarked again and again.
-                self.bench_failed(model, attempt, str(splits[-1].get("error") or "") if splits else "no split run")
+                error = str(splits[-1].get("error") or "") if splits else "no split run"
+                self.bench_failed(model, attempt, error, permanent=PERMANENT in kinds)
         except asyncio.CancelledError:
             current = asyncio.current_task()
             if current is not None and current.cancelling():

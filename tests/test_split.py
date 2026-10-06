@@ -519,6 +519,30 @@ def test_failed_llama_server_start_falls_back_and_releases_helpers(cluster, clie
     assert wait_for(lambda: c.agent.rpc.session is None, 5)
 
 
+def test_failures_are_transient_or_permanent_and_success_resets_the_backoff(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    (c.hub_bin / "fail_start").write_text("1")  # says nothing that tells why: may work next time
+    assert chat(client, c).status_code == 200 and c.rec.last["path"] == "/api/chat"
+    rec = c.call(lambda: c.hub.plans.record("tiny"))
+    assert rec["degraded"]["kind"] == "transient" and rec["failures"] == 1
+    assert c.call(lambda: c.hub.split.last_failure["tiny:latest"][0]) == "transient"
+
+    # llama.cpp can't load this model at all: no retrying until something changes.
+    c.call(lambda: c.hub.plans.pin("tiny", "split"))  # the owner's pin clears the degraded state
+    (c.hub_bin / "fail_start").write_text("llama_model_load: error loading model: unknown model architecture: 'x'")
+    assert chat(client, c).status_code == 200 and c.rec.last["path"] == "/api/chat"
+    rec = c.call(lambda: c.hub.plans.record("tiny"))
+    assert rec["degraded"]["kind"] == "permanent" and rec["degraded"]["until"] is None
+    assert any("isn't tried again until" in w for w in c.call(c.hub.warnings))
+
+    # An answer through split mode puts the backoff back at planner.retry_after.
+    (c.hub_bin / "fail_start").unlink()
+    c.call(lambda: c.hub.plans.pin("tiny", "split"))
+    assert chat(client, c).status_code == 200 and c.call(lambda: c.hub.split.is_running("tiny"))
+    assert wait_for(lambda: c.call(lambda: c.hub.plans.record("tiny")["failures"]) == 0, 5)
+
+
 def test_plan_refuses_unknown_and_bad_input(cluster):
     with pytest.raises(AdminError, match="not installed"):
         cluster.admin("models.plan", model="missing", ctx=512)

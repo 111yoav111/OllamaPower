@@ -59,8 +59,9 @@ if "--rpc" in args:
         host, port = endpoint.rsplit(":", 1)
         with socket.create_connection((host.strip("[]"), int(port)), timeout=5) as s:
             s.sendall(b"ping"); assert s.recv(4) == b"ping"
-if (HERE / "fail_start").exists():
-    print("error: failed to load model", flush=True); sys.exit(3)
+if (HERE / "fail_start").exists():  # "1", or the line to print before exiting
+    said = (HERE / "fail_start").read_text().strip()
+    print(said if said != "1" else "error: failed to load model", flush=True); sys.exit(3)
 port = int(args[args.index("--port") + 1])
 CTX = int(args[args.index("-c") + 1])
 CALLS_LOCK = threading.Lock()

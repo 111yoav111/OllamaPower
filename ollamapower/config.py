@@ -138,7 +138,10 @@ class PlannerConfig:
     # Seconds without any request before an automatic benchmark may start.
     idle_seconds: float = 300.0
     # After a split failure, Ollama serves the model for at least this long, then split
-    # mode is tried again once all of the plan's helpers are back.
+    # mode is tried again once all of the plan's helpers are back. The pause doubles with
+    # every failure in a row (up to an hour) and starts over once split mode answers again.
+    # Failures that can't go away by themselves (llama.cpp can't load the model, llama.cpp
+    # missing or the wrong build) wait for the model, its context or llama.cpp to change.
     retry_after: float = 120.0
     # The benchmark workload (same for every engine): prompt size and tokens generated.
     prompt_tokens: int = 512

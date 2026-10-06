@@ -10,7 +10,15 @@ from .variants import VariantError, archives_for, current_platform, resolve_back
 
 
 class LlamaCppUnavailable(Exception):
-    """llama.cpp can't be used here; the message says why and how to fix it."""
+    """llama.cpp can't be used here; the message says why and how to fix it.
+
+    ``permanent``: trying again won't help until something changes (no build for this
+    platform, programs missing or the wrong build), unlike a failed download.
+    """
+
+    def __init__(self, message: str, permanent: bool = False) -> None:
+        super().__init__(message)
+        self.permanent = permanent
 
 
 class LlamaCppNotInstalled(LlamaCppUnavailable):
@@ -52,7 +60,9 @@ def ensure(
             root = install(variant, base, pins, progress)
         binaries = LlamaCpp.find(root).probe()
         binaries.check(pins.build)
-    except (InstallError, VariantError, BinaryError) as exc:
+    except (VariantError, BinaryError) as exc:
+        raise LlamaCppUnavailable(str(exc), permanent=True) from None
+    except InstallError as exc:  # download, verification or unpacking: may work next time
         raise LlamaCppUnavailable(str(exc)) from None
     except OSError as exc:  # e.g. the config dir isn't writable: a message, not a traceback
         raise LlamaCppUnavailable(f"llama.cpp setup failed: {exc}") from None

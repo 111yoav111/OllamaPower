@@ -215,7 +215,8 @@ def auto(book, monkeypatch):
 
     async def fake_benchmark(hub_: Any, model: str, ctx: int | None = None, automatic: bool = False) -> dict:
         calls.append(automatic)
-        split = run(30.0, helpers=helpers) if outcome["ok"] else {"ok": False, "error": outcome["error"]}
+        failed = {"ok": False, "error": outcome["error"], "failure": outcome.get("failure", "transient")}
+        split = run(30.0, helpers=helpers) if outcome["ok"] else failed
         plans.decide(model, run(10.0), [split])
         if split["ok"]:
             plans.bench_succeeded(model)
@@ -280,6 +281,110 @@ def test_auto_benchmark_failures_only_count_in_a_row(auto):
         now[0] += plans_mod.FAILED_BENCH_BACKOFF + 1
     outcome["ok"] = True
     cycle()
+    assert plans.record("big:70b")["auto_bench"] is None
+
+
+def test_transient_failures_back_off_exponentially_up_to_a_cap(book, monkeypatch):
+    plans, hub, helpers = book
+    hub.config.planner.retry_after = 120.0
+    now = [1_000_000.0]
+    monkeypatch.setattr("ollamapower.hub.plans.time.time", lambda: now[0])
+    plans.decide("big:70b", run(10.0), [run(20.0, helpers=helpers)])
+    waits = []
+    for _ in range(8):
+        plans.fail("big:70b", "desk disconnected")
+        rec = plans.record("big:70b")
+        wait = rec["degraded"]["until"] - now[0]
+        waits.append(wait)
+        assert rec["degraded"]["kind"] == "transient" and rec["failures"] == len(waits)
+        now[0] += wait - 1
+        assert plans.route("big:70b") is None  # still cooling down
+        now[0] += 2
+        assert plans.route("big:70b") is not None  # tried again (and failed again, below)
+    assert waits == [120, 240, 480, 960, 1920, 3600, 3600, 3600]
+    assert any("retried after 3600 s" in w for w in plans.warnings())
+    plans.succeeded("big:70b")  # an answer came through split mode
+    assert plans.record("big:70b")["failures"] == 0
+    plans.fail("big:70b", "timed out loading the model")
+    assert plans.record("big:70b")["degraded"]["until"] - now[0] == 120
+
+
+def test_permanent_failures_wait_for_a_change(book, monkeypatch):
+    plans, hub, helpers = book
+    now = [1_000_000.0]
+    monkeypatch.setattr("ollamapower.hub.plans.time.time", lambda: now[0])
+    plans.decide("big:70b", run(10.0), [run(20.0, helpers=helpers)])
+    plans.fail("big:70b", "llama-server exited with code 1: unknown model architecture", kind="permanent")
+    rec = plans.record("big:70b")
+    assert rec["degraded"]["kind"] == "permanent" and rec["failures"] == 0
+    assert any("isn't tried again until" in w for w in plans.warnings())
+    now[0] += 365 * 24 * 3600
+    assert plans.route("big:70b") is None  # time alone changes nothing
+    hub.config.llamacpp.path = "/opt/llama.cpp"  # the owner points the hub at another llama.cpp
+    assert plans.route("big:70b") is not None and plans.record("big:70b")["degraded"] is None
+    plans.fail("big:70b", "unsupported model", kind="permanent")
+    hub.ollama.installed[0].digest = "d2"  # the model was pulled again
+    plans.pin("big:70b", "split")
+    assert plans.route("big:70b") is not None
+
+
+def test_old_degraded_records_still_cool_down(book, monkeypatch):
+    plans, hub, helpers = book
+    now = [1_000_000.0]
+    monkeypatch.setattr("ollamapower.hub.plans.time.time", lambda: now[0])
+    plans.decide("big:70b", run(10.0), [run(20.0, helpers=helpers)])
+    hub.state.data["plans"]["big:70b"]["degraded"] = {"reason": "x", "at": now[0], "until": now[0] + 60}
+    assert plans.route("big:70b") is None
+    now[0] += 61
+    assert plans.route("big:70b") is not None
+
+
+@pytest.mark.parametrize(
+    "code,output,kind",
+    [
+        (1, ["llama_model_load: error loading model: unknown model architecture: 'mamba9'"], "permanent"),
+        (127, ["sh: llama-server: not found"], "permanent"),
+        (-4, [], "permanent"),  # SIGILL: built for another CPU
+        (1, ["error while loading shared libraries: libvulkan.so.1"], "permanent"),
+        (
+            1,
+            ["ggml_backend_cuda_buffer_type_alloc_buffer: allocating 9000 MiB: cudaMalloc failed: out of memory"],
+            "transient",
+        ),
+        (1, ["unknown model architecture", "ErrorOutOfDeviceMemory"], "transient"),  # memory may be free next time
+        (3, ["error: failed to load model"], "transient"),
+        (-9, ["GGML_ASSERT failed"], "transient"),
+    ],
+)
+def test_llama_server_exits_are_classified(code, output, kind):
+    from ollamapower.hub.engines.split import exit_kind
+
+    assert exit_kind(code, output) == kind
+
+
+def test_helper_away_is_never_a_failure_and_llamacpp_problems_are_classified():
+    from ollamapower.hub.engines.split import HelperAway, PlanStale, SplitUnavailable
+    from ollamapower.llamacpp.manager import LlamaCppUnavailable
+
+    assert HelperAway("x").kind == PlanStale("x").kind == "away"
+    assert SplitUnavailable("x").kind == "transient" and SplitUnavailable("x", "permanent").kind == "permanent"
+    assert LlamaCppUnavailable("downloading x failed").permanent is False
+
+
+def test_auto_benchmark_stops_at_once_on_a_permanent_failure(auto):
+    plans, _, _, _, outcome, calls, cycle = auto
+    outcome.update(error="llama-server exited with code 1: unknown model architecture", failure="permanent")
+    assert cycle() == ["big:70b"]
+    ab = plans.record("big:70b")["auto_bench"]
+    assert ab["stopped"] and ab["permanent"] and ab["failures"] == 1
+    assert any("can't work under these conditions" in w for w in plans.warnings())
+
+
+def test_auto_benchmark_does_not_count_helpers_stepping_away(auto):
+    plans, _, _, now, outcome, calls, cycle = auto
+    outcome.update(error="desk stopped lending while split mode was starting", failure="away")
+    for _ in range(plans_mod.AUTO_BENCH_MAX_FAILURES + 1):
+        assert cycle() == ["big:70b"]  # no backoff, no count
     assert plans.record("big:70b")["auto_bench"] is None
 
 

@@ -84,7 +84,8 @@ memory_margin = 0.10
 # models; abandoned as soon as a request arrives). Off: only `models benchmark`.
 auto_benchmark = true
 idle_seconds = 300.0
-# After a split failure Ollama serves the model at least this long (seconds).
+# After a split failure Ollama serves the model at least this long (seconds),
+# doubling with each failure in a row up to an hour.
 retry_after = 120.0
 # The benchmark workload: prompt tokens and generated tokens.
 prompt_tokens = 512

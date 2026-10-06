@@ -25,7 +25,7 @@ import httpx
 
 from ..aio import wait_for
 from ..textsafe import safe_text
-from .plans import KEY_VERSION
+from .plans import KEY_VERSION, TRANSIENT
 
 if TYPE_CHECKING:
     from .runtime import Hub
@@ -174,7 +174,12 @@ async def benchmark_model(hub: Hub, model: str, ctx: int | None = None, automati
             splits = []
             for i, ids in enumerate(sets, 1):
                 plans.benchmarking = {**plans.benchmarking, "stage": f"split {i}/{len(sets)}"}
+                began = time.monotonic()
                 result = await run_workload(hub, model, ctx, "split", ids)
+                if not result["ok"]:
+                    # Why split mode didn't start (a helper stepping away is no failure); else: transient.
+                    kind, at = hub.split.last_failure.get(model, (TRANSIENT, 0.0))
+                    result["failure"] = kind if at >= began else TRANSIENT
                 session = hub.split.session
                 key = None
                 if result["ok"] and session is not None:

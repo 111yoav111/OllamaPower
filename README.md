@@ -337,8 +337,12 @@ equivalent; after a hard kill there, end leftovers with `pkill rpc-server` or
 - **Stalls:** no token for `split.stall_timeout` seconds counts as a failure.
 - A degraded model runs on Ollama for at least `planner.retry_after` seconds
   and until every helper of its plan is back; then split mode is used again.
-  The reason, and the last lines of llama-server's output on a crash, are in
-  the warnings and the event log.
+  Each failure in a row doubles the wait (up to an hour); an answer through
+  split mode starts it over. Failures that won't go away by themselves
+  (llama.cpp can't load the model, llama.cpp missing or the wrong build) wait
+  until the model, its context or llama.cpp change. A helper pausing or
+  leaving its schedule is never a failure. The reason, and the last lines of
+  llama-server's output on a crash, are in the warnings and the event log.
 
 Limits today: images (vision models' projector isn't loaded), raw/suffix
 `generate` prompts and per-request `num_ctx` are not supported in split mode
