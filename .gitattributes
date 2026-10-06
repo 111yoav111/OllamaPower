@@ -1,0 +1,5 @@
+# Line endings that must survive a Windows checkout (core.autocrlf=true):
+# shell scripts with CRLF fail in sh ("set: -e\r: invalid option"), so always LF;
+# batch files are committed with CRLF and are left exactly as they are.
+*.sh text eol=lf
+*.bat -text
