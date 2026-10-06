@@ -8,7 +8,10 @@ program names. They answer ``--version`` (the pinned build) and
 * the fake llama-server records its arguments to ``args.json``, checks it can
   reach every ``--rpc`` endpoint (an echo round trip through the agent's
   relay), then serves ``/health`` and an OpenAI-style streaming
-  ``/v1/chat/completions`` with llama-server's ``timings``.
+  ``/v1/chat/completions`` with llama-server's ``timings``; a prompt as long
+  as its ``-c`` context is refused like llama-server does. ``/apply-template``
+  (a toy template), ``/tokenize`` and ``/detokenize`` (one token per
+  character) are logged to ``calls.json``.
 """
 
 from __future__ import annotations
@@ -59,6 +62,10 @@ if "--rpc" in args:
 if (HERE / "fail_start").exists():
     print("error: failed to load model", flush=True); sys.exit(3)
 port = int(args[args.index("--port") + 1])
+CTX = int(args[args.index("-c") + 1])
+
+def render(messages):  # the fake chat template
+    return "".join(f"<{m.get('role')}>{m.get('content') or ''}\n" for m in messages) + "<assistant>"
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -69,7 +76,24 @@ class H(BaseHTTPRequestHandler):
         if self.headers.get("authorization") != "Bearer " + os.environ.get("LLAMA_API_KEY", "-"):
             self.send_response(401); self.end_headers(); return
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        if self.path in ("/apply-template", "/tokenize", "/detokenize"):
+            calls = HERE / "calls.json"
+            calls.write_text(json.dumps([*(json.loads(calls.read_text()) if calls.exists() else []), self.path]))
+            if self.path == "/apply-template":
+                reply = {"prompt": render(body["messages"])}
+            elif self.path == "/tokenize":  # one token per character
+                reply = {"tokens": [ord(ch) for ch in body["content"]]}
+            else:
+                reply = {"content": "".join(chr(t) for t in body["tokens"])}
+            self.send_response(200); self.send_header("content-type", "application/json"); self.end_headers()
+            self.wfile.write(json.dumps(reply).encode()); return
         (HERE / "last_request.json").write_text(json.dumps({"path": self.path, "body": body}))
+        n_prompt = len(render(body["messages"])) if body.get("messages") else 0
+        if n_prompt >= CTX:
+            self.send_response(400); self.send_header("content-type", "application/json"); self.end_headers()
+            message = f"request ({n_prompt} tokens) exceeds the available context size ({CTX} tokens)"
+            error = {"code": 400, "message": message, "type": "exceed_context_size_error", "n_ctx": CTX}
+            self.wfile.write(json.dumps({"error": error}).encode()); return
         if body.get("messages") and body["messages"][-1].get("content") == "fail":
             self.send_response(400); self.send_header("content-type", "application/json"); self.end_headers()
             self.wfile.write(json.dumps({"error": {"code": 400, "message": "bad request from fake"}}).encode()); return

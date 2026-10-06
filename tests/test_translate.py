@@ -11,6 +11,7 @@ from ollamapower.hub.engines.translate import (
     UnsupportedRequest,
     apply_model_defaults,
     chat_request,
+    context_overflow,
     generate_request,
     is_load_request,
 )
@@ -268,6 +269,14 @@ def test_modelfile_defaults_on_generate():
     before = json.loads(json.dumps(out))
     apply_model_defaults(out, body, False, ModelDefaults())
     assert out == before
+
+
+def test_context_overflow_is_recognised():
+    error = {"code": 400, "message": "too long", "type": "exceed_context_size_error", "n_ctx": 256}
+    assert context_overflow(json.dumps({"error": error}).encode()) == 256
+    assert context_overflow(json.dumps({"error": {**error, "n_ctx": None}}).encode()) == 0
+    assert context_overflow(json.dumps({"error": {**error, "type": "invalid_request_error"}}).encode()) is None
+    assert context_overflow(b"not json") is None and context_overflow(b"[]") is None
 
 
 @pytest.mark.parametrize("think", ["max", "true", "", 1])

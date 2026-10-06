@@ -264,6 +264,30 @@ def test_modelfile_system_parameters_and_messages_apply(cluster, client):
     assert sent["temperature"] == 0.2 and sent["stop"] == ["<end>"]
 
 
+def test_a_prompt_longer_than_the_context_drops_the_oldest_messages(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    assert chat(client, c).status_code == 200
+    assert not (c.hub_bin / "calls.json").exists()  # a prompt that fits costs no extra request
+
+    old = [{"role": r, "content": f"{i}" * 100} for i, r in enumerate(["user", "assistant"] * 4)]
+    messages = [{"role": "system", "content": "sys"}, *old, {"role": "user", "content": "latest"}]
+    r = chat(client, c, messages=messages)
+    assert r.status_code == 200, r.text
+    assert "".join(json.loads(x)["message"]["content"] for x in r.text.splitlines()) == "Hello from split"
+    sent = json.loads((c.hub_bin / "last_request.json").read_text())["body"]["messages"]
+    # The fake template makes ~110 tokens of each old message: the system prompt, the last four
+    # old messages and the latest one fit in 512 (474 tokens), one more wouldn't.
+    assert [m["content"] for m in sent] == ["sys", *(f"{i}" * 100 for i in range(4, 8)), "latest"]
+
+    r = chat(client, c, messages=messages, truncate=False)
+    assert r.status_code == 400 and "exceeds the available context size" in r.json()["error"]
+    r = chat(client, c, messages=[{"role": "user", "content": "x" * 600}, {"role": "user", "content": "y" * 600}])
+    assert (
+        r.status_code == 400 and "exceeds the available context size" in r.json()["error"]
+    )  # even the last is too long
+
+
 def test_openai_requests_pass_through_to_llama_server(cluster, client):
     c = cluster
     c.admin("models.plan", model="tiny", ctx=512)

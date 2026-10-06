@@ -19,9 +19,12 @@ import secrets
 import string
 import time
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ...ollama.blobs import ModelDefaults
+
+if TYPE_CHECKING:
+    import httpx
 
 # Ollama option -> llama-server field (llama-server accepts its native sampling fields on /v1 too).
 OPTION_MAP = {
@@ -193,6 +196,73 @@ def apply_model_defaults(out: dict[str, Any], body: dict[str, Any], chat: bool, 
         return
     head, prompt = messages[:-1], messages[-1:]  # generate: [its own system], user prompt
     out["messages"] = [*(head or system), *([] if body.get("context") else model_messages), *prompt]
+
+
+def context_overflow(raw: bytes) -> int | None:
+    """llama-server's "prompt longer than the context" error -> the context size (0 if not said); else None."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    err = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict) or err.get("type") != "exceed_context_size_error":
+        return None
+    n_ctx = err.get("n_ctx")
+    return n_ctx if isinstance(n_ctx, int) and not isinstance(n_ctx, bool) and n_ctx > 0 else 0
+
+
+async def _prompt_tokens(client: httpx.AsyncClient, body: dict[str, Any]) -> int | None:
+    """How many tokens llama-server makes of ``body``'s messages (None: it couldn't render them)."""
+    probe = {k: v for k, v in body.items() if k not in ("stream", "stream_options", "return_progress")}
+    prompt = _field(await client.post("/apply-template", json=probe), "prompt")
+    if not isinstance(prompt, str):
+        return None
+    tokenize = {"content": prompt, "add_special": True, "parse_special": True}  # as llama-server reads prompts
+    tokens = _field(await client.post("/tokenize", json=tokenize), "tokens")
+    return len(tokens) if isinstance(tokens, list) else None
+
+
+def _field(r: httpx.Response, key: str) -> Any:
+    """``key`` of a llama-server JSON answer; None if it failed or isn't readable."""
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    return data.get(key) if isinstance(data, dict) else None
+
+
+async def fit_messages(client: httpx.AsyncClient, body: dict[str, Any], n_ctx: int) -> list[dict[str, Any]] | None:
+    """The longest tail of ``body``'s messages that fits in ``n_ctx`` tokens, like Ollama's chat truncation.
+
+    The oldest messages are dropped first; system messages and the last
+    message are always kept. None if even that doesn't fit. Only called
+    after llama-server refused the whole prompt, so the extra requests
+    (render and count, a binary search) never cost a normal request anything.
+    """
+    messages = body["messages"]
+    last = len(messages) - 1
+    if last < 1:
+        return None
+
+    def keep_from(i: int) -> list[dict[str, Any]]:
+        return [m for m in messages[:i] if m.get("role") == "system"] + messages[i:]
+
+    async def fits(i: int) -> bool:
+        n = await _prompt_tokens(client, {**body, "messages": keep_from(i)})
+        return n is not None and n < n_ctx  # llama-server needs room for at least one new token
+
+    if not await fits(last):
+        return None
+    lo, hi = 1, last
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if await fits(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    return keep_from(lo)
 
 
 def is_load_request(path: str, body: dict[str, Any]) -> bool:

@@ -54,6 +54,8 @@ from ..engines.translate import (
     UnsupportedRequest,
     apply_model_defaults,
     chat_request,
+    context_overflow,
+    fit_messages,
     generate_request,
     is_load_request,
     load_reply,
@@ -95,6 +97,7 @@ TIMED_ENDPOINTS = frozenset({"/api/chat", "/api/generate"})
 SPLIT_ENDPOINTS = frozenset({"/api/chat", "/api/generate", "/v1/chat/completions", "/v1/completions"})
 PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 MAX_PS_BYTES = 4 * 1024 * 1024
+MAX_ERROR_BYTES = 1024 * 1024  # a llama-server error answer read whole (to see if the prompt was too long)
 # Bodies bigger than this are parsed off the event loop (base64 images can be huge).
 INLINE_PARSE_BYTES = 256 * 1024
 
@@ -162,6 +165,20 @@ def keep_alive_zero(value: Any) -> bool:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value == 0
     return isinstance(value, str) and value.strip().rstrip("smh") in ("0", "0.0")
+
+
+async def read_rest(chunks: AsyncIterator[bytes], limit: int = MAX_ERROR_BYTES) -> bytes:
+    """The rest of a (small) error answer; anything past ``limit`` is dropped."""
+    out = bytearray()
+    async for chunk in chunks:
+        if len(out) < limit:
+            out += chunk[: limit - len(out)]
+    return bytes(out)
+
+
+async def no_more() -> AsyncIterator[bytes]:
+    return
+    yield b""  # an async generator that yields nothing
 
 
 def cors(origin: str | None) -> dict[str, str] | None:
@@ -298,21 +315,14 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     hub.split.report_failure(session, "llama-server stopped answering mid-answer")
                 finish(outcome, status)
 
-            # Send the request and wait for the first bytes of the answer. Until then nothing has
-            # reached the client, so if split mode breaks now, Ollama answers instead - transparently.
-            upstream = None
-            try:
-                # One request at a time per llama-server slot; waiting here isn't llama-server's time.
-                await race_kill(session.slot.acquire(), stream, request.receive)
-                has_slot = True
+            upstream: httpx.Response | None = None
+            chunks: AsyncIterator[bytes] | None = None
+            first = b""
+
+            async def start(first_byte: float, read: float | None) -> None:
+                """Send the request; read the first bytes of the answer."""
+                nonlocal upstream, chunks, first
                 assert session.client is not None
-                if native:
-                    # Progress chunks while the prompt is processed: a long prompt is alive, not stalled.
-                    translated["return_progress"] = True
-                    first_byte, read = config.split.stall_timeout, config.split.stall_timeout
-                else:
-                    # /v1 passes through as is: no progress, and "stream": false sends nothing until done.
-                    first_byte, read = config.split.load_timeout, None
                 upstream_request = session.client.build_request(
                     "POST",
                     "/v1/chat/completions" if native else target,
@@ -326,6 +336,49 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     first = await race_kill(wait_for(anext(chunks), first_byte), stream, request.receive)
                 except StopAsyncIteration:
                     first = b""
+
+            async def truncate_and_retry(first_byte: float, read: float | None) -> None:
+                """llama-server refuses a prompt longer than the context; Ollama drops the oldest messages."""
+                nonlocal upstream, chunks, first
+                assert upstream is not None and chunks is not None and translated is not None
+                raw = first + await race_kill(read_rest(chunks), stream, request.receive)
+                first, chunks = raw, no_more()  # unless we retry, this error goes to the client as before
+                n_ctx = context_overflow(raw)
+                if n_ctx is None:
+                    return
+                assert session.client is not None
+                fitted = await race_kill(
+                    fit_messages(session.client, translated, n_ctx or session.ctx), stream, request.receive
+                )
+                if fitted is None:
+                    return
+                log.info(
+                    "split: %d of %d messages dropped to fit the context",
+                    len(translated["messages"]) - len(fitted),
+                    len(translated["messages"]),
+                )
+                translated["messages"] = fitted
+                await upstream.aclose()
+                upstream = None
+                await start(first_byte, read)
+
+            # Send the request and wait for the first bytes of the answer. Until then nothing has
+            # reached the client, so if split mode breaks now, Ollama answers instead - transparently.
+            try:
+                # One request at a time per llama-server slot; waiting here isn't llama-server's time.
+                await race_kill(session.slot.acquire(), stream, request.receive)
+                has_slot = True
+                assert session.client is not None
+                if native:
+                    # Progress chunks while the prompt is processed: a long prompt is alive, not stalled.
+                    translated["return_progress"] = True
+                    first_byte, read = config.split.stall_timeout, config.split.stall_timeout
+                else:
+                    # /v1 passes through as is: no progress, and "stream": false sends nothing until done.
+                    first_byte, read = config.split.load_timeout, None
+                await start(first_byte, read)
+                if path == "/api/chat" and upstream.status_code == 400 and parsed.get("truncate") is not False:
+                    await truncate_and_retry(first_byte, read)
             except (httpx.HTTPError, TimeoutError, StreamKilled) as exc:
                 if upstream is not None:
                     await upstream.aclose()
@@ -353,6 +406,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     await upstream.aclose()
                 release()
                 raise
+            assert upstream is not None
             transform = (
                 OllamaStream(
                     str(parsed.get("model", "")),
