@@ -94,6 +94,12 @@ def test_doctor_exit_code(cfg_env):
     assert result.exit_code == 1 and "[ERROR]" in result.output and "fix:" in result.output
 
 
+def test_doctor_survives_a_malformed_ollama_host(cfg_env):
+    result = run("doctor", env={"OLLAMA_HOST": "http://[::1"})
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit)
+    assert "OLLAMA_HOST is set to 'http://[::1', which is not a valid address" in result.output
+
+
 def test_hub_refuses_non_loopback(cfg_env):
     (cfg_env / "config.toml").write_text('[hub]\nhost = "0.0.0.0"\n')
     result = run("hub", "--allow-root")

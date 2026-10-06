@@ -39,8 +39,9 @@ an attacker who already runs code as the owner on the Hub or a helper.
   get `403`, and llama-server's own "allow every origin" headers are never
   passed on.
 - **Ollama stays local.** `ollama.url` must be a loopback address and may not
-  be the front door's own port. `doctor` flags Ollama's port answering on any
-  non-loopback interface and a non-loopback `OLLAMA_HOST`.
+  be the front door's own port. `doctor` flags Ollama's port or the front
+  door's port answering on any non-loopback interface, and a non-loopback,
+  all-interfaces or malformed `OLLAMA_HOST`.
 - **Header hygiene.** Requests reach Ollama with the client's headers except
   hop-by-hop ones, `Host`, `Content-Length`, `Accept-Encoding`, `Expect`,
   cookies and every `X-OllamaPower-*` header; Ollama needs the rest (Origin for its CORS check,
@@ -55,10 +56,12 @@ an attacker who already runs code as the owner on the Hub or a helper.
   tap reads Ollama's final timing object and keeps nothing else.
 - **Owner-only files.** `.env`, `state.json`, its backup and the logs are
   `0600` in a `0700` directory, written atomically; symlinked or foreign-owned
-  directories are refused. `doctor` checks the permissions. `hub` refuses to
-  run as root unless started with `--allow-root`. On Windows the files rely on
-  the user profile's ACL instead; `doctor` warns when `OLLAMAPOWER_CONFIG_DIR`
-  moves them outside it.
+  directories are refused. `doctor` checks the permissions: the config
+  directory, token, hub key and admin secrets readable by others, or any file
+  writable by others, is an error; other files readable by others a warning.
+  On Windows the files rely on the user profile's ACL instead; `doctor` warns
+  when `OLLAMAPOWER_CONFIG_DIR` moves them outside it. `hub` refuses to run as
+  root unless started with `--allow-root`.
 - **Admin channel.** `status` reaches the hub only over a local channel (Unix
   socket `0600`, or `127.0.0.1` on Windows) keyed by a 256-bit secret in an
   owner-only file. The secret never crosses the channel: the hub sends a fresh

@@ -840,16 +840,15 @@ def llamacpp_install(
 ) -> None:
     """Download and verify the pinned llama.cpp build for this machine (hub or helper)."""
     from .llamacpp.install import Pins
-    from .llamacpp.manager import LlamaCppUnavailable, ensure
+    from .llamacpp.manager import LlamaCppUnavailable, ensure, gpu_vendors
     from .llamacpp.variants import BACKENDS
-    from .telemetry import Telemetry
 
     base, configured, custom = _agent_or_hub_llamacpp(config_path)
     backend = backend or configured
     if backend not in BACKENDS:
         typer.secho(f"--backend must be one of {', '.join(BACKENDS)}", fg="red", err=True)
         raise typer.Exit(2)
-    vendors = [g.get("vendor", "") for g in Telemetry().static().get("gpus", []) if g.get("vendor")]
+    vendors = gpu_vendors()
     pins = Pins.load()
     last = [0]
 
@@ -875,11 +874,10 @@ def llamacpp_install(
 @llamacpp_cli.command("status")
 def llamacpp_status(config_path: Path | None = ConfigOption, as_json: bool = typer.Option(False, "--json")) -> None:
     """Show the installed llama.cpp build and the devices it sees (installs nothing)."""
-    from .llamacpp.manager import LlamaCppUnavailable, ensure
-    from .telemetry import Telemetry
+    from .llamacpp.manager import LlamaCppUnavailable, ensure, gpu_vendors
 
     base, backend, custom = _agent_or_hub_llamacpp(config_path)
-    vendors = [g.get("vendor", "") for g in Telemetry().static().get("gpus", []) if g.get("vendor")]
+    vendors = gpu_vendors()
     try:
         found = ensure(base, backend, custom, vendors, download=False)
     except LlamaCppUnavailable as exc:
@@ -901,7 +899,7 @@ def llamacpp_status(config_path: Path | None = ConfigOption, as_json: bool = typ
 
 @cli.command()
 def doctor(config_path: Path | None = ConfigOption) -> None:
-    """Check the setup (Ollama's port move, exposure, token, keys, file permissions)."""
+    """Check the setup (Ollama's port move, exposure, token, keys, file permissions, llama.cpp)."""
     from . import doctor as doc
 
     config = load(config_path)

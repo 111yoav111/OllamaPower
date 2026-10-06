@@ -13,6 +13,17 @@ class LlamaCppUnavailable(Exception):
     """llama.cpp can't be used here; the message says why and how to fix it."""
 
 
+class LlamaCppNotInstalled(LlamaCppUnavailable):
+    """``download=False`` and the pinned build is not installed (nothing is broken)."""
+
+
+def gpu_vendors() -> list[str]:
+    """The GPU vendors this machine has, for ``backend = "auto"``."""
+    from ..telemetry import Telemetry
+
+    return [g.get("vendor", "") for g in Telemetry().static().get("gpus", []) if g.get("vendor")]
+
+
 def ensure(
     base: Path,
     backend: str = "auto",
@@ -35,7 +46,7 @@ def ensure(
             concrete = resolve_backend(backend, system, arch, gpu_vendors or [])
             variant = archives_for(pins.tag, system, arch, concrete)
             if not download and not is_installed(install_dir(base, pins.tag, concrete), variant, pins):
-                raise LlamaCppUnavailable(
+                raise LlamaCppNotInstalled(
                     f"llama.cpp {pins.tag} ({concrete}) is not installed; run `ollamapower llamacpp install`"
                 )
             root = install(variant, base, pins, progress)

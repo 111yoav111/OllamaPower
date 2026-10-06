@@ -70,6 +70,12 @@ sudo systemctl edit ollama        # add: [Service]  Environment="OLLAMA_HOST=127
 sudo systemctl restart ollama
 ```
 
+`doctor` also checks that neither Ollama's port nor the front door's (11434)
+answers on a network address, that `OLLAMA_HOST` is a valid loopback address,
+the cluster token, the hub key, the permissions of the config directory and
+its secrets, and the pinned llama.cpp build (installed, verified, runs). It
+exits 1 if anything is an `[ERROR]`.
+
 `hub` refuses to run as root/Administrator (`--allow-root` overrides) and to
 listen on anything but loopback (remote access is OllamaGate's job).
 
