@@ -464,6 +464,28 @@ async def test_split_request_without_llamacpp_is_refused_with_a_reason(setup):
     assert setup.node().connected  # the agent answered and stayed
 
 
+async def test_stopping_the_agent_ends_its_background_work(setup):
+    agent = setup.agent()
+    task = setup.run(agent)
+    assert await until(lambda: setup.node() is not None and setup.node().connected)
+    stopping = asyncio.Event()
+
+    async def slow_stop(session_id=None, reason=""):
+        if session_id is not None:
+            stopping.set()
+            await asyncio.Event().wait()  # a stop that never finishes on its own
+        return False
+
+    agent.rpc.stop = slow_stop
+    await setup.node().channel.send("rpc_stop", session_id="session-1")
+    await asyncio.wait_for(stopping.wait(), 5)
+    background = set(agent._background)
+    assert background
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert all(t.done() for t in background)  # nothing the hub asked for outlives the agent
+
+
 async def test_outside_allowed_networks_is_dropped(tmp_path, hub_key):
     s = Setup(tmp_path, hub_key, allowed_networks=["10.0.0.0/8"])
     await s.start()

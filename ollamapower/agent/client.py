@@ -120,6 +120,7 @@ class AgentClient:
         self.welcome: dict[str, Any] = {}
         self._tests: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._background: set[asyncio.Task[Any]] = set()
+        self._starts: dict[str, asyncio.Task[Any]] = {}  # rpc_start in progress, by session id
         self._requested: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._heartbeat_seq = 0
         self.rpc = RpcManager(config, self.state.note, self._rpc_failed)
@@ -136,6 +137,18 @@ class AgentClient:
         """Connect and stay connected until stopped (cancelled) or an unrecoverable error."""
         self.state.static = await asyncio.to_thread(self.telemetry.static)
         self._spawn(self._prepare_llamacpp())
+        try:
+            await self._run_connected()
+        finally:
+            # Stopping: nothing the agent started (an rpc_start or rpc_stop in progress,
+            # a network test, the llama.cpp setup) may outlive it.
+            await self._reap_background()
+
+    async def _reap_background(self) -> None:
+        draining = [self._draining] if self._draining is not None else []
+        await reap(*self._background, *draining)
+
+    async def _run_connected(self) -> None:
         while True:
             delay = RECONNECT_DELAY
             try:
@@ -152,6 +165,9 @@ class AgentClient:
                 # Stopping (Ctrl+C, quitting the TUI): tell the hub, so it isn't logged as a failure.
                 if self.channel is not None:
                     await asyncio.shield(self.channel.close("agent stopping"))
+                # Before the session is stopped below: an rpc_start in progress would make
+                # that wait for it to finish starting (up to a minute and a half).
+                await self._reap_background()
                 raise
             finally:
                 # Without the hub there is no one to lend to: end any split session.
@@ -299,16 +315,29 @@ class AgentClient:
             if fut is not None and not fut.done():
                 fut.set_result(m["result"])
         elif kind == "rpc_start":
-            self._spawn(self._rpc_start(channel, m))  # starting takes a while; keep reading
+            session_id = m["session_id"]
+            task = self._spawn(self._rpc_start(channel, m))  # starting takes a while; keep reading
+            self._starts[session_id] = task
+            task.add_done_callback(
+                lambda t: self._starts.pop(session_id, None) if self._starts.get(session_id) is t else None
+            )
         elif kind == "rpc_stop":
-            if not self.rpc.stop_bench(m["session_id"]):
-                await self.rpc.stop(m["session_id"], "stopped by the hub")
-            self.state.version += 1
+            # Stopping waits for that session's start, which can take a minute and a half:
+            # not here, where it would hold up everything else the hub sends.
+            self._spawn(self._rpc_stop(m["session_id"], self._starts.get(m["session_id"])))
 
-    def _spawn(self, coro: Any) -> None:
+    async def _rpc_stop(self, session_id: str, start: asyncio.Task[Any] | None) -> None:
+        if start is not None:
+            await asyncio.wait([start])  # stop what that start made, not before it exists
+        if not self.rpc.stop_bench(session_id):
+            await self.rpc.stop(session_id, "stopped by the hub")
+        self.state.version += 1
+
+    def _spawn(self, coro: Any) -> asyncio.Task[Any]:
         task = asyncio.ensure_future(coro)
         self._background.add(task)  # keep a reference: the loop only holds weak ones
         task.add_done_callback(self._background.discard)
+        return task
 
     # ----- split mode ------------------------------------------------------------------
 

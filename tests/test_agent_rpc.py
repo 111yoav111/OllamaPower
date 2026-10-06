@@ -172,3 +172,25 @@ async def test_start_rechecks_lending_after_launching(agent):
     with pytest.raises(RpcRefused, match="outside the lending schedule"):
         await agent.rpc.start(message, "127.0.0.1", "127.0.0.1", agent.client.config.lending, lambda: next(reasons))
     assert agent.rpc.session is None
+
+
+async def test_a_slow_rpc_stop_does_not_hold_up_the_receive_loop(agent):
+    start = agent.start()
+    await agent.launching.wait()
+    # The hub gives up on the start and says stop: stopping waits for the start to finish,
+    # which can take a minute and a half. Heartbeat replies and other messages can't.
+    await wait_for(agent.client._on_message(agent.channel, {"type": "rpc_stop", "session_id": "s1"}), 1)
+    agent.release.set()
+    await wait_for(start, 5)
+    await wait_for(asyncio.gather(*agent.client._background), 5)
+    assert agent.rpc.session is None  # the stop still came after the start: nothing is left running
+    assert agent.channel.kinds("s1") == ["rpc_ready"]
+
+
+async def test_rpc_stop_right_after_a_tunnel_test_start_stops_it(agent):
+    agent.client.config.lending.allow_direct = True
+    start = {"type": "rpc_start", "session_id": "b1", "purpose": "bench", "tunnel": {"mode": "direct"}}
+    await agent.client._on_message(agent.channel, start)
+    await agent.client._on_message(agent.channel, {"type": "rpc_stop", "session_id": "b1"})
+    await wait_for(asyncio.gather(*agent.client._background), 5)
+    assert agent.rpc.benches == {}  # was left running until its two-minute expiry
