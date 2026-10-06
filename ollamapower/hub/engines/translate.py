@@ -36,6 +36,7 @@ OPTION_MAP = {
     "mirostat_tau": "mirostat_tau",
     "mirostat_eta": "mirostat_eta",
 }
+THINK_LEVELS = frozenset({"high", "medium", "low"})  # llama-server's reasoning_effort takes the same words
 FINISH = {"stop": "stop", "length": "length", "tool_calls": "stop", "content_filter": "stop"}
 NO_IMAGES = (
     "images are not supported in split mode yet (the vision part of the model isn't loaded); "
@@ -66,10 +67,21 @@ def _options(body: dict[str, Any]) -> dict[str, Any]:
         out["response_format"] = {"type": "json_object"}
     elif isinstance(fmt, dict):
         out["response_format"] = {"type": "json_schema", "json_schema": {"name": "response", "schema": fmt}}
-    think = body.get("think")
-    if think is not None:
-        out["chat_template_kwargs"] = {"enable_thinking": think is not False}
+    out.update(_think(body.get("think")))
     return out
+
+
+def _think(think: Any) -> dict[str, Any]:
+    """Ollama's ``think``: true/false, or a level ("high", "medium", "low") that also enables thinking."""
+    if think is None:
+        return {}
+    if isinstance(think, bool):
+        return {"chat_template_kwargs": {"enable_thinking": think}}
+    if isinstance(think, str) and think in THINK_LEVELS:
+        return {"chat_template_kwargs": {"enable_thinking": True}, "reasoning_effort": think}
+    # Ollama refuses anything else while decoding the request, with this message.
+    shown = json.dumps(think[:100]) if isinstance(think, str) else str(think)[:100]
+    raise UnsupportedRequest(f'invalid think value: {shown} (must be "high", "medium", "low", true, or false)')
 
 
 def _message(m: Any, index: int) -> dict[str, Any]:

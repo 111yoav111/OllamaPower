@@ -133,3 +133,25 @@ def test_an_answer_cut_off_is_never_reported_as_done():
     lines = [json.loads(x) for x in out.splitlines()]
     assert all(not x.get("done") for x in lines) and "stopped in the middle" in lines[-1]["error"]
     assert t.truncated
+
+
+@pytest.mark.parametrize(
+    "think,expected",
+    [
+        (True, {"chat_template_kwargs": {"enable_thinking": True}}),
+        (False, {"chat_template_kwargs": {"enable_thinking": False}}),
+        ("high", {"chat_template_kwargs": {"enable_thinking": True}, "reasoning_effort": "high"}),
+        ("medium", {"chat_template_kwargs": {"enable_thinking": True}, "reasoning_effort": "medium"}),
+        ("low", {"chat_template_kwargs": {"enable_thinking": True}, "reasoning_effort": "low"}),
+    ],
+)
+def test_think_bools_and_levels(think, expected):
+    body = chat_request({"messages": [], "think": think})
+    assert {k: body[k] for k in ("chat_template_kwargs", "reasoning_effort") if k in body} == expected
+    assert "reasoning_effort" not in chat_request({"messages": []})
+
+
+@pytest.mark.parametrize("think", ["max", "true", "", 1])
+def test_unknown_think_values_are_refused_like_ollama(think):
+    with pytest.raises(UnsupportedRequest, match="invalid think value"):
+        generate_request({"prompt": "x", "think": think})
