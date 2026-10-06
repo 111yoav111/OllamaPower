@@ -121,9 +121,11 @@ def test_pins_and_exclusions(book):
         plans.pin("big:70b", "turbo")
 
 
-def test_degraded_until_retry_after_and_helpers_back(book):
+def test_degraded_until_retry_after_and_helpers_back(book, monkeypatch):
     plans, hub, helpers = book
     hub.config.planner.retry_after = 0.2
+    now = [time.time()]  # a fake clock: a loaded test machine must not end the cool-down early
+    monkeypatch.setattr("ollamapower.hub.plans.time.time", lambda: now[0])
     plans.decide("big:70b", run(10.0), [run(20.0, helpers=helpers)])
     plans.fail("big:70b", "desk disconnected", ["line 1", "GGML_ASSERT x"])
     assert plans.route("big:70b") is None
@@ -131,7 +133,7 @@ def test_degraded_until_retry_after_and_helpers_back(book):
     event = [e for e in hub.recent_events if e["kind"] == "split_failed"][-1]
     assert event["tail"][-1] == "GGML_ASSERT x"
     gone = helpers.pop(0)
-    time.sleep(0.25)
+    now[0] += 0.25
     assert plans.route("big:70b") is None  # cooled down, but desk is still missing
     helpers.insert(0, gone)
     assert plans.route("big:70b") is not None  # recovered: split again
