@@ -96,6 +96,8 @@ class GGUFInfo:
     head_count_kv: int = 0
     key_length: int = 0
     value_length: int = 0
+    feed_forward_length: int = 0  # widest FFN a token passes (MoE: expert width x experts used)
+    vocab_size: int = 0
     split_count: int = 1  # >1: the model is sharded over several files
     nextn_layers: int = 0  # trailing blocks that are llama.cpp MTP ("NextN") layers
     foreign: dict[str, int] = field(default_factory=dict)  # part ("vision", "audio", "MTP") -> tensor count
@@ -315,12 +317,15 @@ def read_gguf(path: Path) -> GGUFInfo:
             key = r.string()
             meta[key] = r.value(r.unpack("<I"))
         tensors: list[tuple[str, int]] = []
+        embd_dims: tuple[int, ...] = ()
         for _ in range(n_tensors):
             name = r.string()
             dims = r.unpack("<I")
             if dims > MAX_DIMS:
                 raise GGUFError("too many tensor dimensions")
-            r.read(8 * dims)
+            shape = r.read(8 * dims)
+            if name == "token_embd.weight":
+                embd_dims = struct.unpack(f"<{dims}Q", shape)
             r.unpack("<I")  # type
             tensors.append((name, r.unpack("<Q")))
         alignment = _int(meta.get("general.alignment")) or DEFAULT_ALIGNMENT
@@ -348,6 +353,10 @@ def read_gguf(path: Path) -> GGUFInfo:
         head_count_kv=arch_key("attention.head_count_kv"),
         key_length=arch_key("attention.key_length"),
         value_length=arch_key("attention.value_length"),
+        feed_forward_length=max(
+            arch_key("feed_forward_length"), arch_key("expert_feed_forward_length") * arch_key("expert_used_count")
+        ),
+        vocab_size=arch_key("vocab_size") or (embd_dims[1] if len(embd_dims) >= 2 else 0),
         split_count=max(1, _int(meta.get("split.count"))),
         nextn_layers=arch_key("nextn_predict_layers"),
         metadata={k: v for k, v in meta.items() if not isinstance(v, list) and not k.startswith("tokenizer.")},
@@ -363,6 +372,8 @@ def read_gguf(path: Path) -> GGUFInfo:
         "head_count_kv",
         "key_length",
         "value_length",
+        "feed_forward_length",
+        "vocab_size",
     ):
         if getattr(info, field_name) > MAX_DIMENSION:
             raise GGUFError(f"implausible {field_name} {getattr(info, field_name)}")

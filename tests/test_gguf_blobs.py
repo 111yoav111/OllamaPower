@@ -21,6 +21,7 @@ def test_reads_layers_and_attention_shape(tmp_path):
     info = read_gguf(write_tiny_llama(tmp_path / "m.gguf", n_layer=3, n_embd=64, n_head=4, n_head_kv=2, n_ff=128))
     assert (info.architecture, info.block_count, info.head_count, info.head_count_kv) == ("llama", 3, 4, 2)
     assert info.context_length == 512 and info.embedding_length == 64
+    assert info.feed_forward_length == 128 and info.vocab_size == len(vocab()[0])  # from token_embd's shape
     per_layer = 4 * (64 + 64 * 64 + 2 * 64 * 32 + 64 * 64 + 64 + 3 * 64 * 128)  # F32 weights of one block
     assert info.layer_bytes == [per_layer] * 3
     vocab_bytes = 4 * 64 * len(vocab()[0])

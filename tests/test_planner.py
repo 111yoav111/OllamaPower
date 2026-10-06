@@ -6,7 +6,7 @@ import bisect
 
 import pytest
 
-from ollamapower.hub.planner import DEVICE_RESERVE, MIB, Device, PlanError, plan_split, unit_sizes
+from ollamapower.hub.planner import MIB, Device, PlanError, device_reserve, plan_split, unit_sizes
 from ollamapower.ollama.gguf import GGUFInfo
 
 GIB = 1024 * MIB
@@ -28,11 +28,13 @@ def model(layers: int = 10, layer_gb: float = 1.0, output_gb: float = 0.5) -> GG
     )
 
 
-def gpu(label: str, gb: float, node: str | None = None, cap_gb: float | None = None) -> Device:
+def gpu(label: str, gb: float, node: str | None = None, cap_gb: float | None = None, ctx: int = 1024) -> Device:
+    """A device with ``gb`` (or ``cap_gb``) for layers once the reserve for ``model()`` at ``ctx`` is set aside."""
+    reserve = device_reserve(model(), ctx)
     return Device(
         label,
-        int(gb * GIB) + DEVICE_RESERVE,
-        cap=None if cap_gb is None else int(cap_gb * GIB) + DEVICE_RESERVE,
+        int(gb * GIB) + reserve,
+        cap=None if cap_gb is None else int(cap_gb * GIB) + reserve,
         node_id=node,
         device="X",
     )
@@ -78,8 +80,8 @@ def test_tensor_split_reproduces_the_plan_in_llama_cpp(hub_gb, helpers_gb):
 def test_hub_gpu_first_then_best_helper_then_cpu():
     info = model(layers=10, layer_gb=1.0, output_gb=0.5)
     kv = info.kv_bytes_per_layer(2048)
-    hub = [gpu("hub", 3.0)]
-    helpers = [gpu("fast", 4.5, node="a"), gpu("slow", 2.5, node="b")]
+    hub = [gpu("hub", 3.0, ctx=2048)]
+    helpers = [gpu("fast", 4.5, node="a", ctx=2048), gpu("slow", 2.5, node="b", ctx=2048)]
     plan = plan_split("m", info, 2048, hub, helpers)
     by_label = {p.device.label: p for p in plan.placements}
     # The hub takes the output layer and as many blocks as fit; then "fast", then "slow".
@@ -130,6 +132,44 @@ def test_per_layer_cache_places_more_layers_and_is_counted_per_device():
     for p in b.placements:
         assert p.cache == sum(kv[first : first + p.layers])
         first += p.layers
+
+
+def test_device_reserve_grows_with_the_context():
+    from ollamapower.hub.planner import DEVICE_OVERHEAD, UBATCH, compute_buffer
+
+    info = model()
+    info.feed_forward_length = 14336  # Llama-3-8B widths
+    small, big = device_reserve(info, 4096), device_reserve(info, 131072)
+    # With flash attention the growing part is the f16 KQ mask: ubatch x context.
+    assert big - small == 2 * UBATCH * (131072 - 4096)
+    assert compute_buffer(info, 4096) < 128 * MIB  # an 8B at 4k: well under the old flat 768 MiB in total
+    assert DEVICE_OVERHEAD < small < big < 768 * MIB  # at most the old flat reserve for an 8B, even at 128k
+    # The same helper takes fewer layers at a long context (KV cache and compute buffer both grow).
+    helpers = [gpu("h", 6.0, node="a")]
+    short, long = plan_split("m", info, 4096, [], helpers), plan_split("m", info, 131072, [], helpers)
+    assert long.gpu_layers < short.gpu_layers
+    assert all(p.device.reserve == device_reserve(info, 131072) for p in long.placements)
+
+
+def test_compute_buffer_matches_llama_cpp_on_a_tiny_model(tmp_path):
+    """b11347 on CPU, tiny model (n_embd 256, n_ff 512), -fa on: 8.0 / 36.0 / 132.0 MiB plus small change."""
+    from ollamapower.hub.planner import compute_buffer
+    from ollamapower.ollama.gguf import read_gguf
+
+    from .tiny_gguf import write_tiny_llama
+
+    info = read_gguf(write_tiny_llama(tmp_path / "m.gguf", n_embd=256, n_ff=512, ctx=131072))
+    for ctx, measured_mib in ((4096, 8.51), (32768, 36.51), (131072, 132.51)):
+        estimate = compute_buffer(info, ctx) / MIB
+        assert measured_mib <= estimate <= measured_mib + 20
+
+
+def test_output_device_reserves_the_logits_of_a_ubatch():
+    from ollamapower.hub.planner import UBATCH
+
+    info = model(layers=4)
+    info.vocab_size = 152064  # Qwen2.5
+    assert unit_sizes(info, 1024)[-1] > info.output_bytes + 3 * UBATCH * info.vocab_size
 
 
 def test_summary_is_json_friendly():
