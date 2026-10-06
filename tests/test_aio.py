@@ -47,6 +47,31 @@ async def test_caller_cancelled_while_reaping_stays_cancelled():
         await outer
 
 
+async def test_reaping_while_being_cancelled_still_waits_for_every_task():
+    async def slow_to_stop(seconds: float) -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await asyncio.sleep(seconds)  # cleanup, like stopping a process
+            raise
+
+    tasks = [asyncio.ensure_future(slow_to_stop(0.02 * i)) for i in range(1, 4)]
+    await asyncio.sleep(0)
+
+    async def shutting_down() -> None:
+        try:
+            await asyncio.sleep(60)
+        finally:  # cleanup on the way out of a cancelled task
+            await reap(*tasks)
+
+    outer = asyncio.ensure_future(shutting_down())
+    await asyncio.sleep(0)
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    assert all(t.done() for t in tasks)  # not just the first one: the rest were left running
+
+
 async def test_wait_for_keeps_a_cancellation_that_races_the_result():
     from ollamapower.aio import wait_for
 
