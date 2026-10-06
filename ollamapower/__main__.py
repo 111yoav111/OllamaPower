@@ -26,6 +26,7 @@ from .cli_common import (
     Lines,
     call,
     configure_logging,
+    control_text,
     duration,
     gb,
     load,
@@ -392,7 +393,7 @@ def render_status(s: dict[str, Any]) -> Lines:
             f"{len(lending)} lending, {len(nodes)} known, "
             f"{gb(sum(n['vram_lendable'] for n in lending))} GB VRAM lendable",
         ),
-        ("Control", f"port {c['port']}" if c["enabled"] else "off (no cluster token? run `ollamapower init`)"),
+        ("Control", control_text(c)),
         ("Hub key", format_fingerprint(c["fingerprint"]) if c["fingerprint"] else "-"),
     ]
     session = (s.get("split") or {}).get("session")

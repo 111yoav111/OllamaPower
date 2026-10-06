@@ -163,6 +163,18 @@ def test_status_over_the_admin_channel(admin_frontdoor, client):
     assert json.loads(result.output)["ollama"]["version"] == "0.0.0-fake"
     plain = run("status").output
     assert "Front door:" in plain and "big:70b" in plain and "⚠ big:70b is only 50% in VRAM" in plain
+    # The control plane is enabled in the config but was never started (no token): say that, not "off".
+    assert "Control:     not running: no usable cluster token" in plain
+
+
+def test_control_text_tells_off_from_not_running():
+    from ollamapower.cli_common import control_text
+
+    assert control_text({"enabled": True, "configured": True, "port": 9000}) == "port 9000"
+    off = control_text({"enabled": False, "configured": False, "port": None})
+    assert "control.enabled = false" in off and "token" not in off
+    broken = control_text({"enabled": False, "configured": True, "port": None})
+    assert "no usable cluster token" in broken and "control.enabled" not in broken
 
 
 def test_logs_command(admin_frontdoor, client):

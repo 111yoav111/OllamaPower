@@ -24,7 +24,7 @@ from textual.widgets import DataTable, Footer, Header, Input, Sparkline, Static,
 
 from ...admin.ipc import AdminError
 from ...admin.service import Admin
-from ...cli_common import tunnel_test_lines
+from ...cli_common import control_text, tunnel_test_lines
 from ...textsafe import safe
 from ...tui.widgets import (
     STATUS_DOT,
@@ -278,7 +278,7 @@ class HubTUI(App[None]):
                 f"{len(lending)} lending · {sum(1 for n in nodes if n['connected'])} connected · {len(nodes)} known · "
                 f"{gib(sum(n['vram_lendable'] for n in lending))} GB VRAM lendable",
             ),
-            ("Control plane", f"port {c['port']}" if c["enabled"] else "off"),
+            ("Control plane", control_text(c)),
         ]
         if c["enabled"] and c["fingerprint"]:
             rows.append(("Hub key", fingerprint_text(c["fingerprint"])))

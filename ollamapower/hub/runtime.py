@@ -321,6 +321,8 @@ class Hub:
             "nodes": self.registry.snapshot(),
             "control": {
                 "enabled": self.control is not None,
+                # control.enabled in config.toml: off by choice, vs. on but not running (no usable token)
+                "configured": self.config.control.enabled,
                 "port": self.control.port if self.control is not None and self.control.server else None,
                 "fingerprint": self.fingerprint,
                 "bans": {ip: round(left) for ip, left in self.control.bans.active().items()} if self.control else {},

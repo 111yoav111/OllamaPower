@@ -169,6 +169,15 @@ def show(fetch: Callable[[], Any], render: Callable[[Any], Lines], as_json: bool
         pass
 
 
+def control_text(c: dict[str, Any]) -> str:
+    """The control plane's state, and why it is off: turned off on purpose, or on but without a usable token."""
+    if c["enabled"]:
+        return f"port {c['port']}"
+    if not c.get("configured", True):
+        return "off (control.enabled = false in config.toml; helpers can't join)"
+    return "not running: no usable cluster token, see the warnings (helpers can't join)"
+
+
 def tunnel_test_lines(r: dict[str, Any]) -> list[str]:
     lines = []
     for mode in ("secure", "direct"):
