@@ -19,7 +19,7 @@ from typing import Any
 
 import typer
 
-from ..cli_common import Lines, call, configure_logging, gb, refuse_root, show, ts
+from ..cli_common import Lines, call, configure_logging, gb, refuse_root, show, stop_like_ctrl_c, ts
 from ..config import ConfigError, default_config_dir
 from ..textsafe import safe
 
@@ -167,7 +167,8 @@ def agent(
         return 0
 
     try:
-        code = asyncio.run(main())
+        with stop_like_ctrl_c():  # kill / systemd / closing the window: stop rpc-server too
+            code = asyncio.run(main())
     except KeyboardInterrupt:
         code = 0
     raise typer.Exit(code)

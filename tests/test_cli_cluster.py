@@ -116,12 +116,13 @@ def test_hub_and_agent_end_to_end(fake_ollama, tmp_path):
         assert cli("nodes", "pause", "desk", env=hub_env).returncode == 0
         assert wait_for(lambda: node_status() == "paused", 5)
     finally:
-        for proc in (agent, hub):
-            if proc is not None:
-                proc.send_signal(signal.SIGINT)
+        if agent is not None:
+            agent.send_signal(signal.SIGTERM)  # like `kill`/systemd: must clean up as Ctrl+C does
+        hub.send_signal(signal.SIGINT)
         outputs = [proc.communicate(timeout=20)[0] for proc in (agent, hub) if proc is not None]
     assert hub.returncode == 0, outputs[-1]
     assert agent.returncode == 0, outputs[0]
+    assert not (agent_dir / "agent-run" / "admin.json").exists()
     assert "front door on" in outputs[-1] and fingerprint in outputs[-1]
     saved = json.loads((hub_dir / "state.json").read_text())["nodes"]
     assert [n["name"] for n in saved.values()] == ["desk"] and next(iter(saved.values()))["hub_paused"]

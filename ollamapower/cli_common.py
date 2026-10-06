@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import logging
 import os
+import signal
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,39 @@ from .config import Config, ConfigError, load_config
 ConfigOption = typer.Option(None, "--config", "-c", help="Path to config.toml", exists=True, dir_okay=False)
 WATCH_INTERVAL = 2.0
 Lines = list[tuple[str, Any]]
+
+
+@contextlib.contextmanager
+def stop_like_ctrl_c() -> Iterator[None]:
+    """Make SIGTERM (and, on Windows, Ctrl+Break or closing the console window) stop like Ctrl+C.
+
+    Their default action ends the process at once, skipping every ``finally``: an
+    agent stopped by ``kill``, systemd or a closed window left its ``rpc-server``
+    running (holding VRAM) and its admin files behind. Inside ``asyncio.run`` the
+    SIGINT handler cancels the main task, so cleanup runs and ``KeyboardInterrupt``
+    comes out at the end. Uses ``signal.signal``, which works with Windows'
+    Proactor event loop (``loop.add_signal_handler`` does not).
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def forward(signum: int, frame: Any) -> None:
+        handler = signal.getsignal(signal.SIGINT)
+        if callable(handler):
+            handler(signal.SIGINT, frame)
+        else:
+            raise KeyboardInterrupt
+
+    signals = [signal.SIGTERM]
+    if hasattr(signal, "SIGBREAK"):
+        signals.append(signal.SIGBREAK)
+    original = {sig: signal.signal(sig, forward) for sig in signals}
+    try:
+        yield
+    finally:
+        for sig, handler in original.items():
+            signal.signal(sig, handler)
 
 
 def load(config_path: Path | None) -> Config:
