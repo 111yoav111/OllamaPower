@@ -77,6 +77,9 @@ def test_token_checks(make_config, monkeypatch):
     assert doctor.check_token(cfg)[0].level == "error"
     write_token(cfg.env_path, new_token())
     assert doctor.check_token(cfg)[0].level == "ok"
+    monkeypatch.setenv("OLLAMAPOWER_TOKEN", "short")  # overrides the good one in .env
+    weak = doctor.check_token(cfg)[0]
+    assert weak.level == "error" and "in the environment is too short" in weak.title and "Unset" in weak.fix
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")

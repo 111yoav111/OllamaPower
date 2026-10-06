@@ -27,6 +27,23 @@ def test_token_env_wins_over_file(tmp_path):
     assert files.load_token(tmp_path / "none", environ={}) is None
 
 
+def test_token_strength_applies_to_the_environment_too(tmp_path):
+    p = tmp_path / ".env"
+    strong = "s" * 40
+    files.write_token(p, strong)
+    assert files.token_problem(p, environ={}) == (strong, None)
+    token, problem = files.token_problem(p, environ={TOKEN_ENV: "short"})
+    assert token is None and problem.startswith(f"{TOKEN_ENV} in the environment is too short")
+    assert files.token_fix(p, environ={TOKEN_ENV: "short"}).startswith(f"unset {TOKEN_ENV}")
+    files.write_token(p, "weak")
+    token, problem = files.token_problem(p, environ={})
+    assert token is None and problem.startswith(f"{TOKEN_ENV} in {p} is too short")
+    assert "--rotate-token" in files.token_fix(p, environ={})
+    token, problem = files.token_problem(tmp_path / "none", environ={})
+    assert token is None and "is not set" in problem
+    assert files.token_fix(tmp_path / "none", environ={}) == "run `ollamapower init`"
+
+
 def test_write_token_keeps_other_lines(tmp_path):
     p = tmp_path / ".env"
     p.write_text(f"OTHER=1\n{TOKEN_ENV}=old\n{TOKEN_ENV}_EXTRA=keep\n")

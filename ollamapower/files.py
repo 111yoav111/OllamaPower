@@ -15,7 +15,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from .core.auth import TOKEN_ENV
+from .core.auth import TOKEN_ENV, token_weakness
 
 POSIX = sys.platform != "win32"
 
@@ -95,8 +95,41 @@ def read_env_file(path: Path) -> dict[str, str]:
 
 def load_token(env_path: Path, environ: dict[str, str] | None = None) -> str | None:
     """The cluster token: the environment wins over the ``.env`` file."""
+    return token_and_source(env_path, environ)[0]
+
+
+def token_and_source(env_path: Path, environ: dict[str, str] | None = None) -> tuple[str | None, str]:
+    """(token, ``"environment"`` or ``"file"``): the environment wins over the ``.env`` file."""
     environ = dict(os.environ) if environ is None else environ
-    return environ.get(TOKEN_ENV) or read_env_file(env_path).get(TOKEN_ENV) or None
+    if environ.get(TOKEN_ENV):
+        return environ[TOKEN_ENV], "environment"
+    return read_env_file(env_path).get(TOKEN_ENV) or None, "file"
+
+
+def token_problem(env_path: Path, environ: dict[str, str] | None = None) -> tuple[str | None, str | None]:
+    """(the token if usable, else None; what is wrong with it, naming where it came from, else None).
+
+    The same strength rule applies wherever the token comes from: a short ``OLLAMAPOWER_TOKEN`` in the
+    environment is as unusable as a short one in ``.env``.
+    """
+    token, source = token_and_source(env_path, environ)
+    weakness = token_weakness(token)
+    if weakness is None:
+        return token, None
+    if token is None:
+        return None, f"{TOKEN_ENV} is not set (neither in the environment nor in {env_path})"
+    where = "in the environment" if source == "environment" else f"in {env_path}"
+    return None, f"{TOKEN_ENV} {where} {weakness}"
+
+
+def token_fix(env_path: Path, environ: dict[str, str] | None = None) -> str:
+    """What the hub's owner should do about the problem ``token_problem`` reported."""
+    token, source = token_and_source(env_path, environ)
+    if token is None:
+        return "run `ollamapower init`"
+    if source == "environment":
+        return f"unset {TOKEN_ENV} (or set it to a strong token)"
+    return "run `ollamapower init --rotate-token`"
 
 
 def write_token(env_path: Path, token: str) -> None:

@@ -98,8 +98,7 @@ def agent(
     if ctx.invoked_subcommand is not None:
         return
     from ..admin.ipc import start_control_server
-    from ..core.auth import TokenError, validate_token
-    from ..files import load_token
+    from ..files import token_problem
     from .client import AgentClient, AgentStopped
     from .pinning import format_fingerprint
     from .service import AgentAdmin
@@ -116,16 +115,15 @@ def agent(
         cfg.hub.fingerprint = hub_fingerprint
     if name:
         cfg.agent.name = name
-    try:
-        token = validate_token(load_token(cfg.env_path))
-    except TokenError:
+    token, problem = token_problem(cfg.env_path)
+    if problem or token is None:
         typer.secho(
-            f"No cluster token. On the hub run `ollamapower token show` and put that line in {cfg.env_path} "
-            "(or set OLLAMAPOWER_TOKEN).",
+            f"{problem}. On the hub run `ollamapower token show` and put that line in {cfg.env_path} "
+            "(or set OLLAMAPOWER_TOKEN to it).",
             fg=typer.colors.RED,
             err=True,
         )
-        raise typer.Exit(2) from None
+        raise typer.Exit(2)
 
     log_lines: deque[str] = deque(maxlen=200)
     configure_logging("info", None if no_tui else log_lines)

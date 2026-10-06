@@ -54,6 +54,29 @@ def test_init_creates_everything_once(cfg_env):
     assert "rotated" in rotated.output and read_env_file(cfg_env / ".env")[TOKEN_ENV] != token
 
 
+def test_a_weak_token_from_the_environment_is_not_accepted(cfg_env):
+    assert run("init").exit_code == 0
+    strong = read_env_file(cfg_env / ".env")[TOKEN_ENV]
+    shown = run("token", "show", env={TOKEN_ENV: "short-and-weak"})
+    assert shown.exit_code == 1 and "short-and-weak" not in shown.output
+    assert f"{TOKEN_ENV} in the environment is too short" in shown.output and f"unset {TOKEN_ENV}" in shown.output
+    assert strong in run("token", "show").output
+
+    init = run("init", env={TOKEN_ENV: "short-and-weak"})
+    assert init.exit_code == 0 and "in the environment is too short" in init.output
+    assert read_env_file(cfg_env / ".env")[TOKEN_ENV] == strong  # the file's good token is kept
+
+    agent = run("agent", "--no-tui", "--allow-root", "--hub", "127.0.0.1", env={TOKEN_ENV: "short-and-weak"})
+    assert agent.exit_code == 2 and f"{TOKEN_ENV} in the environment is too short" in agent.output
+
+
+def test_init_replaces_a_weak_token_in_the_file(cfg_env):
+    (cfg_env / ".env").write_text(f'{TOKEN_ENV}="weak"\n')
+    result = run("init")
+    assert result.exit_code == 0 and "The old token is too short" in result.output
+    assert len(read_env_file(cfg_env / ".env")[TOKEN_ENV]) > 40
+
+
 def test_status_when_not_running(cfg_env):
     result = run("status")
     assert result.exit_code == 3 and "not running" in result.output

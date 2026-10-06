@@ -21,8 +21,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from .config import Config, is_loopback_host
-from .core.auth import TOKEN_ENV, TokenError, validate_token
-from .files import load_token
+from .core.auth import TOKEN_ENV
+from .files import load_token, token_fix, token_problem
 
 PROBE_TIMEOUT = 2.0
 
@@ -275,13 +275,12 @@ def check_frontdoor_exposure(config: Config) -> list[Finding]:
 
 
 def check_token(config: Config) -> list[Finding]:
-    token = load_token(config.env_path)
-    if token is None:
+    if load_token(config.env_path) is None:
         return [Finding("warn", f"No {TOKEN_ENV} yet (needed once helpers join)", "Run `ollamapower init`.")]
-    try:
-        validate_token(token)
-    except TokenError as exc:
-        return [Finding("error", str(exc), "Run `ollamapower init --rotate-token`.")]
+    _, problem = token_problem(config.env_path)
+    if problem:
+        fix = token_fix(config.env_path)
+        return [Finding("error", problem, fix[0].upper() + fix[1:] + ".")]
     return [Finding("ok", f"{TOKEN_ENV} is set and strong")]
 
 

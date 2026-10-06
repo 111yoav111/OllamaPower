@@ -26,12 +26,22 @@ def new_token() -> str:
     return TOKEN_PREFIX + secrets.token_urlsafe(TOKEN_BYTES)
 
 
+def token_weakness(token: str | None) -> str | None:
+    """Why ``token`` can't be used ("is not set", "is too short ..."), or None if it is strong enough."""
+    if not token:
+        return "is not set"
+    if len(token) < MIN_TOKEN_CHARS:
+        return f"is too short (at least {MIN_TOKEN_CHARS} characters)"
+    return None
+
+
 def validate_token(token: str | None) -> str:
     """Return ``token`` if it is strong enough to use, else raise ``TokenError``."""
+    weakness = token_weakness(token)
     if not token:
         raise TokenError(f"{TOKEN_ENV} is not set; run `ollamapower init` to create one")
-    if len(token) < MIN_TOKEN_CHARS:
-        raise TokenError(f"{TOKEN_ENV} is too short (at least {MIN_TOKEN_CHARS} characters); run `ollamapower init`")
+    if weakness:
+        raise TokenError(f"{TOKEN_ENV} {weakness}; run `ollamapower init`")
     return token
 
 

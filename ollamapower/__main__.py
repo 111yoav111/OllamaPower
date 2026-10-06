@@ -72,7 +72,7 @@ def init(
     ),
 ) -> None:
     """Create the config directory, a cluster token in .env, config.toml and an empty state.json."""
-    from .core.auth import TOKEN_ENV, new_token
+    from .core.auth import TOKEN_ENV, new_token, token_weakness
     from .files import load_or_create_hub_key, load_token, private_dir, write_private, write_token
     from .state import init_state_file
 
@@ -81,13 +81,18 @@ def init(
     typer.echo(f"Config directory: {config.config_dir}")
 
     existing = load_token(config.env_path, environ={})
-    if existing and not rotate_token:
+    weak = token_weakness(existing) if existing else None
+    if existing and not rotate_token and not weak:
         typer.echo(f"  {config.env_path.name}: {TOKEN_ENV} already set (use --rotate-token to replace it)")
     else:
         write_token(config.env_path, new_token())
-        typer.echo(f"  {config.env_path.name}: {'new' if not existing else 'rotated'} {TOKEN_ENV} written (owner-only)")
+        what = "new" if not existing else "rotated"
+        typer.echo(f"  {config.env_path.name}: {what} {TOKEN_ENV} written (owner-only)")
+        if weak and not rotate_token:
+            typer.secho(f"  The old token {weak}, so it was replaced.", fg=typer.colors.YELLOW)
         if existing:
             typer.secho("  Every helper needs the new token before it can reconnect.", fg=typer.colors.YELLOW)
+    _warn_env_token(config.env_path)
 
     target = config.config_dir / "config.toml"
     if target.exists():
@@ -111,16 +116,44 @@ def init(
     typer.echo("\nNext: `ollamapower doctor` checks Ollama and walks you through moving it to port 11435.")
 
 
+def _warn_env_token(env_path: Path) -> None:
+    """``OLLAMAPOWER_TOKEN`` in the environment overrides .env: say so, loudly if it is too weak to use."""
+    from .core.auth import TOKEN_ENV
+    from .files import read_env_file, token_and_source, token_problem
+
+    from_env, source = token_and_source(env_path)
+    if source != "environment":
+        return
+    _, problem = token_problem(env_path)
+    if problem:
+        typer.secho(
+            f"  {problem}, and it overrides {env_path.name}: the hub can't let helpers join. "
+            f"Unset {TOKEN_ENV} or set it to the token in {env_path.name}.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        return
+    if from_env != read_env_file(env_path).get(TOKEN_ENV):
+        typer.secho(
+            f"  Note: {TOKEN_ENV} is set in the environment and overrides the token in {env_path.name}.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+
 @token_cli.command("show")
 def token_show(config_path: Path | None = ConfigOption) -> None:
     """Print the cluster token, to put in each helper's .env (keep it secret)."""
     from .core.auth import TOKEN_ENV
-    from .files import load_token
+    from .files import load_token, token_fix, token_problem
 
     config = load(config_path)
-    token = load_token(config.env_path)
-    if not token:
+    if not load_token(config.env_path):
         typer.secho("No token yet: run `ollamapower init`.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+    token, problem = token_problem(config.env_path)
+    if problem or token is None:
+        typer.secho(f"{problem}, so helpers can't use it: {token_fix(config.env_path)}.", fg="red", err=True)
         raise typer.Exit(1)
     typer.secho(
         "Anyone with this token can join your cluster as a helper. Copy it only to your helpers.",
@@ -147,10 +180,9 @@ def hub(
     from .admin.service import Admin
     from .agent.pinning import format_fingerprint
     from .config import is_loopback_host
-    from .core.auth import TokenError, validate_token
     from .core.encrypt_layer import public_key_fingerprint
     from .eventlog import EventLog, NullEventLog
-    from .files import load_or_create_hub_key, load_token, private_dir
+    from .files import load_or_create_hub_key, private_dir, token_fix, token_problem
     from .hub.frontdoor.app import create_app
     from .hub.frontdoor.server import build_server
     from .hub.runtime import Hub
@@ -190,12 +222,9 @@ def hub(
         events = NullEventLog()
 
     the_hub = Hub(config, state, events)
-    token = load_token(config.env_path)
-    try:
-        validate_token(token)
-    except TokenError as exc:
-        token = None
-        the_hub.extra_warnings.append(f"{exc}. Helpers can't join until then.")
+    token, problem = token_problem(config.env_path)
+    if problem:
+        the_hub.extra_warnings.append(f"{problem}; {token_fix(config.env_path)}. Helpers can't join until then.")
     app = create_app(the_hub)
     server = build_server(the_hub, app, own_logging=False)
     try:
