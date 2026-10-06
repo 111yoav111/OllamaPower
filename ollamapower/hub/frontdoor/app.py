@@ -52,6 +52,7 @@ from ..engines.split import ENGINE_SPLIT, SplitUnavailable
 from ..engines.translate import (
     OllamaStream,
     UnsupportedRequest,
+    apply_model_defaults,
     chat_request,
     generate_request,
     is_load_request,
@@ -274,6 +275,9 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
             except SplitUnavailable as exc:
                 return unavailable(str(exc))
             stream.engine = ENGINE_SPLIT
+            if translated is not None and session.files is not None:
+                # Ollama applies the Modelfile's SYSTEM/PARAMETER/MESSAGE; llama-server knows nothing of them.
+                apply_model_defaults(translated, parsed, path == "/api/chat", session.files.defaults)
             released = False
             has_slot = False
 

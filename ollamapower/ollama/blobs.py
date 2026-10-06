@@ -44,6 +44,18 @@ class ModelUnavailable(Exception):
 
 
 @dataclass
+class ModelDefaults:
+    """What the model's Modelfile sets for every request: SYSTEM, PARAMETER and MESSAGE."""
+
+    system: str = ""
+    options: dict[str, Any] = field(default_factory=dict)
+    messages: list[dict[str, str]] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.system or self.options or self.messages)
+
+
+@dataclass
 class ModelFiles:
     name: str
     path: Path  # the GGUF weights
@@ -51,6 +63,7 @@ class ModelFiles:
     projectors: list[Path] = field(default_factory=list)
     capabilities: list[str] = field(default_factory=list)
     gguf: GGUFInfo | None = None
+    defaults: ModelDefaults = field(default_factory=ModelDefaults)
 
     @property
     def vision(self) -> bool:
@@ -81,6 +94,52 @@ def _from_lines(modelfile: str) -> list[str]:
         if stripped.upper().startswith("FROM "):
             out.append(stripped[5:].strip().strip('"'))
     return out
+
+
+def _parameter_value(raw: str) -> Any:
+    """One value of ``/api/show``'s "parameters" (Go's ``%#v``: quoted strings, numbers, booleans)."""
+    if raw.startswith('"'):
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return raw.strip('"')
+        return value if isinstance(value, str) else raw
+    if raw in ("true", "false"):
+        return raw == "true"
+    for kind in (int, float):
+        try:
+            return kind(raw)
+        except ValueError:
+            pass
+    return raw
+
+
+def parse_parameters(text: str) -> dict[str, Any]:
+    """``/api/show``'s "parameters" (``key   value`` lines; ``stop`` repeats) -> Ollama options."""
+    options: dict[str, Any] = {}
+    for line in text.splitlines():
+        key, _, raw = line.strip().partition(" ")
+        raw = raw.strip()
+        if not key or not raw:
+            continue
+        value = _parameter_value(raw)
+        if key == "stop":
+            options.setdefault("stop", []).append(str(value))
+        else:
+            options[key] = value
+    return options
+
+
+def model_defaults(data: dict[str, Any]) -> ModelDefaults:
+    """The Modelfile's SYSTEM, PARAMETER and MESSAGE directives, from an ``/api/show`` answer."""
+    system = data.get("system") if isinstance(data.get("system"), str) else ""
+    params = data.get("parameters") if isinstance(data.get("parameters"), str) else ""
+    messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in data.get("messages") or []
+        if isinstance(m, dict) and isinstance(m.get("role"), str) and isinstance(m.get("content"), str)
+    ]
+    return ModelDefaults(system=system, options=parse_parameters(params), messages=messages)
 
 
 def _blob(path: str) -> str | None:
@@ -197,6 +256,7 @@ def locate(data: dict[str, Any], name: str, models_dirs: list[Path] | None = Non
         projectors=projectors,
         capabilities=capabilities,
         gguf=info,
+        defaults=model_defaults(data),
     )
 
 

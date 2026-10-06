@@ -250,6 +250,20 @@ def test_non_streaming_generate_tools_and_ps(cluster, client):
     assert [(m["name"], m["ollamapower"]["engine"]) for m in ps] == [("tiny:latest", "split")]
 
 
+def test_modelfile_system_parameters_and_messages_apply(cluster, client):
+    c = cluster
+    c.rec.show_extra["tiny:latest"] = {
+        "system": "be terse",
+        "parameters": 'stop                           "<end>"\ntemperature                    0.6',
+        "messages": [{"role": "user", "content": "m1"}, {"role": "assistant", "content": "m2"}],
+    }
+    c.admin("models.plan", model="tiny", ctx=512)
+    assert chat(client, c, options={"temperature": 0.2}).status_code == 200
+    sent = json.loads((c.hub_bin / "last_request.json").read_text())["body"]
+    assert [m["content"] for m in sent["messages"]] == ["be terse", "m1", "m2", "hi"]
+    assert sent["temperature"] == 0.2 and sent["stop"] == ["<end>"]
+
+
 def test_openai_requests_pass_through_to_llama_server(cluster, client):
     c = cluster
     c.admin("models.plan", model="tiny", ctx=512)

@@ -9,10 +9,12 @@ import pytest
 from ollamapower.hub.engines.translate import (
     OllamaStream,
     UnsupportedRequest,
+    apply_model_defaults,
     chat_request,
     generate_request,
     is_load_request,
 )
+from ollamapower.ollama.blobs import ModelDefaults
 
 
 def sse(*events: dict) -> bytes:
@@ -222,6 +224,50 @@ def test_logprobs_come_back_in_ollamas_shape():
     t.feed(raw)
     obj = json.loads(t.finish())
     assert obj["response"] == "Hi!" and obj["logprobs"] == [first, second]
+
+
+DEFAULTS = ModelDefaults(
+    system="model system",
+    options={"temperature": 0.7, "stop": ["<end>"], "num_predict": 64, "num_ctx": 8192, "top_k": 40},
+    messages=[{"role": "user", "content": "m1"}, {"role": "assistant", "content": "m2"}],
+)
+
+
+def roles_and_content(body: dict) -> list[tuple[str, str]]:
+    return [(m["role"], m["content"]) for m in body["messages"]]
+
+
+def test_modelfile_defaults_on_chat():
+    body = {"messages": [{"role": "user", "content": "q"}], "options": {"temperature": 0.1, "num_predict": -1}}
+    out = chat_request(body)
+    apply_model_defaults(out, body, True, DEFAULTS)
+    assert roles_and_content(out) == [("system", "model system"), ("user", "m1"), ("assistant", "m2"), ("user", "q")]
+    # The request's options win, even "num_predict": -1 (no limit); the model's fill the rest.
+    assert out["temperature"] == 0.1 and "max_tokens" not in out
+    assert out["stop"] == ["<end>"] and out["top_k"] == 40 and "num_ctx" not in out
+
+    body = {"messages": [{"role": "system", "content": "mine"}, {"role": "user", "content": "q"}]}
+    out = chat_request(body)
+    apply_model_defaults(out, body, True, DEFAULTS)
+    assert roles_and_content(out) == [("user", "m1"), ("assistant", "m2"), ("system", "mine"), ("user", "q")]
+    assert out["max_tokens"] == 64
+
+
+def test_modelfile_defaults_on_generate():
+    body = {"prompt": "q"}
+    out = generate_request(body)
+    apply_model_defaults(out, body, False, DEFAULTS)
+    assert roles_and_content(out) == [("system", "model system"), ("user", "m1"), ("assistant", "m2"), ("user", "q")]
+
+    body = {"prompt": "q", "system": "mine", "context": [1, 2]}
+    out = generate_request(body)
+    apply_model_defaults(out, body, False, DEFAULTS)
+    assert roles_and_content(out) == [("system", "mine"), ("user", "q")]
+
+    out = generate_request(body)
+    before = json.loads(json.dumps(out))
+    apply_model_defaults(out, body, False, ModelDefaults())
+    assert out == before
 
 
 @pytest.mark.parametrize("think", ["max", "true", "", 1])

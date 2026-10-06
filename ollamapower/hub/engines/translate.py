@@ -21,6 +21,8 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from ...ollama.blobs import ModelDefaults
+
 # Ollama option -> llama-server field (llama-server accepts its native sampling fields on /v1 too).
 OPTION_MAP = {
     "temperature": "temperature",
@@ -57,15 +59,21 @@ def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _options(body: dict[str, Any]) -> dict[str, Any]:
+def _sampling(options: dict[str, Any]) -> dict[str, Any]:
+    """Ollama options -> llama-server sampling fields."""
     out: dict[str, Any] = {}
-    options = body.get("options") if isinstance(body.get("options"), dict) else {}
     for key, target in OPTION_MAP.items():
         if key in options and options[key] is not None:
             out[target] = options[key]
     num_predict = options.get("num_predict")
     if isinstance(num_predict, int) and not isinstance(num_predict, bool) and num_predict > 0:
         out["max_tokens"] = num_predict
+    return out
+
+
+def _options(body: dict[str, Any]) -> dict[str, Any]:
+    options = body.get("options") if isinstance(body.get("options"), dict) else {}
+    out = _sampling(options)
     fmt = body.get("format")
     if fmt == "json":
         out["response_format"] = {"type": "json_object"}
@@ -157,6 +165,34 @@ def generate_request(body: dict[str, Any]) -> dict[str, Any]:
         messages.append({"role": "system", "content": body["system"]})
     messages.append({"role": "user", "content": body.get("prompt") or ""})
     return chat_request({**body, "messages": messages})
+
+
+def apply_model_defaults(out: dict[str, Any], body: dict[str, Any], chat: bool, defaults: ModelDefaults) -> None:
+    """Apply the Modelfile's SYSTEM, PARAMETER and MESSAGE to a translated request, the way Ollama does.
+
+    ``out`` is what ``chat_request``/``generate_request`` made of ``body``.
+    Parameters are defaults under the request's own options; the model's
+    messages go before the request's; its system prompt is used when the
+    request brings none (``/api/chat``: its first message isn't a system
+    message; ``/api/generate``: no ``system``). ``/api/generate`` with a
+    ``context`` leaves the model's messages out: they are in the context.
+    """
+    if not defaults:
+        return
+    requested = body.get("options") if isinstance(body.get("options"), dict) else {}
+    model_options = {k: v for k, v in defaults.options.items() if requested.get(k) is None}
+    for key, value in _sampling(model_options).items():
+        out.setdefault(key, value)
+    model_messages = [_message(m, i) for i, m in enumerate(defaults.messages)]
+    system = [{"role": "system", "content": defaults.system}] if defaults.system else []
+    messages = out["messages"]
+    if chat:
+        first = body["messages"][0] if body.get("messages") else None
+        own_system = isinstance(first, dict) and first.get("role") == "system"
+        out["messages"] = [*([] if own_system else system), *model_messages, *messages]
+        return
+    head, prompt = messages[:-1], messages[-1:]  # generate: [its own system], user prompt
+    out["messages"] = [*(head or system), *([] if body.get("context") else model_messages), *prompt]
 
 
 def is_load_request(path: str, body: dict[str, Any]) -> bool:

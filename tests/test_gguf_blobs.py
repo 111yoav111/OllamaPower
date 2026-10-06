@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from ollamapower.ollama.blobs import ModelUnavailable, locate, parse_name, read_manifest
+from ollamapower.ollama.blobs import ModelUnavailable, locate, parse_name, parse_parameters, read_manifest
 from ollamapower.ollama.gguf import GGUFError, read_gguf
 
 from .tiny_gguf import vocab, write_tiny_llama
@@ -103,6 +103,41 @@ def test_locates_the_blob_from_the_modelfile(tmp_path):
     files = locate(show(model), "tiny")
     assert files.path == model and files.digest == DIGEST and not files.vision
     assert files.gguf.block_count == 4
+    assert not files.defaults
+
+
+# What Ollama's /api/show sends for a Modelfile with SYSTEM, PARAMETER and MESSAGE (Go's %#v values).
+SHOW_PARAMETERS = "\n".join(
+    [
+        'stop                           "<|im_end|>"',
+        'stop                           "say \\"bye\\""',
+        "temperature                    0.7",
+        "num_ctx                        8192",
+        "top_k                          40",
+        "penalize_newline               false",
+    ]
+)
+
+
+def test_modelfile_defaults_are_read(tmp_path):
+    model = store(tmp_path)
+    data = {
+        **show(model),
+        "system": "You are terse.",
+        "parameters": SHOW_PARAMETERS,
+        "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}, {"role": 1}],
+    }
+    defaults = locate(data, "tiny").defaults
+    assert defaults.system == "You are terse."
+    assert defaults.options == {
+        "stop": ["<|im_end|>", 'say "bye"'],
+        "temperature": 0.7,
+        "num_ctx": 8192,
+        "top_k": 40,
+        "penalize_newline": False,
+    }
+    assert defaults.messages == [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
+    assert parse_parameters("") == {} and parse_parameters("seed  -1\nbroken\n") == {"seed": -1}
 
 
 def test_projector_is_noticed(tmp_path):
