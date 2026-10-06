@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from ollamapower.llamacpp import install as inst
+from ollamapower.llamacpp import variants
 from ollamapower.llamacpp.variants import Variant, VariantError, archives_for, resolve_backend
 
 
@@ -171,23 +172,16 @@ def test_windows_zip_layout_and_cuda_runtime_merge(tmp_path):
 
 
 def test_pins_file_covers_every_variant():
+    """Every build we may pick has a pinned size and SHA-256, and every pin is used."""
     pins = inst.Pins.load()
     assert pins.tag == f"b{pins.build}"
-    for system, arch, backend in [
-        ("macos", "arm64", "metal"),
-        ("macos", "x64", "cpu"),
-        ("linux", "x64", "vulkan"),
-        ("linux", "x64", "cuda12"),
-        ("linux", "x64", "cuda13"),
-        ("linux", "x64", "rocm"),
-        ("linux", "arm64", "cpu"),
-        ("windows", "x64", "vulkan"),
-        ("windows", "x64", "cuda13"),
-        ("windows", "arm64", "cpu"),
-    ]:
+    used = set()
+    for system, arch, backend in variants._table(pins.tag):
         for name in archives_for(pins.tag, system, arch, backend).archives:
             entry = pins.expect(name)
             assert len(entry["sha256"]) == 64 and entry["size"] > 1_000_000
+            used.add(name)
+    assert used == set(pins.archives)
 
 
 def test_backend_choice():
@@ -196,5 +190,31 @@ def test_backend_choice():
     assert resolve_backend("auto", "linux", "x64", ["nvidia"]) == "vulkan"
     assert resolve_backend("auto", "windows", "x64", []) == "cpu"
     assert resolve_backend("cuda13", "linux", "x64", ["nvidia"]) == "cuda13"
+    # No Vulkan build for Windows on ARM: auto must not pick a build that doesn't exist.
+    assert resolve_backend("auto", "windows", "arm64", ["qualcomm"]) == "cpu"
+    assert resolve_backend("auto", "linux", "arm64", ["nvidia"]) == "vulkan"
+    for system, arch in [("linux", "x64"), ("linux", "arm64"), ("windows", "x64"), ("windows", "arm64")]:
+        for vendors in ([], ["nvidia"]):
+            archives_for("b1", system, arch, resolve_backend("auto", system, arch, vendors))
     with pytest.raises(VariantError, match="no official llama.cpp cuda12 build for macos"):
         archives_for("b1", "macos", "arm64", "cuda12")
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "machine", "translated", "expected"),
+    [
+        ("darwin", "x86_64", "1", ("macos", "arm64")),  # Intel Python under Rosetta on Apple Silicon
+        ("darwin", "x86_64", "0", ("macos", "x64")),  # a real Intel Mac
+        ("darwin", "arm64", "", ("macos", "arm64")),
+        ("win32", "AMD64", "", ("windows", "x64")),
+        ("win32", "ARM64", "", ("windows", "arm64")),
+        ("linux", "aarch64", "", ("linux", "arm64")),
+    ],
+)
+def test_current_platform(monkeypatch, platform_name, machine, translated, expected):
+    monkeypatch.setattr(variants.sys, "platform", platform_name)
+    monkeypatch.setattr(variants.platform, "machine", lambda: machine)
+    monkeypatch.setattr(
+        variants.subprocess, "run", lambda *a, **k: variants.subprocess.CompletedProcess(a, 0, translated, "")
+    )
+    assert variants.current_platform() == expected

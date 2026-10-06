@@ -28,6 +28,8 @@ from typing import Any
 
 import psutil
 
+from .llamacpp.variants import native_machine
+
 log = logging.getLogger("ollamapower.telemetry")
 
 APPLE_GPU_SHARE = 0.75  # Metal's recommended working set is ~75% of unified memory
@@ -160,7 +162,7 @@ def amd_sample(root: Path = SYSFS_DRM) -> list[dict[str, Any]]:
 
 
 def apple_static() -> list[dict[str, Any]]:
-    if sys.platform != "darwin" or platform.machine() != "arm64":
+    if sys.platform != "darwin" or native_machine() != "arm64":  # also under Rosetta
         return []
     return [
         {
