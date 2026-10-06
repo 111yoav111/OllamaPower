@@ -43,4 +43,6 @@ def ensure(
         binaries.check(pins.build)
     except (InstallError, VariantError, BinaryError) as exc:
         raise LlamaCppUnavailable(str(exc)) from None
+    except OSError as exc:  # e.g. the config dir isn't writable: a message, not a traceback
+        raise LlamaCppUnavailable(f"llama.cpp setup failed: {exc}") from None
     return binaries

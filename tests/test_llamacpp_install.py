@@ -75,16 +75,16 @@ class FakeRelease:
 
 
 def test_download_and_install(tmp_path):
-    rel = FakeRelease(
-        {"a.tar.gz": make_tgz({"llama-server": b"#!srv", "libggml.so.0": b"lib"}, {"libggml.so": "libggml.so.0"})}
-    )
+    # Creating symlinks needs a privilege on Windows (which only gets .zip builds anyway).
+    links = {} if sys.platform == "win32" else {"libggml.so": "libggml.so.0"}
+    rel = FakeRelease({"a.tar.gz": make_tgz({"llama-server": b"#!srv", "libggml.so.0": b"lib"}, links)})
     pins, seen = rel.pins(), []
     target = inst.install(
         Variant("cpu", ("a.tar.gz",)), tmp_path, pins, progress=lambda n, d, t: seen.append(d), client=rel.client()
     )
     assert (target / "llama-server").read_bytes() == b"#!srv"
-    assert os.readlink(target / "libggml.so") == "libggml.so.0"
     if sys.platform != "win32":
+        assert os.readlink(target / "libggml.so") == "libggml.so.0"
         assert os.access(target / "llama-server", os.X_OK)
     assert seen[-1] == len(rel.archives["a.tar.gz"])
     assert not (tmp_path / "llamacpp" / "downloads" / "a.tar.gz").exists()  # archive removed after unpacking
@@ -218,3 +218,28 @@ def test_current_platform(monkeypatch, platform_name, machine, translated, expec
         variants.subprocess, "run", lambda *a, **k: variants.subprocess.CompletedProcess(a, 0, translated, "")
     )
     assert variants.current_platform() == expected
+
+
+def test_unpack_failure_is_an_install_error_and_leaves_nothing(tmp_path, monkeypatch):
+    """E.g. Windows without the symlink privilege, or a full disk: a message, no half install."""
+    rel = FakeRelease({"a.tar.gz": make_tgz({"llama-server": b"#!srv"}, {"libggml.so": "llama-server"})})
+
+    def no_symlinks(*_a, **_k):
+        raise OSError(1314, "A required privilege is not held by the client")
+
+    monkeypatch.setattr(inst.os, "symlink", no_symlinks)
+    with pytest.raises(inst.InstallError, match="cannot install llama.cpp"):
+        inst.install(Variant("cpu", ("a.tar.gz",)), tmp_path, rel.pins(), client=rel.client())
+    tag_dir = tmp_path / "llamacpp" / "b1"
+    assert not tag_dir.exists() or not list(tag_dir.iterdir())
+
+
+def test_ensure_turns_os_errors_into_a_message(tmp_path, monkeypatch):
+    from ollamapower.llamacpp import manager
+
+    def locked(*_a, **_k):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(manager, "install", locked)
+    with pytest.raises(manager.LlamaCppUnavailable, match="Access is denied"):
+        manager.ensure(tmp_path, "cpu", pins=FakeRelease({}).pins())

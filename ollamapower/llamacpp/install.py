@@ -211,12 +211,21 @@ def install(
     archives = [download(name, downloads, pins, progress, client) for name in variant.archives]
     staging = target.with_name(target.name + ".staging")
     shutil.rmtree(staging, ignore_errors=True)
-    for archive in archives:
-        unpack(archive, staging)
-    marker = {"tag": pins.tag, "archives": {name: pins.expect(name)["sha256"] for name in variant.archives}}
-    (staging / MARKER).write_text(json.dumps(marker))
-    shutil.rmtree(target, ignore_errors=True)
-    os.replace(staging, target)
+    try:
+        for archive in archives:
+            unpack(archive, staging)
+        marker = {"tag": pins.tag, "archives": {name: pins.expect(name)["sha256"] for name in variant.archives}}
+        (staging / MARKER).write_text(json.dumps(marker))
+        shutil.rmtree(target, ignore_errors=True)
+        os.replace(staging, target)
+    except OSError as exc:
+        # Disk full, no right to create symlinks, or (Windows) a program from the old
+        # install still running, which keeps its files locked.
+        shutil.rmtree(staging, ignore_errors=True)
+        raise InstallError(
+            f"cannot install llama.cpp in {target}: {exc}. If a llama.cpp program from there is still running, "
+            "stop it (or the agent/hub using it) and try again"
+        ) from None
     for archive in archives:
         archive.unlink(missing_ok=True)  # unpacked and verified: the archive is no longer needed
     log.info("installed llama.cpp %s (%s) in %s", pins.tag, variant.backend, target)
