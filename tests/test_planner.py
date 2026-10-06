@@ -114,6 +114,24 @@ def test_kv_cache_grows_with_context():
     assert big[-1] == small[-1]  # the output layer has no KV cache
 
 
+def test_per_layer_cache_places_more_layers_and_is_counted_per_device():
+    from ollamapower.ollama.gguf import KVLayer
+
+    ctx = 32768
+    full = model(layers=10, layer_gb=0.5)
+    per_token = full.kv_bytes_per_layer(1)
+    windowed = model(layers=10, layer_gb=0.5)
+    windowed.kv_layers = [KVLayer(per_token, window=1536 if i % 2 == 0 else 0) for i in range(10)]
+    helpers = [gpu("h", 4.0, node="a")]
+    a, b = plan_split("m", full, ctx, [], helpers), plan_split("m", windowed, ctx, [], helpers)
+    assert b.gpu_layers > a.gpu_layers  # a smaller (correct) cache estimate fits more layers
+    kv = [*windowed.kv_bytes(ctx), 0]
+    first = b.cpu_layers
+    for p in b.placements:
+        assert p.cache == sum(kv[first : first + p.layers])
+        first += p.layers
+
+
 def test_summary_is_json_friendly():
     import json
 

@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 from ..aio import reap
 from ..llamacpp.install import Pins
 from ..ollama.blobs import ModelUnavailable, resolve
+from ..ollama.gguf import GGUFInfo
 from ..textsafe import safe_text
 
 if TYPE_CHECKING:
@@ -78,6 +79,7 @@ class PlanBook:
         self.hub = hub
         self.config = hub.config
         self.facts_cache: dict[str, dict[str, Any]] = {}  # digest -> facts
+        self.gguf_cache: dict[str, GGUFInfo] = {}  # digest -> header (the KV cache depends on the context)
         self.last_request: dict[str, float] = {}  # model -> time.time() of its last client request
         self.last_activity = time.monotonic()
         self.bench_lock = asyncio.Lock()
@@ -269,9 +271,9 @@ class PlanBook:
                 weights=info.weights_bytes,
                 layers=info.block_count,
                 architecture=info.architecture,
-                kv_per_token=info.kv_bytes_per_layer(1) * info.block_count,
                 vision=files.vision,
             )
+            self.gguf_cache[cache_key] = info
         self.facts_cache[cache_key] = base
         return self._with_vram(base, model)
 
@@ -284,7 +286,10 @@ class PlanBook:
         out["hub_vram"] = hub_vram
         ctx = self.ctx_for(model)
         if base.get("splittable"):
-            needed = int((base["weights"] + base["kv_per_token"] * ctx) * (1 + self.config.planner.memory_margin))
+            info = self.gguf_cache.get(self.digest_of(model) or model)
+            kv = info.kv_bytes_total(ctx) if info is not None else 0
+            out["kv"] = kv
+            needed = int((base["weights"] + kv) * (1 + self.config.planner.memory_margin))
             out["needed"] = needed
             out["fits"] = hub_vram > 0 and needed <= hub_vram
         else:

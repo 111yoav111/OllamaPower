@@ -231,6 +231,69 @@ def test_multimodal_and_mtp_tensors_in_the_main_gguf_are_refused(tmp_path, tenso
         locate(show(model), "tiny")
 
 
+def test_kv_cache_of_mla_models_is_the_compressed_latent(tmp_path):
+    # DeepSeek-V3 shape, scaled down: kv_lora_rank 512 + 64 RoPE dims per token, K only (llama.cpp's MLA cache).
+    mla = {
+        "deepseek2.attention.kv_lora_rank": 512,
+        "deepseek2.attention.key_length": 576,
+        "deepseek2.attention.value_length": 512,
+        "deepseek2.attention.key_length_mla": 192,
+        "deepseek2.attention.value_length_mla": 128,
+        "deepseek2.rope.dimension_count": 64,
+    }
+    info = read_gguf(write_tiny_llama(tmp_path / "m.gguf", arch="deepseek2", n_head_kv=1, extra_kv=mla))
+    assert info.kv_bytes(4096) == [4096 * (512 + 64) * 2] * 4
+    # Without key_length_mla llama.cpp (and so the estimate) uses the decompressed per-head cache.
+    old = {k: v for k, v in mla.items() if "_mla" not in k}
+    info = read_gguf(write_tiny_llama(tmp_path / "o.gguf", arch="deepseek2", n_head_kv=1, extra_kv=old))
+    assert info.kv_bytes(4096) == [4096 * (576 + 512) * 2] * 4
+
+
+def test_sliding_window_layers_cache_only_the_window(tmp_path):
+    from ollamapower.ollama.gguf import UBATCH
+
+    cells = 1024 + UBATCH  # window + one ubatch, already a multiple of 256
+    per_token = 2 * (16 + 16) * 2
+    swa = {"gemma3.attention.sliding_window": 1024}
+    info = read_gguf(write_tiny_llama(tmp_path / "g.gguf", arch="gemma3", n_layer=12, extra_kv=swa))
+    full, slide = 32768 * per_token, cells * per_token
+    assert info.kv_bytes(32768) == ([slide] * 5 + [full]) * 2  # gemma3: 5 local layers, then 1 global
+    assert info.kv_bytes(512) == [512 * per_token] * 12  # a context smaller than the window
+    # An explicit per-layer pattern wins over the architecture's default.
+    pattern = {**swa, "gemma3.attention.sliding_window_pattern": (7, [True, False] * 6)}
+    info = read_gguf(write_tiny_llama(tmp_path / "p.gguf", arch="gemma3", n_layer=12, extra_kv=pattern))
+    assert info.kv_bytes(32768) == [slide, full] * 6
+    # cohere2 slides 3 of every 4 layers; without a window key nothing slides.
+    info = read_gguf(
+        write_tiny_llama(tmp_path / "c.gguf", arch="cohere2", extra_kv={"cohere2.attention.sliding_window": 1024})
+    )
+    assert info.kv_bytes(32768) == [slide, slide, slide, full]
+    assert read_gguf(write_tiny_llama(tmp_path / "n.gguf", arch="cohere2")).kv_bytes(32768) == [full] * 4
+
+
+def test_recurrent_layers_have_no_kv_cache(tmp_path):
+    ssm = {"ssm.conv_kernel": 4, "ssm.inner_size": 128, "ssm.state_size": 16, "ssm.group_count": 1}
+    state = ((4 - 1) * (128 + 2 * 16) + 16 * 128) * 4  # conv + SSM state, f32
+    per_token = 2 * (16 + 16) * 2
+    # Jamba-style: head_count_kv per layer, 0 for the Mamba layers.
+    kv = {"jamba.attention.head_count_kv": (5, [0, 2, 0, 0])} | {f"jamba.{k}": v for k, v in ssm.items()}
+    info = read_gguf(write_tiny_llama(tmp_path / "j.gguf", arch="jamba", extra_kv=kv))
+    assert info.kv_bytes(8192) == [state, 8192 * per_token, state, state]
+    # Qwen3-Next: every 4th layer is full attention, the rest linear (recurrent).
+    kv = {f"qwen3next.{k}": v for k, v in ssm.items()}
+    info = read_gguf(write_tiny_llama(tmp_path / "q.gguf", arch="qwen3next", n_layer=8, extra_kv=kv))
+    assert info.kv_bytes(8192) == ([state] * 3 + [8192 * per_token]) * 2
+    # A pure SSM: no KV anywhere, and the cache doesn't grow with the context.
+    kv = {f"mamba2.{k}": v for k, v in ssm.items()}
+    info = read_gguf(write_tiny_llama(tmp_path / "m.gguf", arch="mamba2", extra_kv=kv))
+    assert info.kv_bytes(1024) == info.kv_bytes(131072) == [state] * 4
+
+
+def test_recurrent_layers_of_unknown_size_keep_the_upper_bound(tmp_path):
+    info = read_gguf(write_tiny_llama(tmp_path / "q.gguf", arch="qwen3next", n_layer=4))
+    assert info.kv_bytes(1000) == [1000 * 2 * (16 + 16) * 2] * 4
+
+
 def test_declared_nextn_layers_are_llama_cpp_layout_and_allowed(tmp_path):
     model = store(
         tmp_path,

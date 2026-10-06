@@ -52,7 +52,8 @@ class Device:
 class Placement:
     device: Device
     layers: int
-    bytes: int
+    bytes: int  # weights + cache
+    cache: int = 0  # the KV cache / recurrent state part of ``bytes``
 
 
 @dataclass
@@ -95,6 +96,7 @@ class SplitPlan:
                     "device": p.device.device,
                     "layers": p.layers,
                     "bytes": p.bytes,
+                    "cache": p.cache,
                     "budget": p.device.budget,
                 }
                 for p in self.placements
@@ -104,8 +106,7 @@ class SplitPlan:
 
 def unit_sizes(info: GGUFInfo, ctx: int) -> list[int]:
     """Bytes each of llama.cpp's layer slots needs: blocks (weights + KV cache), then the output layer."""
-    kv = info.kv_bytes_per_layer(ctx)
-    return [b + kv for b in info.layer_bytes] + [info.output_bytes]
+    return [b + kv for b, kv in zip(info.layer_bytes, info.kv_bytes(ctx), strict=True)] + [info.output_bytes]
 
 
 def _fill(units: list[int], devices: list[Device]) -> tuple[list[tuple[Device, int, int]], int]:
@@ -137,7 +138,12 @@ def plan_split(model: str, info: GGUFInfo, ctx: int, hub: list[Device], helpers:
         raise PlanError(f"{model} fits on the hub's GPU alone; Ollama runs it faster without helpers")
     order = [*reversed(helpers), *hub]  # the best helper sits next to the hub's GPUs
     placed, cpu = _fill(units, order)
-    placements = [Placement(d, n, b) for d, n, b in placed if n > 0]
+    caches = [*info.kv_bytes(ctx), 0]
+    placements, first = [], cpu
+    for d, n, b in placed:
+        if n > 0:
+            placements.append(Placement(d, n, b, sum(caches[first : first + n])))
+        first += n
     if not any(p.device.node_id for p in placements):
         raise PlanError(f"no helper has room for even one layer of {model} (each layer needs ~{max(units) // MIB} MB)")
     # Whatever didn't fit (the first ``cpu`` layers) stays on the hub's CPU: -ngl is set below the layer count.

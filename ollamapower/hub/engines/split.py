@@ -129,8 +129,7 @@ class SplitSession:
         relays = [x.relay for x in self.leases if x.relay is not None]
         if not relays or self.plan is None or self.files is None or self.files.gguf is None:
             return None
-        kv = self.files.gguf.kv_bytes_per_layer(self.ctx)
-        expected = sum(max(0, p.bytes - kv * p.layers) for p in self.plan.helpers)
+        expected = sum(max(0, p.bytes - p.cache) for p in self.plan.helpers)
         return {"sent": sum(r.bytes_out for r in relays), "expected": expected, "loading": self.state == "starting"}
 
     def alive(self) -> bool:

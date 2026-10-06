@@ -55,8 +55,32 @@ _NEXTN = re.compile(r"^blk\.(\d+)\.nextn\.")
 FOREIGN_PREFIXES = {"v.": "vision", "mm.": "vision", "a.": "audio", "mtp.": "MTP", "mtp_": "MTP"}
 
 
+# KV cache shapes llama.cpp uses (see llama-hparams.cpp / llama-kv-cache*.cpp at the pinned build).
+UBATCH = 512  # llama-server's default -ub: a sliding-window cache keeps the window plus one ubatch
+KV_PAD = 256
+# Architectures whose sliding-window layers follow a fixed pattern unless the header gives one
+# (every n-th layer is global, the others slide), from each model's load_arch_hparams.
+SWA_PATTERN_DEFAULTS = {"gemma2": 2, "gemma3": 6, "cohere2": 4, "gpt-oss": 2}
+# Hybrid models whose linear-attention layers are all but every n-th one, unless the header says.
+RECURRENT_INTERVAL_DEFAULTS = {"qwen3next": 4, "qwen35": 4, "qwen35moe": 4}
+PURE_RECURRENT = frozenset({"mamba", "mamba2", "rwkv6", "rwkv6qwen2", "rwkv7", "arwkv7"})
+PARALLEL_HYBRID = frozenset({"falcon-h1"})  # attention and SSM side by side in every layer
+# MLA models whose cache has more than the compressed latent (DSA indexer caches): keep the
+# old, larger estimate for those rather than under-estimate.
+MLA_WITH_EXTRA_CACHES = frozenset({"deepseek32", "deepseek4", "glm-dsa", "glm5-next"})
+
+
 class GGUFError(ValueError):
     """Not a GGUF file, or one we can't use."""
+
+
+@dataclass(frozen=True)
+class KVLayer:
+    """What one block keeps per sequence besides its weights."""
+
+    per_token: int  # K+V cache bytes per token (f16); 0 for layers without attention
+    window: int = 0  # >0: a sliding-window layer, which caches at most this many tokens
+    state: int = 0  # recurrent (SSM/RWKV) state in bytes, independent of the context
 
 
 @dataclass
@@ -80,17 +104,33 @@ class GGUFInfo:
     input_bytes: int = 0  # token embeddings: always kept on the hub's CPU
     other_bytes: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+    kv_layers: list[KVLayer] = field(default_factory=list)  # per block; empty = every block full attention
 
     @property
     def weights_bytes(self) -> int:
         return sum(self.layer_bytes) + self.output_bytes + self.input_bytes + self.other_bytes
 
-    def kv_bytes_per_layer(self, ctx: int) -> int:
-        """KV cache for one layer at ``ctx`` tokens (f16), an upper bound."""
+    def _uniform_kv_per_token(self) -> int:
         heads_kv = self.head_count_kv or self.head_count
         k = self.key_length or (self.embedding_length // self.head_count if self.head_count else 0)
         v = self.value_length or k
-        return ctx * heads_kv * (k + v) * 2
+        return heads_kv * (k + v) * 2
+
+    def kv_bytes(self, ctx: int) -> list[int]:
+        """Cache bytes each block needs at ``ctx`` tokens: KV (f16, windows applied) plus recurrent state."""
+        if not self.kv_layers:
+            return [ctx * self._uniform_kv_per_token()] * self.block_count
+        return [
+            layer.per_token * (min(ctx, layer.window) if layer.window else ctx) + layer.state
+            for layer in self.kv_layers
+        ]
+
+    def kv_bytes_total(self, ctx: int) -> int:
+        return sum(self.kv_bytes(ctx))
+
+    def kv_bytes_per_layer(self, ctx: int) -> int:
+        """Cache of the largest block at ``ctx`` tokens (for display: an upper bound per layer)."""
+        return max(self.kv_bytes(ctx), default=0)
 
 
 class _Reader:
@@ -155,6 +195,105 @@ def _int(value: Any) -> int:
     if isinstance(value, list):  # per-layer values (e.g. head_count_kv): plan for the largest
         value = max((v for v in value if isinstance(v, int)), default=0)
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _per_layer(value: Any, n: int) -> list[int] | None:
+    """A per-layer header value as ``n`` ints (a scalar repeats), or None if absent or malformed."""
+    if isinstance(value, list):
+        if len(value) != n or not all(isinstance(v, int) for v in value):
+            return None
+        return [max(0, int(v)) for v in value]
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return [value] * n
+    return None
+
+
+def _kv_layout(meta: dict[str, Any], info: GGUFInfo) -> list[KVLayer]:
+    """Per-block cache shape, as llama.cpp allocates it: MLA, sliding windows, recurrent layers.
+
+    Anything unknown falls back to the full-attention estimate, which is an upper bound.
+    """
+    arch, n = info.architecture, info.block_count
+    trunk = n - info.nextn_layers
+
+    def key(name: str) -> Any:
+        return meta.get(f"{arch}.{name}")
+
+    def num(name: str) -> int:
+        return min(_int(key(name)), MAX_DIMENSION)
+
+    heads = _per_layer(key("attention.head_count"), n) or [0] * n
+    # Absent: as many KV heads as heads. An array may hold 0 for layers without attention.
+    explicit_kv = isinstance(key("attention.head_count_kv"), list)
+    heads_kv = _per_layer(key("attention.head_count_kv"), n) if key("attention.head_count_kv") else None
+    if heads_kv is None or (not explicit_kv and not any(heads_kv)):
+        heads_kv = heads
+    k_len = info.key_length or (info.embedding_length // info.head_count if info.head_count else 0)
+    v_len = info.value_length or k_len
+    k_swa = num("attention.key_length_swa") or k_len
+    v_swa = num("attention.value_length_swa") or (k_swa if num("attention.key_length_swa") else v_len)
+
+    # MLA (DeepSeek-V2/V3, Kimi K2, ...): one compressed latent plus the RoPE part per token, K only.
+    kv_lora, mla = num("attention.kv_lora_rank"), num("attention.key_length_mla")
+    mla_per_token = 0
+    if kv_lora and mla and arch not in MLA_WITH_EXTRA_CACHES:
+        rope = num("rope.dimension_count") or max(0, k_len - kv_lora)
+        mla_per_token = (kv_lora + rope) * 2
+
+    # Sliding-window attention: those layers keep the window (plus one ubatch), not the context.
+    window = num("attention.sliding_window")
+    swa = [False] * n
+    if window > 0:
+        pattern = key("attention.sliding_window_pattern")
+        if isinstance(pattern, list) and len(pattern) == n:
+            swa = [bool(x) for x in pattern]
+        else:
+            every = _int(pattern) if isinstance(pattern, int) and not isinstance(pattern, bool) else None
+            every = SWA_PATTERN_DEFAULTS.get(arch) if every is None else every
+            if every is not None:
+                swa = [i < trunk and (every == 0 or i % every < every - 1) for i in range(n)]
+    cells = -(-(window + UBATCH) // KV_PAD) * KV_PAD
+
+    # Recurrent layers (SSM, RWKV, linear attention): a fixed state instead of a KV cache.
+    recurrent = [arch in PURE_RECURRENT] * n
+    listed = key("attention.recurrent_layers")
+    interval = num("full_attention_interval") or RECURRENT_INTERVAL_DEFAULTS.get(arch, 0)
+    if isinstance(listed, list) and len(listed) == n:
+        recurrent = [bool(x) for x in listed]
+    elif interval:
+        recurrent = [i < trunk and (i + 1) % interval != 0 for i in range(n)]
+    if explicit_kv:
+        recurrent = [r or kv == 0 for r, kv in zip(recurrent, heads_kv, strict=True)]
+    n_embd = info.embedding_length
+    state: int | None = None
+    if num("wkv.head_size"):
+        state = ((num("token_shift_count") or 2) * n_embd + n_embd * num("wkv.head_size")) * 4
+    elif num("shortconv.l_cache"):
+        state = n_embd * max(0, num("shortconv.l_cache") - 1) * 4
+    elif num("ssm.inner_size") and num("ssm.state_size"):
+        inner, d_state = num("ssm.inner_size"), num("ssm.state_size")
+        conv = max(0, num("ssm.conv_kernel") - 1) * (inner + 2 * num("ssm.group_count") * d_state)
+        state = (conv + d_state * inner) * 4
+
+    out = []
+    for i in range(n):
+        if mla_per_token:
+            per_token = mla_per_token if heads_kv[i] else 0
+        elif swa[i]:
+            per_token = heads_kv[i] * (k_swa + v_swa) * 2
+        else:
+            per_token = heads_kv[i] * (k_len + v_len) * 2
+        layer_state = 0
+        if arch in PARALLEL_HYBRID and state is not None:
+            layer_state = state
+        elif recurrent[i]:
+            if state is None:  # a recurrent layer we can't size: keep the attention estimate
+                per_token = per_token or info.head_count * (k_len + v_len) * 2
+                out.append(KVLayer(per_token))
+                continue
+            per_token, layer_state = 0, state
+        out.append(KVLayer(per_token, cells if swa[i] and per_token else 0, layer_state))
+    return out
 
 
 def read_gguf(path: Path) -> GGUFInfo:
@@ -230,6 +369,7 @@ def read_gguf(path: Path) -> GGUFInfo:
     if info.nextn_layers > info.block_count:
         raise GGUFError(f"implausible nextn_predict_layers {info.nextn_layers}")
     first_nextn = info.block_count - info.nextn_layers
+    info.kv_layers = _kv_layout(meta, info)
 
     ordered = sorted(tensors, key=lambda t: t[1])
     layers = [0] * info.block_count
