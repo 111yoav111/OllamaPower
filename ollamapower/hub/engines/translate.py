@@ -15,6 +15,8 @@ context sizes (split mode loads the model once with a fixed context).
 from __future__ import annotations
 
 import json
+import secrets
+import string
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -42,6 +44,7 @@ NO_IMAGES = (
     "images are not supported in split mode yet (the vision part of the model isn't loaded); "
     "remove the split plan to use this model with images"
 )
+ID_CHARS = string.ascii_lowercase + string.digits
 MAX_PENDING = 16 * 1024 * 1024  # an SSE line longer than this is dropped
 
 
@@ -247,7 +250,9 @@ class OllamaStream:
         delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
         for call in delta.get("tool_calls") or []:
             if isinstance(call, dict):
-                slot = self._tools.setdefault(int(call.get("index", 0) or 0), {"name": "", "arguments": ""})
+                slot = self._tools.setdefault(_int(call.get("index")), {"id": "", "name": "", "arguments": ""})
+                if call.get("id") and not slot["id"]:
+                    slot["id"] = str(call["id"])[:128]
                 fn = call.get("function") if isinstance(call.get("function"), dict) else {}
                 slot["name"] += str(fn.get("name") or "")
                 slot["arguments"] += str(fn.get("arguments") or "")
@@ -276,13 +281,21 @@ class OllamaStream:
         return obj
 
     def _tool_calls(self) -> list[dict[str, Any]]:
+        """The finished tool calls, shaped like Ollama's: an id, the call's index, arguments as an object."""
         calls = []
-        for _, slot in sorted(self._tools.items()):
+        for index, (_, slot) in enumerate(sorted(self._tools.items())):
             try:
-                args = json.loads(slot["arguments"]) if slot["arguments"] else {}
+                args = json.loads(slot["arguments"]) if slot["arguments"].strip() else {}
             except ValueError:
-                args = slot["arguments"]
-            calls.append({"function": {"name": slot["name"], "arguments": args}})
+                args = {}
+            if not isinstance(args, dict):
+                args = {}  # Ollama's arguments are always an object; it never passes on a broken one
+            calls.append(
+                {
+                    "id": slot["id"] or _call_id(),
+                    "function": {"index": index, "name": slot["name"], "arguments": args},
+                }
+            )
         return calls
 
     def _final(self) -> dict[str, Any]:
@@ -331,6 +344,15 @@ class OllamaStream:
         if calls and self.key == "message":
             final["message"]["tool_calls"] = calls
         return json.dumps({**final, **self._final()}, ensure_ascii=False).encode()
+
+
+def _int(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _call_id() -> str:
+    """A tool call id like Ollama's own (``call_`` and 8 random characters)."""
+    return "call_" + "".join(secrets.choice(ID_CHARS) for _ in range(8))
 
 
 def _upstream_error(raw: bytes, status: int) -> str:

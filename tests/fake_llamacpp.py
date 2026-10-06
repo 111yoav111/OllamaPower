@@ -85,8 +85,8 @@ class H(BaseHTTPRequestHandler):
                 os._exit(1)
             time.sleep(float(body.get("fake_delay", 0)))
         if body.get("tools"):
-            for fn in ({"name": "get", "arguments": '{"a":'}, {"arguments": ' 1}'}):
-                ev({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": fn}]}}]})
+            for extra, fn in (({"id": "fake1"}, {"name": "get", "arguments": '{"a":'}), ({}, {"arguments": ' 1}'})):
+                ev({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, **extra, "function": fn}]}}]})
         ev({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
         timings = {"prompt_n": 7, "prompt_ms": 70.0, "predicted_n": 3, "predicted_ms": 150.0}
         if (HERE / "timings.json").exists():  # tests set how fast "split" is

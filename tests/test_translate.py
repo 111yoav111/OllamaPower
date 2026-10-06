@@ -151,6 +151,31 @@ def test_think_bools_and_levels(think, expected):
     assert "reasoning_effort" not in chat_request({"messages": []})
 
 
+def tool_delta(index: int, fn: dict, **extra) -> dict:
+    return delta(tool_calls=[{"index": index, **extra, "function": fn}])
+
+
+def test_tool_calls_get_ids_indexes_and_object_arguments():
+    t = OllamaStream("m", "/api/chat", stream=True)
+    raw = sse(
+        tool_delta(0, {"name": "a", "arguments": '{"x":'}, id="up1"),
+        tool_delta(0, {"arguments": " 1}"}),
+        tool_delta(1, {"name": "b", "arguments": "{broken"}),
+        tool_delta(2, {"name": "c", "arguments": "[1, 2]"}),
+        tool_delta(3, {"name": "d", "arguments": ""}),
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        FINAL,
+    )
+    lines = [json.loads(x) for x in (t.feed(raw) + t.finish()).splitlines()]
+    calls = lines[0]["message"]["tool_calls"]
+    assert calls[0] == {"id": "up1", "function": {"index": 0, "name": "a", "arguments": {"x": 1}}}
+    assert [c["function"]["index"] for c in calls] == [0, 1, 2, 3]
+    assert [c["function"]["arguments"] for c in calls[1:]] == [{}, {}, {}]  # broken JSON never reaches the client
+    generated = [c["id"] for c in calls[1:]]
+    assert all(i.startswith("call_") and len(i) == 13 for i in generated) and len(set(generated)) == 3
+    assert lines[-1]["done"] is True and lines[-1]["done_reason"] == "stop"
+
+
 @pytest.mark.parametrize("think", ["max", "true", "", 1])
 def test_unknown_think_values_are_refused_like_ollama(think):
     with pytest.raises(UnsupportedRequest, match="invalid think value"):

@@ -233,7 +233,9 @@ def test_non_streaming_generate_tools_and_ps(cluster, client):
 
     tools = [{"type": "function", "function": {"name": "get", "parameters": {"type": "object"}}}]
     r = chat(client, c, stream=False, tools=tools, options={"temperature": 0.1, "num_predict": 9})
-    assert r.json()["message"]["tool_calls"] == [{"function": {"name": "get", "arguments": {"a": 1}}}]
+    assert r.json()["message"]["tool_calls"] == [
+        {"id": "fake1", "function": {"index": 0, "name": "get", "arguments": {"a": 1}}}
+    ]
     sent = json.loads((c.hub_bin / "last_request.json").read_text())["body"]
     assert sent["temperature"] == 0.1 and sent["max_tokens"] == 9 and sent["tools"] == tools
 
