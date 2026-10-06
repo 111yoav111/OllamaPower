@@ -74,6 +74,9 @@ class Transform(Protocol):
 
     def feed(self, chunk: bytes) -> bytes: ...
 
+    async def settle(self) -> None:
+        """Anything to ask before ``finish`` (e.g. ``/api/generate``'s context tokens)."""
+
     def finish(self) -> bytes: ...
 
 
@@ -289,6 +292,7 @@ class ProxyStreamResponse(Response):
             async for chunk in source:
                 await self._send_body(self.transform.feed(chunk) if self.transform else chunk, send)
             if self.transform is not None:
+                await self.transform.settle()
                 await self._send_body(self.transform.finish(), send)
         except httpx.HTTPError as exc:
             log.warning("upstream stream error: %s", type(exc).__name__)

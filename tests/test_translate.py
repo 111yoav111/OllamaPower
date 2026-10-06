@@ -11,6 +11,7 @@ from ollamapower.hub.engines.translate import (
     UnsupportedRequest,
     apply_model_defaults,
     chat_request,
+    completion_request,
     context_overflow,
     generate_request,
     is_load_request,
@@ -269,6 +270,42 @@ def test_modelfile_defaults_on_generate():
     before = json.loads(json.dumps(out))
     apply_model_defaults(out, body, False, ModelDefaults())
     assert out == before
+
+
+def test_completion_request_for_a_built_prompt():
+    chat = generate_request(
+        {"prompt": "x", "format": {"type": "object"}, "think": "low", "logprobs": True, "options": {"seed": 1}}
+    )
+    out = completion_request(chat, "PROMPT")
+    assert out["prompt"] == "PROMPT" and out["seed"] == 1 and out["stream"] is True
+    assert out["json_schema"] == {"type": "object"} and out["logprobs"] == 1
+    assert not {"messages", "response_format", "chat_template_kwargs", "reasoning_effort"} & set(out)
+    out = completion_request(generate_request({"prompt": "x", "format": "json"}), "P")
+    assert out["json_schema"] == {"type": "object"} and "logprobs" not in out
+
+
+async def test_generate_answers_end_with_their_context():
+    seen = []
+
+    async def tokens(response: str) -> list[int]:
+        seen.append(response)
+        return [1, 2, 3]
+
+    completion = {"choices": [{"index": 0, "text": "ab", "logprobs": {"content": [lp("ab", -1, [lp("c", -2)])]}}]}
+    raw = sse(completion, delta(content="c"), {"choices": [{"index": 0, "text": "", "finish_reason": "stop"}]}, FINAL)
+    t = OllamaStream("m", "/api/generate", stream=True, top_logprobs=0, context=tokens)
+    out = t.feed(raw)
+    await t.settle()
+    lines = [json.loads(x) for x in (out + t.finish()).splitlines()]
+    assert [x["response"] for x in lines] == ["ab", "c", ""] and "top_logprobs" not in lines[0]["logprobs"][0]
+    assert seen == ["abc"] and lines[-1]["context"] == [1, 2, 3]
+    assert "context" not in lines[0]
+
+    # A broken answer gets no context (and nothing is asked).
+    t = OllamaStream("m", "/api/generate", stream=False, context=tokens)
+    t.feed(b'data: {"error": {"message": "boom"}}\n\n')
+    await t.settle()
+    assert json.loads(t.finish()) == {"error": "boom"} and seen == ["abc"]
 
 
 def test_context_overflow_is_recognised():

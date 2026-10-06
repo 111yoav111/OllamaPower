@@ -54,11 +54,14 @@ from ..engines.translate import (
     UnsupportedRequest,
     apply_model_defaults,
     chat_request,
+    completion_request,
     context_overflow,
+    context_prompt,
     fit_messages,
     generate_request,
     is_load_request,
     load_reply,
+    output_context,
 )
 from ..plans import SplitSpec
 from ..runtime import ENGINE_LOCAL, Hub
@@ -318,6 +321,10 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
             upstream: httpx.Response | None = None
             chunks: AsyncIterator[bytes] | None = None
             first = b""
+            endpoint = "/v1/chat/completions"
+            chat_body = translated  # what the chat template is applied to (for /api/generate's context)
+            prompt_text: str | None = None  # the whole prompt, when it is built here (generate with a context)
+            context = parsed.get("context") if path == "/api/generate" else None
 
             async def start(first_byte: float, read: float | None) -> None:
                 """Send the request; read the first bytes of the answer."""
@@ -325,7 +332,7 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 assert session.client is not None
                 upstream_request = session.client.build_request(
                     "POST",
-                    "/v1/chat/completions" if native else target,
+                    endpoint if native else target,
                     content=json.dumps(translated).encode() if native else body,
                     headers={"content-type": "application/json", "accept-encoding": "identity"},
                     timeout=httpx.Timeout(connect=5.0, read=read, write=60.0, pool=30.0),
@@ -373,6 +380,17 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     # Progress chunks while the prompt is processed: a long prompt is alive, not stalled.
                     translated["return_progress"] = True
                     first_byte, read = config.split.stall_timeout, config.split.stall_timeout
+                    if context:
+                        # Ollama puts the earlier tokens, as text, before the templated prompt.
+                        prompt_text = await race_kill(
+                            context_prompt(session.client, translated, context), stream, request.receive
+                        )
+                        if prompt_text is None:
+                            release()
+                            finish("rejected", 400)
+                            return error(path, 400, "split mode could not read the request's context", cors(origin))
+                        translated = completion_request(translated, prompt_text)
+                        endpoint = "/v1/completions"
                 else:
                     # /v1 passes through as is: no progress, and "stream": false sends nothing until done.
                     first_byte, read = config.split.load_timeout, None
@@ -407,6 +425,11 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 release()
                 raise
             assert upstream is not None
+
+            async def answer_context(response: str) -> list[int] | None:
+                assert session.client is not None and chat_body is not None
+                return await output_context(session.client, chat_body, prompt_text, response)
+
             transform = (
                 OllamaStream(
                     str(parsed.get("model", "")),
@@ -414,6 +437,8 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     parsed.get("stream", True) is not False,
                     upstream.status_code,
                     (stream.queued_ms or 0) * 1_000_000,
+                    top_logprobs=parsed.get("top_logprobs") or 0,
+                    context=answer_context if path == "/api/generate" else None,
                 )
                 if native
                 else None

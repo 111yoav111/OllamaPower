@@ -14,17 +14,21 @@ context sizes (split mode loads the model once with a fixed context).
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import secrets
 import string
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
+
+import httpx
 
 from ...ollama.blobs import ModelDefaults
 
-if TYPE_CHECKING:
-    import httpx
+log = logging.getLogger("ollamapower.split")
 
 # Ollama option -> llama-server field (llama-server accepts its native sampling fields on /v1 too).
 OPTION_MAP = {
@@ -163,6 +167,11 @@ def generate_request(body: dict[str, Any]) -> dict[str, Any]:
         raise UnsupportedRequest("raw prompts are not supported in split mode; use /api/chat or /v1/completions")
     if body.get("suffix"):
         raise UnsupportedRequest("suffix (fill-in-the-middle) is not supported in split mode")
+    context = body.get("context")
+    if context is not None and (
+        not isinstance(context, list) or not all(isinstance(t, int) and not isinstance(t, bool) for t in context)
+    ):
+        raise UnsupportedRequest("context must be a list of token ids")
     messages = []
     if body.get("system"):
         messages.append({"role": "system", "content": body["system"]})
@@ -213,13 +222,33 @@ def context_overflow(raw: bytes) -> int | None:
 
 async def _prompt_tokens(client: httpx.AsyncClient, body: dict[str, Any]) -> int | None:
     """How many tokens llama-server makes of ``body``'s messages (None: it couldn't render them)."""
-    probe = {k: v for k, v in body.items() if k not in ("stream", "stream_options", "return_progress")}
-    prompt = _field(await client.post("/apply-template", json=probe), "prompt")
-    if not isinstance(prompt, str):
+    prompt = await _render(client, body)
+    if prompt is None:
         return None
     tokenize = {"content": prompt, "add_special": True, "parse_special": True}  # as llama-server reads prompts
-    tokens = _field(await client.post("/tokenize", json=tokenize), "tokens")
+    tokens = _field(await _post(client, "/tokenize", tokenize), "tokens")
     return len(tokens) if isinstance(tokens, list) else None
+
+
+async def _render(client: httpx.AsyncClient, body: dict[str, Any]) -> str | None:
+    """The prompt llama-server's chat template makes of a ``/v1/chat/completions`` body."""
+    probe = {k: v for k, v in body.items() if k not in ("stream", "stream_options", "return_progress")}
+    prompt = _field(await _post(client, "/apply-template", probe), "prompt")
+    return prompt if isinstance(prompt, str) else None
+
+
+async def _post(client: httpx.AsyncClient, path: str, body: dict[str, Any]) -> httpx.Response:
+    """POST to one of llama-server's side endpoints (template, tokenize: no side effects).
+
+    Tried twice: a kept-alive connection llama-server has meanwhile closed
+    fails on first use, and these requests are safe to repeat.
+    """
+    try:
+        return await client.post(path, json=body)
+    except httpx.TimeoutException:
+        raise
+    except httpx.TransportError:
+        return await client.post(path, json=body)
 
 
 def _field(r: httpx.Response, key: str) -> Any:
@@ -265,6 +294,54 @@ async def fit_messages(client: httpx.AsyncClient, body: dict[str, Any], n_ctx: i
     return keep_from(lo)
 
 
+async def context_prompt(client: httpx.AsyncClient, chat: dict[str, Any], context: list[int]) -> str | None:
+    """``/api/generate`` with a ``context``: the earlier tokens as text, then the templated prompt (as Ollama does).
+
+    Both are asked of llama-server at the same time, so this costs one
+    round trip, and only for requests that send a context.
+    """
+    detok = _post(client, "/detokenize", {"tokens": context})
+    text, prompt = await asyncio.gather(detok, _render(client, chat))
+    earlier = _field(text, "content")
+    if not isinstance(earlier, str) or prompt is None:
+        return None
+    return earlier + prompt
+
+
+def completion_request(chat: dict[str, Any], prompt: str) -> dict[str, Any]:
+    """A translated chat request -> a ``/v1/completions`` request for a prompt that is already templated."""
+    chat_only = ("messages", "tools", "chat_template_kwargs", "reasoning_effort", "response_format", "top_logprobs")
+    out = {k: v for k, v in chat.items() if k not in chat_only}
+    out["prompt"] = prompt
+    fmt = chat.get("response_format") or {}
+    if fmt.get("type") == "json_object":
+        out["json_schema"] = {"type": "object"}
+    elif fmt.get("type") == "json_schema":
+        out["json_schema"] = fmt["json_schema"]["schema"]
+    if chat.get("logprobs"):
+        out["logprobs"] = chat.get("top_logprobs") or 1  # /v1/completions takes how many alternatives to list
+    return out
+
+
+async def output_context(
+    client: httpx.AsyncClient, chat: dict[str, Any], prompt: str | None, response: str
+) -> list[int] | None:
+    """The ``context`` Ollama's ``/api/generate`` ends with: the tokens of the templated prompt and the answer.
+
+    No BOS token is added: the next request's prompt gets its own when
+    llama-server reads it, after this context.
+    """
+    if prompt is None:
+        prompt = await _render(client, chat)
+        if prompt is None:
+            return None
+    tokenize = {"content": prompt + response, "add_special": False, "parse_special": True}
+    tokens = _field(await _post(client, "/tokenize", tokenize), "tokens")
+    if not isinstance(tokens, list) or not all(isinstance(t, int) for t in tokens):
+        return None
+    return tokens
+
+
 def is_load_request(path: str, body: dict[str, Any]) -> bool:
     """An empty request: Ollama's way to load (or, with keep_alive 0, unload) a model."""
     if path == "/api/chat":
@@ -288,10 +365,21 @@ class OllamaStream:
     ``feed`` takes raw upstream bytes and returns bytes for the client;
     ``finish`` returns the rest (the final ``done`` object, or the whole
     answer when the client asked for ``"stream": false``). Content is passed
-    on, never stored, except while assembling a non-streamed answer.
+    on, never stored, except while assembling a non-streamed answer or the
+    ``context`` of an ``/api/generate`` answer: ``context`` turns the answer
+    into those tokens, and ``settle`` (awaited before ``finish``) calls it.
     """
 
-    def __init__(self, model: str, path: str, stream: bool, status: int = 200, queued_ns: int = 0) -> None:
+    def __init__(
+        self,
+        model: str,
+        path: str,
+        stream: bool,
+        status: int = 200,
+        queued_ns: int = 0,
+        top_logprobs: int = MAX_TOP_LOGPROBS,
+        context: Callable[[str], Awaitable[list[int] | None]] | None = None,
+    ) -> None:
         self.model = model
         self.key = "message" if path == "/api/chat" else "response"
         self.stream = stream
@@ -310,6 +398,10 @@ class OllamaStream:
         self._finished = False  # llama-server said the answer is complete (finish_reason or [DONE])
         self.truncated = False  # the answer ended without that: llama-server died mid-answer
         self._raw: list[bytes] = []  # error bodies only
+        self.top_logprobs = top_logprobs
+        self._context_fn = context
+        self._context: list[int] | None = None
+        self._tail = b""  # output of the last, unterminated line (read by settle, sent by finish)
 
     @property
     def content_type(self) -> str:
@@ -371,9 +463,9 @@ class OllamaStream:
                 fn = call.get("function") if isinstance(call.get("function"), dict) else {}
                 slot["name"] += str(fn.get("name") or "")
                 slot["arguments"] += str(fn.get("arguments") or "")
-        content = delta.get("content") or ""
+        content = delta.get("content") or choice.get("text") or ""  # "text": /v1/completions
         thinking = delta.get("reasoning_content") or ""
-        logprobs = _logprobs(choice.get("logprobs"))
+        logprobs = _logprobs(choice.get("logprobs"), self.top_logprobs)
         if not content and not thinking and not logprobs:
             return b""
         if not self.stream:
@@ -381,6 +473,8 @@ class OllamaStream:
             self._thinking.append(thinking)
             self._logprobs.extend(logprobs)
             return b""
+        if self._context_fn is not None and content:
+            self._content.append(content)
         piece = self._piece(content, thinking, done=False)
         if logprobs:
             piece["logprobs"] = logprobs
@@ -422,8 +516,10 @@ class OllamaStream:
         t = self._timings
         prompt_n = t.get("prompt_n", self._usage.get("prompt_tokens", 0))
         gen_n = t.get("predicted_n", self._usage.get("completion_tokens", 0))
+        context = {"context": self._context} if self._context is not None else {}
         return {
             "done_reason": self._finish,
+            **context,
             "total_duration": time.monotonic_ns() - self.started + self.queued_ns,
             "load_duration": 0,
             "prompt_eval_count": int(prompt_n or 0),
@@ -436,14 +532,28 @@ class OllamaStream:
     def _dump(obj: dict[str, Any]) -> bytes:
         return json.dumps(obj, ensure_ascii=False).encode() + b"\n"
 
+    def _read_tail(self) -> None:
+        if self._pending:
+            self._tail += self._line(bytes(self._pending).strip())
+            self._pending.clear()
+
+    async def settle(self) -> None:
+        """Ask for the answer's ``context`` tokens, once the answer is complete."""
+        if self._context_fn is None or self.status != 200:
+            return
+        self._read_tail()
+        if self._error is not None or not self._finished:
+            return
+        try:
+            self._context = await self._context_fn("".join(self._content))
+        except httpx.HTTPError as exc:
+            log.warning("split: could not tokenize the answer's context: %s", type(exc).__name__)
+
     def finish(self) -> bytes:
         if self.status != 200:
             return self._dump({"error": _upstream_error(b"".join(self._raw), self.status)})
-        if self._pending:
-            tail = self._line(bytes(self._pending).strip())
-            self._pending.clear()
-        else:
-            tail = b""
+        self._read_tail()
+        tail, self._tail = self._tail, b""
         if self._error is not None:
             return tail + self._dump({"error": self._error})
         if not self._finished:
@@ -480,8 +590,8 @@ def _token_logprob(entry: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _logprobs(value: Any) -> list[dict[str, Any]]:
-    """llama-server's (OpenAI's) ``logprobs.content`` -> Ollama's ``logprobs`` list."""
+def _logprobs(value: Any, top_n: int = MAX_TOP_LOGPROBS) -> list[dict[str, Any]]:
+    """llama-server's (OpenAI's) ``logprobs.content`` -> Ollama's ``logprobs`` list (``top_n`` alternatives at most)."""
     entries = value.get("content") if isinstance(value, dict) else None
     if not isinstance(entries, list):
         return []
@@ -491,8 +601,8 @@ def _logprobs(value: Any) -> list[dict[str, Any]]:
             continue
         item = _token_logprob(entry)
         top = entry.get("top_logprobs")
-        if isinstance(top, list) and top:
-            item["top_logprobs"] = [_token_logprob(t) for t in top if isinstance(t, dict)]
+        if isinstance(top, list) and top[:top_n]:
+            item["top_logprobs"] = [_token_logprob(t) for t in top[:top_n] if isinstance(t, dict)]
         out.append(item)
     return out
 

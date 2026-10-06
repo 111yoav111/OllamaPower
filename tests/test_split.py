@@ -288,6 +288,32 @@ def test_a_prompt_longer_than_the_context_drops_the_oldest_messages(cluster, cli
     )  # even the last is too long
 
 
+def test_generate_context_goes_out_and_comes_back(cluster, client):
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    r = client.post(c.url + "/api/generate", json={"model": "tiny", "prompt": "hi", "stream": False})
+    first = r.json()
+    prompt = "<user>hi\n<assistant>"  # the fake's chat template; one token per character
+    assert first["response"] == "Hello from split"
+    assert first["context"] == [ord(ch) for ch in prompt + "Hello from split"]
+    assert json.loads((c.hub_bin / "calls.json").read_text()) == ["/apply-template", "/tokenize"]
+
+    r = client.post(
+        c.url + "/api/generate", json={"model": "tiny", "prompt": "more", "context": first["context"], "stream": True}
+    )
+    lines = [json.loads(x) for x in r.text.splitlines()]
+    assert "".join(x["response"] for x in lines) == "Hello from split"
+    sent = json.loads((c.hub_bin / "last_request.json").read_text())
+    assert sent["path"] == "/v1/completions" and "messages" not in sent["body"]
+    second = "<user>more\n<assistant>"
+    assert sent["body"]["prompt"] == prompt + "Hello from split" + second
+    assert lines[-1]["done"] is True
+    assert lines[-1]["context"] == [ord(ch) for ch in prompt + "Hello from split" + second + "Hello from split"]
+
+    r = client.post(c.url + "/api/generate", json={"model": "tiny", "prompt": "x", "context": ["a"]})
+    assert r.status_code == 400 and "context must be a list of token ids" in r.json()["error"]
+
+
 def test_openai_requests_pass_through_to_llama_server(cluster, client):
     c = cluster
     c.admin("models.plan", model="tiny", ctx=512)

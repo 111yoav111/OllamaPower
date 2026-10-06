@@ -39,7 +39,7 @@ while True:
 """
 
 SERVER = r"""
-import json, os, socket, sys, time
+import json, os, socket, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 args = sys.argv[1:]
@@ -63,6 +63,7 @@ if (HERE / "fail_start").exists():
     print("error: failed to load model", flush=True); sys.exit(3)
 port = int(args[args.index("--port") + 1])
 CTX = int(args[args.index("-c") + 1])
+CALLS_LOCK = threading.Lock()
 
 def render(messages):  # the fake chat template
     return "".join(f"<{m.get('role')}>{m.get('content') or ''}\n" for m in messages) + "<assistant>"
@@ -77,8 +78,9 @@ class H(BaseHTTPRequestHandler):
             self.send_response(401); self.end_headers(); return
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         if self.path in ("/apply-template", "/tokenize", "/detokenize"):
-            calls = HERE / "calls.json"
-            calls.write_text(json.dumps([*(json.loads(calls.read_text()) if calls.exists() else []), self.path]))
+            with CALLS_LOCK:  # requests are served in parallel threads
+                calls = HERE / "calls.json"
+                calls.write_text(json.dumps([*(json.loads(calls.read_text()) if calls.exists() else []), self.path]))
             if self.path == "/apply-template":
                 reply = {"prompt": render(body["messages"])}
             elif self.path == "/tokenize":  # one token per character
@@ -88,7 +90,7 @@ class H(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("content-type", "application/json"); self.end_headers()
             self.wfile.write(json.dumps(reply).encode()); return
         (HERE / "last_request.json").write_text(json.dumps({"path": self.path, "body": body}))
-        n_prompt = len(render(body["messages"])) if body.get("messages") else 0
+        n_prompt = len(render(body["messages"])) if body.get("messages") else len(str(body.get("prompt", "")))
         if n_prompt >= CTX:
             self.send_response(400); self.send_header("content-type", "application/json"); self.end_headers()
             message = f"request ({n_prompt} tokens) exceeds the available context size ({CTX} tokens)"
@@ -104,6 +106,8 @@ class H(BaseHTTPRequestHandler):
         def ev(obj): self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n"); self.wfile.flush()
         for word in ["Hello", " from", " split"]:
             choice = {"index": 0, "delta": {"content": word}, "finish_reason": None}
+            if self.path == "/v1/completions":
+                choice = {"index": 0, "text": word, "finish_reason": None}
             if body.get("logprobs"):
                 top = [{"id": 1, "token": "x", "bytes": [120], "logprob": -2.0}] * body.get("top_logprobs", 0)
                 entry = {"id": 0, "token": word, "bytes": list(word.encode()), "logprob": -0.5, "top_logprobs": top}
