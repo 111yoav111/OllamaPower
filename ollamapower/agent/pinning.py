@@ -26,8 +26,14 @@ def format_fingerprint(fp_hex: str) -> str:
     return ":".join(fp_hex[i : i + 2] for i in range(0, len(fp_hex), 2)).upper()
 
 
-def short_fingerprint(fp_hex: str) -> str:
-    return format_fingerprint(fp_hex[:16])
+def fingerprint_lines(fp_hex: str) -> list[str]:
+    """The whole fingerprint in two halves of 16 pairs, for narrow views (a TUI row).
+
+    Never shorten a fingerprint the owner compares: a prefix is easy to forge.
+    """
+    pairs = [p for p in format_fingerprint(fp_hex).split(":") if p]
+    half = (len(pairs) + 1) // 2
+    return [":".join(part) for part in (pairs[:half], pairs[half:]) if part]
 
 
 class KnownHubs:

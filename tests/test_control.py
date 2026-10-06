@@ -15,6 +15,7 @@ import pytest
 from ollamapower.agent import client as agent_client
 from ollamapower.agent.client import AgentClient, AgentStopped
 from ollamapower.agent.config import AgentConfig
+from ollamapower.agent.pinning import fingerprint_lines, format_fingerprint
 from ollamapower.config import Config
 from ollamapower.core import protocol
 from ollamapower.core.auth import new_token
@@ -167,11 +168,22 @@ async def test_key_is_pinned_on_first_use(setup):
 async def test_changed_hub_key_is_refused_without_sending_the_token(setup):
     agent = setup.agent()
     agent.known.pin(agent.hub_key, "ab" * 32)
-    with pytest.raises(AgentStopped, match="KEY CHANGED"):
+    with pytest.raises(AgentStopped, match="KEY CHANGED") as stopped:
         await asyncio.wait_for(agent.run(), 5)
+    # Both keys in full, so the owner can compare them with what the hub prints.
+    assert format_fingerprint("ab" * 32) in str(stopped.value)
+    assert format_fingerprint(public_key_fingerprint(setup.key.public_key())) in str(stopped.value)
     await asyncio.sleep(0.1)
     assert setup.node() is None
     assert not any(e["kind"] == "auth_failed" for e in setup.hub.recent_events)  # the hub never saw a token
+
+
+def test_fingerprint_lines_keep_every_pair():
+    fp = "0123456789abcdef" * 4
+    lines = fingerprint_lines(fp)
+    assert len(lines) == 2 and all(len(line) == 47 for line in lines)
+    assert ":".join(lines) == format_fingerprint(fp)
+    assert fingerprint_lines("ab") == ["AB"] and fingerprint_lines("") == []
 
 
 async def test_unconfirmed_or_mismatched_key_stops(setup):

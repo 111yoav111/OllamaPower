@@ -28,6 +28,13 @@ def t(value: Any, style: str = "") -> Text:
     return Text("-" if value is None or value == "" else safe(value), style=style)
 
 
+def fingerprint_text(fp_hex: str | None) -> Text:
+    """A key fingerprint in full, on two lines: the owner compares it, so it is never shortened."""
+    from ..agent.pinning import fingerprint_lines
+
+    return Text("\n".join(safe(line) for line in fingerprint_lines(fp_hex)) if fp_hex else "-")
+
+
 def ago(value: float | None, now: float | None = None) -> str:
     if value is None:
         return "never"

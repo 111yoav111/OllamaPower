@@ -24,10 +24,20 @@ from textual.widgets import DataTable, Footer, Header, Input, Sparkline, Static,
 
 from ...admin.ipc import AdminError
 from ...admin.service import Admin
-from ...agent.pinning import format_fingerprint
 from ...cli_common import tunnel_test_lines
 from ...textsafe import safe
-from ...tui.widgets import STATUS_DOT, ConfirmScreen, ago, bar, duration, gib, human_bytes, t, ts
+from ...tui.widgets import (
+    STATUS_DOT,
+    ConfirmScreen,
+    ago,
+    bar,
+    duration,
+    fingerprint_text,
+    gib,
+    human_bytes,
+    t,
+    ts,
+)
 
 log = logging.getLogger("ollamapower.tui")
 
@@ -257,7 +267,7 @@ class HubTUI(App[None]):
         grid.add_column(style="bold")
         grid.add_column()
         waiting = ", ".join(f"{n} {p}" for p, n in q["waiting_by_priority"].items() if n) or "none"
-        rows = [
+        rows: list[tuple[str, Any]] = [
             ("Front door", s["frontdoor"]["url"]),
             ("Ollama", f"{o['version']} at {o['url']}" if o["reachable"] else f"UNREACHABLE at {o['url']}"),
             ("Uptime", duration(s["uptime_s"])),
@@ -268,11 +278,10 @@ class HubTUI(App[None]):
                 f"{len(lending)} lending · {sum(1 for n in nodes if n['connected'])} connected · {len(nodes)} known · "
                 f"{gib(sum(n['vram_lendable'] for n in lending))} GB VRAM lendable",
             ),
-            (
-                "Control plane",
-                f"port {c['port']}  ·  key {format_fingerprint(c['fingerprint'])[:47]}…" if c["enabled"] else "off",
-            ),
+            ("Control plane", f"port {c['port']}" if c["enabled"] else "off"),
         ]
+        if c["enabled"] and c["fingerprint"]:
+            rows.append(("Hub key", fingerprint_text(c["fingerprint"])))
         session = (s.get("split") or {}).get("session")
         if session:
             plan = session.get("plan") or {}
@@ -283,7 +292,10 @@ class HubTUI(App[None]):
         if c.get("bans"):
             rows.append(("Banned IPs", ", ".join(f"{ip} ({left}s)" for ip, left in c["bans"].items())))
         for label, value in rows:
-            grid.add_row(label, t(value, "bold red" if str(value).startswith("UNREACHABLE") else ""))
+            if isinstance(value, Text):
+                grid.add_row(label, value)
+            else:
+                grid.add_row(label, t(value, "bold red" if str(value).startswith("UNREACHABLE") else ""))
         self.query_one("#status", Static).update(grid)
 
         hw = s.get("hub_hardware") or {}

@@ -22,7 +22,7 @@ from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, Stat
 
 from ...admin.ipc import AdminError
 from ...textsafe import safe
-from ...tui.widgets import ConfirmScreen, ago, bar, gib, t, ts
+from ...tui.widgets import ConfirmScreen, ago, bar, fingerprint_text, gib, t, ts
 from ..client import AgentClient, AgentStopped
 from ..pinning import format_fingerprint
 from ..service import AgentAdmin, agent_snapshot
@@ -211,7 +211,7 @@ class AgentTUI(App[None]):
                     CONNECTION_STYLE.get(state, ""),
                 ),
             ),
-            ("Hub key", t(format_fingerprint(s["fingerprint"])[:47] + "…" if s["fingerprint"] else "-")),
+            ("Hub key", fingerprint_text(s["fingerprint"])),
             ("Key pinned", t("yes (known_hub)" if s["pinned"] else "no")),
             ("This helper", t(f"{s['name']} · {s['node_id']}")),
             ("Connected", t(ago(s["connected_since"]) if s["connected_since"] else "-")),

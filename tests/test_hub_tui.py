@@ -9,6 +9,8 @@ from rich.console import Console
 from textual.widgets import DataTable, TabbedContent
 
 from ollamapower.admin.service import Admin
+from ollamapower.agent.pinning import format_fingerprint
+from ollamapower.core.encrypt_layer import public_key_fingerprint
 from ollamapower.hub.tui.app import HubTUI
 from ollamapower.tui.widgets import ConfirmScreen
 
@@ -49,6 +51,8 @@ async def test_overview_nodes_detail_log(tmp_path, hub_key):  # noqa: F811
         async with app.run_test(size=(180, 50)) as pilot:
             await pilot.pause()
             assert "Control plane" in plain(app, "#status") and "1 lending" in plain(app, "#status")
+            fp = format_fingerprint(public_key_fingerprint(hub_key.public_key()))  # whole, to compare
+            assert fp[:47] in plain(app, "#status") and fp[48:] in plain(app, "#status")
             await shot(app, "overview")
 
             await pilot.press("2")

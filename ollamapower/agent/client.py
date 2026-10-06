@@ -245,8 +245,8 @@ class AgentClient:
         if pinned is not None:
             if pinned != fingerprint:
                 raise AgentStopped(
-                    f"THE HUB'S KEY CHANGED (was {format_fingerprint(pinned)[:23]}…, now "
-                    f"{format_fingerprint(fingerprint)[:23]}…). Someone may be impersonating it. If you replaced "
+                    f"THE HUB'S KEY CHANGED. Pinned: {format_fingerprint(pinned)}; the hub now presents: "
+                    f"{format_fingerprint(fingerprint)}. Someone may be impersonating it. If you replaced "
                     "the hub's key yourself, run `ollamapower agent forget-hub` and connect again."
                 )
             self.state.pinned = True
@@ -255,7 +255,8 @@ class AgentClient:
         if expected:
             if expected != fingerprint:
                 raise AgentStopped(
-                    f"the hub's key {format_fingerprint(fingerprint)} doesn't match the configured fingerprint"
+                    f"the hub's key {format_fingerprint(fingerprint)} doesn't match the configured fingerprint "
+                    f"{format_fingerprint(expected)}"
                 )
             self._pin(fingerprint)
             return True

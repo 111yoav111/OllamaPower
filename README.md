@@ -156,7 +156,8 @@ OllamaPower there too, then:
 
    On first contact the agent shows the hub's **key fingerprint**; compare it
    with the one the hub prints (`ollamapower init`, `ollamapower status` or the
-   Overview tab) and confirm. Headless helpers pass it up front:
+   Overview tab, where it is shown whole on two lines) and confirm; compare
+   every pair, not just the first few. Headless helpers pass it up front:
    `--hub-fingerprint AB:CD:...`. The key is then pinned in `known_hub`; if
    the hub's key ever changes, the agent refuses to connect and says so.
 
