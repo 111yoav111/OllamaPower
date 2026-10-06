@@ -95,7 +95,7 @@ class RpcSession:
             "cap_mib": self.cap_mib,
             "model": self.model,
             "since": self.started,
-            "connections": len(self.relay.connections) if self.relay else 0,
+            "connections": self.relay.active if self.relay else 0,
             "tunnel": self.relay.mode if self.relay else "",
         }
 

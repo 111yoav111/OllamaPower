@@ -91,7 +91,10 @@ class HubRelay:
         self.client = client
         self.server: asyncio.Server | None = None
         self.port = 0
-        self.connections: set[asyncio.StreamWriter] = set()
+        self.connections: set[asyncio.StreamWriter] = set()  # both ends of each relayed connection
+        self.active = 0  # local connections being relayed (what MAX_LOCAL_CONNECTIONS limits)
+        self.closed = False
+        self._handlers: set[asyncio.Task[Any]] = set()
         self.failures = 0
         self.refused = 0
         self.bytes_out = 0  # hub -> helper: mostly model weights while loading
@@ -103,13 +106,23 @@ class HubRelay:
         return self.port
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self.closed or self.active >= MAX_LOCAL_CONNECTIONS:
+            self.refused += 1
+            log.warning("tunnel: refused a local connection (%d already open)", self.active)
+            writer.close()
+            return
         # Only llama-server, i.e. our own user, may use the tunnel: another local user
         # would otherwise reach the helper's unauthenticated rpc-server through it.
-        if len(self.connections) >= MAX_LOCAL_CONNECTIONS or not same_user_on_loopback(writer):
+        if not same_user_on_loopback(writer):
             self.refused += 1
             log.warning("tunnel: refused a local connection that isn't from llama-server's user")
             writer.close()
             return
+        # Counted from here (no await before it) until the finally below, on every path.
+        self.active += 1
+        task = asyncio.current_task()
+        if task is not None:
+            self._handlers.add(task)
         self.connections.add(writer)
         remote: asyncio.StreamWriter | None = None
         try:
@@ -121,6 +134,9 @@ class HubRelay:
             self.last_error = type(exc).__name__
             log.warning("tunnel to %s failed: %s", self.client.host, type(exc).__name__)
         finally:
+            self.active -= 1
+            if task is not None:
+                self._handlers.discard(task)
             for w in (writer, remote):
                 if w is not None:
                     self.connections.discard(w)
@@ -130,10 +146,13 @@ class HubRelay:
         self.bytes_out += n
 
     def close(self) -> None:
+        self.closed = True
         if self.server is not None:
             self.server.close()
         for w in list(self.connections):
             w.close()
+        for task in list(self._handlers):
+            task.cancel()  # e.g. still opening its TLS connection to the helper
 
 
 async def measure(client: TunnelClient, bulk_bytes: int = BULK_BYTES) -> dict[str, Any]:

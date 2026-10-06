@@ -9,7 +9,9 @@ the hub connects from and forwards to it, for one session only:
 2. **Secure mode:** TLS 1.3 with the session's pinned certificates
    (``core/tunnel.py``); the peer must present exactly the hub's certificate
    for this session. **Direct mode** (both owners opted in): plain TCP.
-3. At most ``MAX_CONNECTIONS`` at once; all are cut when the session ends.
+3. At most ``MAX_CONNECTIONS`` hub connections at once, counted from the
+   moment they are accepted (TLS handshakes in progress included) until they
+   are fully closed; all are cut when the session ends.
 
 ``EchoTarget`` stands in for ``rpc-server`` during a tunnel test: it sends back
 what it receives, so the hub can time the real path (network, relay, TLS)
@@ -59,7 +61,8 @@ class HelperRelay:
         self.hub_fingerprint = hub_fingerprint
         self.listener: socket.socket | None = None
         self.port = 0
-        self.connections: set[asyncio.StreamWriter] = set()
+        self.connections: set[asyncio.StreamWriter] = set()  # both ends of each relayed connection
+        self.active = 0  # hub connections accepted and not finished yet (what MAX_CONNECTIONS limits)
         self.closed = False
         self.refused = 0
         self.last_active = 0.0  # monotonic time of the last byte from the hub (auto-yield needs it)
@@ -95,14 +98,22 @@ class HelperRelay:
                     return
                 await asyncio.sleep(0.05)
                 continue
-            if not same_ip(peer[0], self.hub_ip) or self.closed or len(self.connections) >= MAX_CONNECTIONS:
+            if not same_ip(peer[0], self.hub_ip) or self.closed or self.active >= MAX_CONNECTIONS:
                 self.refused += 1
                 log.warning("relay: refused a connection from %s", peer[0])
                 conn.close()
                 continue
+            self.active += 1
             task = asyncio.ensure_future(self._serve(conn))
             self._handlers.add(task)
-            task.add_done_callback(self._handlers.discard)
+            task.add_done_callback(lambda t, conn=conn: self._finished(t, conn))
+
+    def _finished(self, task: asyncio.Task[None], conn: socket.socket) -> None:
+        """Runs however ``_serve`` ended, even if it was cancelled before it started."""
+        self._handlers.discard(task)
+        self.active -= 1
+        if task.cancelled():
+            conn.close()  # idempotent; covers a task cancelled before it ever ran
 
     async def _serve(self, conn: socket.socket) -> None:
         loop = asyncio.get_running_loop()

@@ -31,6 +31,16 @@ def secure_relay(ids, hub_ip: str = "127.0.0.1") -> HelperRelay:
     return HelperRelay(0, hub_ip, tls, ids["hub"].fingerprint)
 
 
+async def until(predicate, timeout: float = 5.0) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.02)
+    return predicate()
+
+
 async def roundtrip(client: TunnelClient, data: bytes = b"ping") -> bytes:
     reader, writer = await client.open()
     try:
@@ -140,6 +150,107 @@ async def test_hub_relay_gives_llama_server_a_plain_local_port(ids):
     finally:
         hub.close()
         target.close()
+
+
+async def _refused(reader: asyncio.StreamReader) -> bool:
+    try:
+        return await asyncio.wait_for(reader.read(10), 3) == b""
+    except (ConnectionResetError, ssl.SSLError):
+        return True
+
+
+async def test_helper_relay_counts_each_hub_connection_once(ids, monkeypatch):
+    from ollamapower.agent import tunnel as agent_tunnel
+
+    monkeypatch.setattr(agent_tunnel, "MAX_CONNECTIONS", 3)
+    relay = secure_relay(ids)
+    target = await echo_through(relay)
+    client = TunnelClient("127.0.0.1", relay.port, ids["hub"], ids["helper"].cert_pem)
+    try:
+        # As many live relayed connections as the limit says (each is two writers inside).
+        opened = []
+        for i in range(3):
+            r, w = await client.open()
+            w.write(b"%d" % i)
+            assert await asyncio.wait_for(r.readexactly(1), 3) == b"%d" % i
+            opened.append(w)
+        assert relay.active == 3
+        reader, writer = await asyncio.open_connection("127.0.0.1", relay.port)
+        assert await _refused(reader)
+        writer.close()
+        assert relay.refused == 1
+        for w in opened:
+            w.close()
+        assert await until(lambda: relay.active == 0)
+        # Unfinished TLS handshakes hold slots too, and give them back when they fail.
+        stalled = [await asyncio.open_connection("127.0.0.1", relay.port) for _ in range(3)]
+        await until(lambda: relay.active == 3)
+        reader, writer = await asyncio.open_connection("127.0.0.1", relay.port)
+        assert await _refused(reader)
+        writer.close()
+        for _, w in stalled:
+            w.close()
+        assert await until(lambda: relay.active == 0)
+        assert await roundtrip(client) == b"ping"
+        # Closing the relay mid-handshake releases everything too.
+        stalled = [await asyncio.open_connection("127.0.0.1", relay.port) for _ in range(2)]
+        await until(lambda: relay.active == 2)
+        relay.close()
+        assert await until(lambda: relay.active == 0 and not relay.connections)
+        for _, w in stalled:
+            w.close()
+    finally:
+        relay.close()
+        target.close()
+
+
+async def test_hub_relay_counts_each_local_connection_once(ids, monkeypatch):
+    from ollamapower.hub import tunnel as hub_tunnel
+
+    monkeypatch.setattr(hub_tunnel, "MAX_LOCAL_CONNECTIONS", 3)
+    relay = secure_relay(ids)
+    target = await echo_through(relay)
+    hub = HubRelay(TunnelClient("127.0.0.1", relay.port, ids["hub"], ids["helper"].cert_pem))
+    await hub.start()
+    try:
+        opened = []
+        for i in range(3):  # used to stop at 2: each one put two writers in the count
+            r, w = await asyncio.open_connection("127.0.0.1", hub.port)
+            w.write(b"%d" % i)
+            assert await asyncio.wait_for(r.readexactly(1), 3) == b"%d" % i
+            opened.append(w)
+        assert hub.active == 3
+        r, w = await asyncio.open_connection("127.0.0.1", hub.port)
+        assert await _refused(r)
+        w.close()
+        assert hub.refused == 1
+        for w in opened:
+            w.close()
+        assert await until(lambda: hub.active == 0 and not hub.connections)
+    finally:
+        hub.close()
+        relay.close()
+        target.close()
+
+
+async def test_closing_the_hub_relay_releases_connections_still_opening(ids):
+    async def never_answer(reader, writer):  # a "helper" that accepts and never does TLS
+        await reader.read()
+
+    silent = await asyncio.start_server(never_answer, "127.0.0.1", 0)
+    port = silent.sockets[0].getsockname()[1]
+    hub = HubRelay(TunnelClient("127.0.0.1", port, ids["hub"], ids["helper"].cert_pem))
+    await hub.start()
+    try:
+        r, w = await asyncio.open_connection("127.0.0.1", hub.port)
+        assert await until(lambda: hub.active == 1)
+        hub.close()
+        assert await until(lambda: hub.active == 0 and not hub.connections)
+        assert await _refused(r)
+        w.close()
+    finally:
+        hub.close()
+        silent.close()
 
 
 async def test_plain_splice_passes_half_close():
