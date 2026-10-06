@@ -5,6 +5,24 @@ owner's own machines are added as they come in (Phase 7). Measure your setup
 with `ollamapower nodes tunnel-test <helper>` and `ollamapower status`
 (tokens/s per model).
 
+## Front-door overhead (requests Ollama serves)
+
+What the front door adds to a request it passes to Ollama
+(`scripts/bench_frontdoor.py`: a fake Ollama and the front door in separate
+processes, small non-streaming `/api/chat` requests, then 200-chunk streams).
+
+**Loopback, development container (4 vCPUs, Python 3.11, uvicorn with h11).**
+
+| Path | Latency (median) | Latency (p95) | Stream chunks/s |
+|---|---|---|---|
+| straight to Ollama | 1.0 ms | 1.3 ms | ~40 000 |
+| through the front door | 2.7 ms | 3.3 ms | ~15 000 |
+
+About 1.7 ms per request, against a model that takes tens of milliseconds
+or more per token; the stream ceiling is ~100x what Ollama generates. Without
+`sniffio` installed, httpcore repeats a failed import on every request, which
+cost another 0.35 ms (it is now a dependency).
+
 ## Split-mode tunnel overhead
 
 What encryption costs on the split-mode path (`nodes tunnel-test`: round

@@ -18,6 +18,8 @@ dependencies = [
     "starlette>=0.40,<2",
     "uvicorn>=0.30,<1",
     "httpx>=0.27,<0.29",
+    # httpcore looks for sniffio on every request; without it each lookup is a failed import (~0.35 ms).
+    "sniffio>=1.3,<2",
     "psutil>=5.9,<8",
     "nvidia-ml-py>=12,<14",
     "textual>=0.80,<9",
