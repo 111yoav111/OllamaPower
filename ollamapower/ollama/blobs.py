@@ -8,8 +8,10 @@ service with its own ``OLLAMA_MODELS``. The manifest next to the blobs is read
 too when possible, to catch what the Modelfile doesn't show (sharded weights).
 
 Split mode can't use a model whose weights aren't one GGUF file (sharded
-models, safetensors imports), has adapters, or isn't a text model; ``resolve``
-says so in owner-readable words.
+models, safetensors imports), has adapters, isn't a text model, has an
+architecture the pinned llama.cpp doesn't know, or keeps vision/audio/MTP
+tensors in Ollama's own layout inside the GGUF; ``resolve`` says so in
+owner-readable words, before anything is started.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from typing import Any
 
 import httpx
 
+from ..llamacpp.archs import architecture_problem
+from ..textsafe import safe_text
 from .client import PROBE_HEADERS
 from .gguf import GGUFError, GGUFInfo, read_gguf
 
@@ -184,7 +188,8 @@ def locate(data: dict[str, Any], name: str, models_dirs: list[Path] | None = Non
     if info.split_count > 1:
         raise ModelUnavailable(f"{name} is stored in several files (sharded); split mode needs a single GGUF")
     if info.block_count <= 0:
-        raise ModelUnavailable(f"{name} has no layers split mode can place ({info.architecture})")
+        raise ModelUnavailable(f"{name} has no layers split mode can place ({safe_text(info.architecture, 60)})")
+    check_llamacpp_can_load(info, name)
     return ModelFiles(
         name=name,
         path=model_path,
@@ -193,6 +198,23 @@ def locate(data: dict[str, Any], name: str, models_dirs: list[Path] | None = Non
         capabilities=capabilities,
         gguf=info,
     )
+
+
+def check_llamacpp_can_load(info: GGUFInfo, name: str) -> None:
+    """Refuse, before anything starts, a GGUF the pinned llama.cpp can't serve as a text model.
+
+    Without this the failure comes from llama-server itself, after Ollama has
+    unloaded its models and the helpers have started rpc-server.
+    """
+    problem = architecture_problem(info.architecture)
+    if problem:
+        raise ModelUnavailable(f"{name} can't run in split mode: {problem}; Ollama serves it")
+    if info.foreign:
+        parts = " and ".join(sorted(info.foreign))
+        raise ModelUnavailable(
+            f"{name} can't run in split mode: its GGUF holds {parts} tensors in Ollama's own layout, "
+            "which llama.cpp doesn't load; Ollama serves it"
+        )
 
 
 async def resolve(client: httpx.AsyncClient, name: str, models_dirs: list[Path] | None = None) -> ModelFiles:

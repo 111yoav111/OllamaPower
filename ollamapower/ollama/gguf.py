@@ -48,6 +48,11 @@ _SCALARS = {
     F64: "<d",
 }
 _BLOCK = re.compile(r"^blk\.(\d+)\.")
+_NEXTN = re.compile(r"^blk\.(\d+)\.nextn\.")
+# Tensors of parts llama.cpp's text model doesn't load from the main GGUF. Ollama's own engine
+# keeps a vision/audio encoder or a multi-token-prediction head there; llama.cpp wants the
+# encoders in a separate projector file and its MTP layers as declared ``blk.N.nextn.*``.
+FOREIGN_PREFIXES = {"v.": "vision", "mm.": "vision", "a.": "audio", "mtp.": "MTP", "mtp_": "MTP"}
 
 
 class GGUFError(ValueError):
@@ -68,6 +73,8 @@ class GGUFInfo:
     key_length: int = 0
     value_length: int = 0
     split_count: int = 1  # >1: the model is sharded over several files
+    nextn_layers: int = 0  # trailing blocks that are llama.cpp MTP ("NextN") layers
+    foreign: dict[str, int] = field(default_factory=dict)  # part ("vision", "audio", "MTP") -> tensor count
     layer_bytes: list[int] = field(default_factory=list)  # weights of blk.0 .. blk.N-1
     output_bytes: int = 0  # the output layer (llama.cpp's "layer N")
     input_bytes: int = 0  # token embeddings: always kept on the hub's CPU
@@ -203,6 +210,7 @@ def read_gguf(path: Path) -> GGUFInfo:
         key_length=arch_key("attention.key_length"),
         value_length=arch_key("attention.value_length"),
         split_count=max(1, _int(meta.get("split.count"))),
+        nextn_layers=arch_key("nextn_predict_layers"),
         metadata={k: v for k, v in meta.items() if not isinstance(v, list) and not k.startswith("tokenizer.")},
     )
 
@@ -219,6 +227,9 @@ def read_gguf(path: Path) -> GGUFInfo:
     ):
         if getattr(info, field_name) > MAX_DIMENSION:
             raise GGUFError(f"implausible {field_name} {getattr(info, field_name)}")
+    if info.nextn_layers > info.block_count:
+        raise GGUFError(f"implausible nextn_predict_layers {info.nextn_layers}")
+    first_nextn = info.block_count - info.nextn_layers
 
     ordered = sorted(tensors, key=lambda t: t[1])
     layers = [0] * info.block_count
@@ -228,6 +239,12 @@ def read_gguf(path: Path) -> GGUFInfo:
         nbytes = end - offset
         if offset > data_size or nbytes < 0:
             raise GGUFError("GGUF tensor offsets are out of range")
+        part = next((p for prefix, p in FOREIGN_PREFIXES.items() if name.startswith(prefix)), None)
+        nextn = _NEXTN.match(name)
+        if nextn and not first_nextn <= int(nextn.group(1)) < info.block_count:
+            part = "MTP"  # NextN tensors in a block the header doesn't declare as a NextN layer
+        if part is not None:
+            info.foreign[part] = info.foreign.get(part, 0) + 1
         block = _BLOCK.match(name)
         if block and int(block.group(1)) < info.block_count:
             layers[int(block.group(1))] += nbytes

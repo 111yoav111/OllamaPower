@@ -180,3 +180,62 @@ def test_hostile_context_length_is_refused(tmp_path):
     path = write_tiny_llama(tmp_path / "m.gguf", ctx=1 << 30)
     with pytest.raises(GGUFError, match="implausible context_length"):
         read_gguf(path)
+
+
+# ----- what the pinned llama.cpp can load -----------------------------------------------
+
+
+def test_architecture_list_follows_the_pin():
+    from ollamapower.llamacpp.archs import BUILD
+    from ollamapower.llamacpp.install import Pins
+
+    assert BUILD == Pins.load().build, "llama.cpp pin moved: re-check llamacpp/archs.py against llama-arch.cpp"
+
+
+@pytest.mark.parametrize(
+    "arch,message",
+    [
+        ("gptoss", "doesn't know its architecture 'gptoss'"),  # Ollama's name; llama.cpp says gpt-oss
+        ("mllama", "doesn't know its architecture 'mllama'"),
+        ("nomic-bert", "embedding model"),
+        ("llada", "diffusion model"),
+        ("evil\x1b[2J", r"'evil\\x1b\[2J'"),
+    ],
+)
+def test_architectures_llama_cpp_cannot_serve_are_refused_up_front(tmp_path, arch, message):
+    model = store(tmp_path, arch=arch)
+    with pytest.raises(ModelUnavailable, match=message) as exc:
+        locate(show(model), "tiny")
+    assert "Ollama serves it" in str(exc.value)
+
+
+@pytest.mark.parametrize("arch", ["gpt-oss", "gemma3", "deepseek2", "qwen3moe", "glm4moe"])
+def test_known_text_architectures_pass(tmp_path, arch):
+    assert locate(show(store(tmp_path, arch=arch)), "tiny").gguf.architecture == arch
+
+
+@pytest.mark.parametrize(
+    "tensor,part",
+    [
+        ("v.blk.0.attn_q.weight", "vision"),
+        ("mm.input_projection.weight", "vision"),
+        ("a.conv1d.0.weight", "audio"),
+        ("mtp.blk.0.attn_q.weight", "MTP"),
+        ("blk.3.nextn.eh_proj.weight", "MTP"),  # NextN tensors, but the header declares no NextN layer
+    ],
+)
+def test_multimodal_and_mtp_tensors_in_the_main_gguf_are_refused(tmp_path, tensor, part):
+    model = store(tmp_path, extra_tensors=[(tensor, [8])])
+    assert read_gguf(model).foreign == {part: 1}
+    with pytest.raises(ModelUnavailable, match=f"holds {part} tensors in Ollama's own layout"):
+        locate(show(model), "tiny")
+
+
+def test_declared_nextn_layers_are_llama_cpp_layout_and_allowed(tmp_path):
+    model = store(
+        tmp_path,
+        extra_kv={"llama.nextn_predict_layers": 1},
+        extra_tensors=[("blk.3.nextn.eh_proj.weight", [8]), ("blk.3.nextn.enorm.weight", [8])],
+    )
+    files = locate(show(model), "tiny")
+    assert files.gguf.nextn_layers == 1 and not files.gguf.foreign

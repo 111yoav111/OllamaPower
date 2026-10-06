@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any
 
 ALIGN = 32
-U32, I32, F32, STRING, ARRAY, U64 = 4, 5, 6, 8, 9, 10
+U32, I32, F32, BOOL, STRING, ARRAY, U64 = 4, 5, 6, 7, 8, 9, 10
+_ITEM = {F32: "<f", I32: "<i", U32: "<I", BOOL: "<?"}
 
 
 def _str(value: str) -> bytes:
@@ -23,6 +24,8 @@ def _str(value: str) -> bytes:
 
 def _kv(key: str, value: Any) -> bytes:
     out = _str(key)
+    if isinstance(value, bool):
+        return out + struct.pack("<I?", BOOL, value)
     if isinstance(value, str):
         return out + struct.pack("<I", STRING) + _str(value)
     if isinstance(value, float):
@@ -33,7 +36,7 @@ def _kv(key: str, value: Any) -> bytes:
         return out + struct.pack("<II", U32, value)
     if isinstance(value, tuple):  # (item type, items)
         kind, items = value
-        body = b"".join(_str(i) if kind == STRING else struct.pack({F32: "<f", I32: "<i"}[kind], i) for i in items)
+        body = b"".join(_str(i) if kind == STRING else struct.pack(_ITEM[kind], i) for i in items)
         return out + struct.pack("<IIQ", ARRAY, kind, len(items)) + body
     raise TypeError(type(value))
 
@@ -59,23 +62,26 @@ def write_tiny_llama(
     tied: bool = False,
     seed: int = 1,
     extra_kv: dict[str, Any] | None = None,
+    arch: str = "llama",
+    extra_tensors: list[tuple[str, list[int]]] | None = None,
 ) -> Path:
+    """A llama-shaped model; ``arch`` renames the architecture (and its keys), ``extra_tensors`` adds tensors."""
     tokens, scores, types = vocab()
     n_vocab = len(tokens)
     n_kv_embd = n_embd // n_head * n_head_kv
     kv = {
-        "general.architecture": "llama",
+        "general.architecture": arch,
         "general.name": "tiny",
         "general.alignment": ALIGN,
         "general.file_type": 0,
-        "llama.context_length": ctx,
-        "llama.embedding_length": n_embd,
-        "llama.block_count": n_layer,
-        "llama.feed_forward_length": n_ff,
-        "llama.attention.head_count": n_head,
-        "llama.attention.head_count_kv": n_head_kv,
-        "llama.attention.layer_norm_rms_epsilon": 1e-5,
-        "llama.rope.dimension_count": n_embd // n_head,
+        f"{arch}.context_length": ctx,
+        f"{arch}.embedding_length": n_embd,
+        f"{arch}.block_count": n_layer,
+        f"{arch}.feed_forward_length": n_ff,
+        f"{arch}.attention.head_count": n_head,
+        f"{arch}.attention.head_count_kv": n_head_kv,
+        f"{arch}.attention.layer_norm_rms_epsilon": 1e-5,
+        f"{arch}.rope.dimension_count": n_embd // n_head,
         "tokenizer.ggml.model": "llama",
         "tokenizer.ggml.tokens": (STRING, tokens),
         "tokenizer.ggml.scores": (F32, scores),
@@ -102,6 +108,7 @@ def write_tiny_llama(
     tensors.append(("output_norm.weight", [n_embd]))
     if not tied:
         tensors.append(("output.weight", [n_embd, n_vocab]))
+    tensors += extra_tensors or []
 
     header = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv))
     header += b"".join(_kv(k, v) for k, v in kv.items())
