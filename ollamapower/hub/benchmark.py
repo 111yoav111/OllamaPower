@@ -25,6 +25,7 @@ import httpx
 
 from ..aio import wait_for
 from ..textsafe import safe_text
+from .plans import KEY_VERSION
 
 if TYPE_CHECKING:
     from .runtime import Hub
@@ -177,16 +178,9 @@ async def benchmark_model(hub: Hub, model: str, ctx: int | None = None, automati
                 session = hub.split.session
                 key = None
                 if result["ok"] and session is not None:
-                    result["helpers"] = [
-                        {
-                            "id": x.node.node_id,
-                            "name": x.node.name,
-                            "tunnel": x.mode,
-                            "device": x.endpoint.get("device"),
-                        }
-                        for x in session.leases
-                    ]
-                    key = {"digest": digest, "ctx": ctx, "build": plans.pins.build, "helpers": result["helpers"]}
+                    layout = session.layout()
+                    result["helpers"] = layout["helpers"]
+                    key = {"v": KEY_VERSION, "digest": digest, "ctx": ctx, "build": plans.pins.build, **layout}
                     result["key"] = key
                     if session.plan is not None:
                         result["placement"] = session.plan.summary()

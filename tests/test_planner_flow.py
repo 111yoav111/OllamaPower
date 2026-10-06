@@ -50,12 +50,29 @@ def run(tps: float, ok: bool = True, helpers: list[StubNode] | None = None, ctx:
     r: dict[str, Any] = {"ok": ok, "gen_tps": tps, "error": "" if ok else "boom"}
     if helpers is not None:
         r["key"] = {
+            "v": plans_mod.KEY_VERSION,
             "digest": "d1",
             "ctx": ctx,
             "build": plans_mod.Pins.load().build,
-            "helpers": [{"id": n.node_id, "name": n.name, "tunnel": n.tunnel_effective} for n in helpers],
+            **layout(helpers),
         }
     return r
+
+
+def layout(helpers: list[StubNode], lent: int = 8, layers: tuple[int, ...] = ()) -> dict[str, Any]:
+    """A ``SplitSession.layout()``: each helper lends Vulkan0, the hub's CUDA0 holds the rest."""
+    counts = list(layers) or [10] * len(helpers) + [31]
+    return {
+        "helpers": [
+            {"id": n.node_id, "name": n.name, "tunnel": n.tunnel_effective, "device": "Vulkan0", "lent_gib": lent}
+            for n in helpers
+        ],
+        "placement": [
+            *({"node": n.node_id, "device": "Vulkan0", "layers": c} for n, c in zip(helpers, counts, strict=False)),
+            {"node": None, "device": "CUDA0", "layers": counts[-1]},
+        ],
+        "cpu_layers": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -103,6 +120,53 @@ def test_route_requires_the_benchmark_key_to_still_hold(book):
     assert plans.route("big:70b") is None  # another context size
     plans.pin("big:70b", None, ctx=4096)
     assert plans.route("big:70b") is not None
+
+
+def test_layout_must_match_the_benchmark_up_to_small_jitter(book):
+    _, _, helpers = book
+    key = run(20.0, helpers=helpers)["key"]
+    assert plans_mod.layout_problem(key, layout(helpers)) == ""
+    # Free memory moved a little: lent memory within 1 GiB, a layer more or less here and there.
+    assert plans_mod.layout_problem(key, layout(helpers, lent=9, layers=(11, 9, 31))) == ""
+    assert plans_mod.layout_problem(key, layout(helpers, lent=7, layers=(10, 10, 32))) == ""
+    assert "lends 5 GiB now, 8 GiB" in plans_mod.layout_problem(key, layout(helpers, lent=5))
+    assert "split differently" in plans_mod.layout_problem(key, layout(helpers, layers=(4, 10, 37)))
+    other = layout(helpers)
+    other["helpers"][0]["device"] = other["placement"][0]["device"] = "Vulkan1"
+    assert "desk lends Vulkan1 now, not Vulkan0" in plans_mod.layout_problem(key, other)
+    other = layout(helpers)
+    other["placement"][-1]["device"] = "CUDA1"
+    assert "other devices" in plans_mod.layout_problem(key, other)
+    assert "not part of the benchmark" in plans_mod.layout_problem(key, layout([*helpers, StubNode("node-c", "c")]))
+    spilled = layout(helpers)
+    spilled["cpu_layers"] = 5
+    assert "split differently" in plans_mod.layout_problem(key, spilled)
+
+
+def test_routed_spec_carries_the_key_and_a_stale_key_goes_back_to_ollama(book):
+    plans, hub, helpers = book
+    plans.decide("big:70b", run(10.0), [run(20.0, helpers=helpers)])
+    spec = plans.route("big:70b")
+    assert spec is not None and spec.layout == plans.record("big:70b")["key"]
+    plans.stale("big:70b", "helper desk lends 2 GiB now, 8 GiB at the benchmark")
+    assert plans.route("big:70b") is None
+    assert "lends 2 GiB now" in plans.describe("big:70b")["why"]
+    assert plans.record("big:70b")["degraded"] is None  # nothing failed
+    assert [e for e in hub.recent_events if e["kind"] == "plan_stale"]
+
+
+def test_old_benchmark_keys_stay_readable_but_never_match(book):
+    plans, hub, helpers = book
+    old_key = {
+        "digest": "d1",
+        "ctx": 4096,
+        "build": plans_mod.Pins.load().build,
+        "helpers": [{"id": n.node_id, "name": n.name, "tunnel": n.tunnel_effective} for n in helpers],
+    }
+    hub.state.data["plans"]["big:70b"] = {"choice": "split", "reason": "old", "key": old_key}
+    assert plans.record("big:70b")["key"] == old_key
+    assert plans.route("big:70b") is None
+    assert "predates device and placement tracking" in plans.describe("big:70b")["why"]
 
 
 def test_pins_and_exclusions(book):
@@ -315,6 +379,29 @@ def test_benchmark_picks_split_when_it_is_faster_and_routes_to_it(cluster, clien
     # The helper leaves: the benchmark no longer applies, Ollama serves.
     c.run(c.hub.control.kick(c.node))
     assert wait_for(lambda: c.call(lambda: c.hub.plans.route("tiny")) is None, 10)
+
+
+@pytestmark_e2e
+def test_a_setup_that_changed_since_the_benchmark_is_not_reused(cluster, client):
+    c = cluster
+    split_speed(c, 30.0)
+    assert c.admin("models.benchmark", model="tiny")["choice"] == "split"
+    key = c.call(lambda: c.hub.plans.record("tiny")["key"])
+    assert key["v"] == plans_mod.KEY_VERSION
+    assert key["helpers"][0]["device"] == "FakeGPU0" and key["helpers"][0]["lent_gib"] == 8  # 8000 MiB lent
+    assert key["placement"][0]["node"] == c.node.node_id and key["placement"][0]["layers"] > 0
+    assert chat(client, c).status_code == 200 and c.call(lambda: c.hub.split.is_running("tiny"))
+    c.run(c.hub.split.stop())
+
+    # The helper's owner lends much less memory now than when the benchmark ran.
+    c.call(lambda: c.hub.plans._update("tiny", key={**key, "helpers": [{**key["helpers"][0], "lent_gib": 20}]}))
+    r = chat(client, c)
+    assert r.status_code == 200 and c.rec.last["path"] == "/api/chat"  # Ollama served, transparently
+    rec = c.call(lambda: c.hub.plans.record("tiny"))
+    assert "lends 8 GiB now, 20 GiB at the benchmark" in rec["key"]["stale"] and rec["degraded"] is None
+    assert c.call(lambda: c.hub.plans.route("tiny")) is None  # until it is benchmarked again
+    assert c.admin("models.benchmark", model="tiny")["choice"] == "split"
+    assert c.call(lambda: c.hub.plans.route("tiny")) is not None
 
 
 @pytestmark_e2e

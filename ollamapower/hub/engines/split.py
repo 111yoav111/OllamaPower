@@ -55,7 +55,7 @@ from ...ollama.blobs import ModelFiles, ModelUnavailable, resolve
 from ...ollama.client import PROBE_HEADERS, human_bytes, parse_ps
 from ...textsafe import safe_text
 from ..planner import MIB, Device, PlanError, SplitPlan, fits_on_hub, plan_split
-from ..plans import SplitSpec
+from ..plans import SplitSpec, layout_problem
 from ..tunnel import BULK_BYTES, HubRelay, TunnelClient, measure
 
 if TYPE_CHECKING:
@@ -80,6 +80,10 @@ class SplitUnavailable(Exception):
 
 class HelperAway(SplitUnavailable):
     """A helper stopped lending on purpose (pause, schedule, auto-yield): not a failure of the plan."""
+
+
+class PlanStale(SplitUnavailable):
+    """The setup changed since the model's benchmark: not a failure, the model is benchmarked again."""
 
 
 @dataclass
@@ -132,6 +136,27 @@ class SplitSession:
             return None
         expected = sum(max(0, p.bytes - p.cache) for p in self.plan.helpers)
         return {"sent": sum(r.bytes_out for r in relays), "expected": expected, "loading": self.state == "starting"}
+
+    def layout(self) -> dict[str, Any]:
+        """What a benchmark key records of this session's setup (see ``plans.layout_problem``)."""
+        plan = self.plan
+        return {
+            "helpers": [
+                {
+                    "id": x.node.node_id,
+                    "name": x.node.name,
+                    "tunnel": x.mode,
+                    "device": x.endpoint.get("device", ""),
+                    "lent_gib": round(int(x.endpoint.get("free_mib", 0)) / 1024),
+                }
+                for x in self.leases
+            ],
+            "placement": [
+                {"node": p.device.node_id, "device": p.device.device, "layers": p.layers}
+                for p in (plan.placements if plan else [])
+            ],
+            "cpu_layers": plan.cpu_layers if plan else 0,
+        }
 
     def alive(self) -> bool:
         return self.state == "ready" and self.process is not None and self.process.returncode is None
@@ -278,7 +303,7 @@ class SplitEngine:
                 await self._stop(session, reason, failed=not cancelled)
                 if cancelled:
                     raise  # abandoned (nobody waits, or the hub stops): not a failure of the plan
-                if not isinstance(exc, HelperAway):
+                if not isinstance(exc, (HelperAway, PlanStale)):
                     self.hub.plans.fail(key, reason, tail)
                 raise SplitUnavailable(reason) from None
             session.active += 1
@@ -346,6 +371,12 @@ class SplitEngine:
             if lease not in used:
                 await self._send_stop(lease)
         s.leases = used
+        if s.spec.layout is not None:
+            problem = layout_problem(s.spec.layout, s.layout())
+            if problem:
+                # Not what was benchmarked (another device, less memory, other layers): it may be slower.
+                self.hub.plans.stale(s.model, problem)
+                raise PlanStale(f"the benchmark no longer applies: {problem}")
         for lease in s.leases:
             lease.node.split_model = s.model
         await self._launch(s, binaries)

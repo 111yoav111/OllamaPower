@@ -18,8 +18,13 @@ canonical name):
 **Golden rule - never slower.** In automatic mode a model runs split only if
 a benchmark showed split generating at least ``planner.min_gain`` faster than
 plain Ollama, and only while nothing that benchmark depended on has changed:
-the model's digest, the context size, the llama.cpp build and the exact set
-of helpers with their tunnel modes (the benchmark *key*). If anything differs
+the model's digest, the context size, the llama.cpp build, the exact set
+of helpers with their tunnel modes, the device each helper lent and how much
+memory (within ``LENT_SLACK_GIB``), and where the layers went (the benchmark
+*key*). Helpers and tunnels are checked before routing; devices, memory and
+placement once a session has asked its helpers and planned the layers - a
+mismatch there marks the key stale. Keys saved by older versions stay
+readable but never match. If anything differs
 the model goes back to Ollama and is benchmarked again (automatically while
 the hub is idle, if ``planner.auto_benchmark`` is on).
 
@@ -35,7 +40,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ..aio import reap
@@ -58,13 +63,53 @@ AUTO_BENCH_MAX_FAILURES = 3  # failed automatic benchmarks in a row (same key) b
 WARNING_TTL = 600.0
 
 
+KEY_VERSION = 2  # benchmark keys with each helper's device and memory, and the placement
+LENT_SLACK_GIB = 1  # a helper's lent memory (rounded to GiB) may differ this much from its benchmark's
+PLACEMENT_SLACK = 0.05  # and each device's layer count by this share of the layers (at least one layer)
+
+
 @dataclass(frozen=True)
 class SplitSpec:
-    """How to start a split session: the context and which helpers (None = every eligible one)."""
+    """How to start a split session: the context and which helpers (None = every eligible one).
+
+    ``layout`` is the benchmark key a planned session must still match once its helpers
+    have answered and the layers are placed (None: no benchmark to match, e.g. a pin).
+    """
 
     ctx: int
     helpers: tuple[str, ...] | None = None
     exclude: tuple[str, ...] = ()
+    layout: dict[str, Any] | None = field(default=None, hash=False)
+
+
+def layout_problem(key: dict[str, Any], now: dict[str, Any]) -> str:
+    """Why the setup ``now`` (``SplitSession.layout()``) differs from benchmark ``key`` ("" if it doesn't).
+
+    The helpers must lend the same device with about the same memory, and the layers must land
+    on the same devices in about the same numbers; small free-memory jitter is tolerated.
+    """
+    want = {h.get("id"): h for h in key.get("helpers") or [] if isinstance(h, dict)}
+    for h in now["helpers"]:
+        old = want.get(h["id"])
+        if old is None:
+            return f"helper {h['name']} was not part of the benchmark"
+        if old.get("device") != h["device"]:
+            return f"helper {h['name']} lends {h['device'] or 'another device'} now, not {old.get('device')}"
+        lent = old.get("lent_gib")
+        if not isinstance(lent, int) or abs(lent - h["lent_gib"]) > LENT_SLACK_GIB:
+            return f"helper {h['name']} lends {h['lent_gib']} GiB now, {lent} GiB at the benchmark"
+    placement = key.get("placement")
+    if not isinstance(placement, list) or not all(isinstance(p, dict) for p in placement):
+        return "the benchmark has no placement"
+    if [(p.get("node"), p.get("device")) for p in placement] != [(p["node"], p["device"]) for p in now["placement"]]:
+        return "the layers would go to other devices"
+    total = sum(p["layers"] for p in now["placement"]) + now["cpu_layers"]
+    slack = max(1, int(total * PLACEMENT_SLACK))
+    counts = [(old.get("layers"), q["layers"]) for old, q in zip(placement, now["placement"], strict=True)]
+    counts.append((key.get("cpu_layers"), now["cpu_layers"]))
+    if any(not isinstance(a, int) or abs(a - b) > slack for a, b in counts):
+        return "the layers would be split differently"
+    return ""
 
 
 def _default_record() -> dict[str, Any]:
@@ -191,6 +236,10 @@ class PlanBook:
         key = rec.get("key")
         if not isinstance(key, dict):
             return "no benchmark yet"
+        if key.get("v") != KEY_VERSION:
+            return "the benchmark predates device and placement tracking"
+        if key.get("stale"):
+            return str(key["stale"])
         digest = self.digest_of(model)
         if digest and key.get("digest") and digest != key["digest"]:
             return "the model changed since its benchmark"
@@ -230,8 +279,21 @@ class PlanBook:
             return SplitSpec(ctx=ctx, exclude=exclude)
         if rec["choice"] == "split" and not self.key_problem(model, rec):
             ids = tuple(h["id"] for h in rec["key"]["helpers"])
-            return SplitSpec(ctx=ctx, helpers=ids, exclude=exclude)
+            return SplitSpec(ctx=ctx, helpers=ids, exclude=exclude, layout=rec["key"])
         return None
+
+    def stale(self, model: str, problem: str) -> None:
+        """Split mode found its setup changed since the benchmark: route to Ollama, benchmark again.
+
+        Nothing failed, so the model isn't degraded; the key just no longer applies.
+        """
+        rec = self.record(model)
+        if self.hub.state is None or not isinstance(rec["key"], dict):
+            return
+        problem = safe_text(problem, 200)
+        self._update(model, key={**rec["key"], "stale": problem})
+        self.hub.event("plan_stale", model=model, reason=problem)
+        log.info("the benchmark of %s no longer applies: %s", model, problem)
 
     def fail(self, model: str, reason: str, tail: list[str] | None = None) -> None:
         """Split mode failed for ``model``: Ollama serves it until the plan can recover."""
