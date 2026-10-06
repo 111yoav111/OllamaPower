@@ -260,3 +260,21 @@ def test_hub_end_to_end(fake_ollama, tmp_path):
     assert (tmp_path / "state.json").exists()
     kinds = [json.loads(line)["kind"] for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
     assert kinds[0] == "hub_start" and kinds[-1] == "hub_stop"
+
+
+def test_cli_output_survives_a_narrow_encoding(tmp_path):
+    """Redirected output on Windows is cp1252: "→" and "✓" must not crash the command."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    entry = {"ts": 1_700_000_000, "kind": "note", "msg": "loading… hub → helper ✓"}
+    (logs / "events.jsonl").write_text(json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8")
+    env = {**os.environ, "OLLAMAPOWER_CONFIG_DIR": str(tmp_path), "PYTHONIOENCODING": "cp1252"}
+    env.pop("OLLAMAPOWER_TOKEN", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "ollamapower", "logs", "--file", "events"],
+        env=env,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr.decode("cp1252", "replace")
+    assert "msg=loading… hub ? helper ?" in result.stdout.decode("cp1252")

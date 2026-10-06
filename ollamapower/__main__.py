@@ -33,6 +33,7 @@ from .cli_common import (
     load,
     refuse_root,
     show,
+    tolerant_stdio,
     ts,
     tunnel_test_lines,
 )
@@ -1027,6 +1028,7 @@ def logs(
 
 
 def main() -> None:
+    tolerant_stdio()
     cli()
 
 

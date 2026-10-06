@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -21,6 +22,29 @@ from .config import Config, ConfigError, load_config
 ConfigOption = typer.Option(None, "--config", "-c", help="Path to config.toml", exists=True, dir_okay=False)
 WATCH_INTERVAL = 2.0
 Lines = list[tuple[str, Any]]
+
+
+# Characters the CLI prints (status icons, arrows, ellipses, warnings).
+_CLI_CHARS = "…→↓↑✓⚠●·🟢"
+
+
+def tolerant_stdio() -> None:
+    """Replace, instead of crash on, characters stdout/stderr can't encode.
+
+    Redirected output on Windows uses the ANSI code page (cp1252 and the like),
+    which has no "→" or "✓": the first one printed raised ``UnicodeEncodeError``
+    and the command died half-way. Streams that can encode them (UTF-8) are
+    left alone.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        try:
+            _CLI_CHARS.encode(encoding or "ascii")
+            continue
+        except (UnicodeEncodeError, LookupError):
+            pass
+        with contextlib.suppress(AttributeError, ValueError, OSError):
+            stream.reconfigure(errors="replace")  # type: ignore[union-attr]
 
 
 @contextlib.contextmanager
