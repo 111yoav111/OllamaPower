@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from ...aio import reap, wait_for
+from ...childproc import spawn
 from ...core.tunnel import TunnelError, TunnelIdentity, check_cert_pem
 from ...llamacpp import binaries as llamacpp_binaries
 from ...llamacpp.binaries import LlamaCpp, llamacpp_env, preferred
@@ -549,7 +550,7 @@ class SplitEngine:
             "-ngl",
             str(plan.gpu_layers),
         ]
-        s.process = await asyncio.create_subprocess_exec(
+        s.process = await spawn(
             *args,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,

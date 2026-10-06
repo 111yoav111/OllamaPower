@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from ..aio import reap, wait_for
+from ..childproc import spawn
 from ..core.tunnel import TunnelError, TunnelIdentity, cert_fingerprint, check_cert_pem
 from ..llamacpp.binaries import Device, LlamaCpp, llamacpp_env, telemetry_indexes
 from ..llamacpp.manager import LlamaCppUnavailable, ensure
@@ -321,7 +322,7 @@ class RpcManager:
         last_error = ""
         for _ in range(3):  # another program may grab the port between choosing and binding it
             session.port = _free_port()
-            proc = await asyncio.create_subprocess_exec(
+            proc = await spawn(
                 *args,
                 "-p",
                 str(session.port),

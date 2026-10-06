@@ -319,6 +319,12 @@ requests pass straight through, and `/api/ps` lists the split model with
 `split.keep_alive` seconds idle (Ollama gets the GPU back on its next
 request), when a helper leaves or its owner pauses, or when the plan changes.
 
+`rpc-server` and `llama-server` die with the process that started them, even
+when it is killed outright (`kill -9`, Task Manager): on Linux through
+`PR_SET_PDEATHSIG`, on Windows through a kill-on-close Job Object. macOS has no
+equivalent; after a hard kill there, end leftovers with `pkill rpc-server` or
+`pkill llama-server` (a normal stop, Ctrl+C or `kill`, cleans up everywhere).
+
 ### When something breaks
 
 - **Before the first token** (a helper vanished, llama-server didn't start or
