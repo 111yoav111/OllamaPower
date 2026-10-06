@@ -275,9 +275,13 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 return unavailable(str(exc))
             stream.engine = ENGINE_SPLIT
             released = False
+            has_slot = False
 
             def release() -> None:
-                nonlocal released
+                nonlocal released, has_slot
+                if has_slot:
+                    has_slot = False
+                    session.slot.release()
                 if not released:
                     released = True
                     hub.split.release(session)
@@ -294,19 +298,28 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
             # reached the client, so if split mode breaks now, Ollama answers instead - transparently.
             upstream = None
             try:
+                # One request at a time per llama-server slot; waiting here isn't llama-server's time.
+                await race_kill(session.slot.acquire(), stream, request.receive)
+                has_slot = True
                 assert session.client is not None
+                if native:
+                    # Progress chunks while the prompt is processed: a long prompt is alive, not stalled.
+                    translated["return_progress"] = True
+                    first_byte, read = config.split.stall_timeout, config.split.stall_timeout
+                else:
+                    # /v1 passes through as is: no progress, and "stream": false sends nothing until done.
+                    first_byte, read = config.split.load_timeout, None
                 upstream_request = session.client.build_request(
                     "POST",
                     "/v1/chat/completions" if native else target,
                     content=json.dumps(translated).encode() if native else body,
                     headers={"content-type": "application/json", "accept-encoding": "identity"},
+                    timeout=httpx.Timeout(connect=5.0, read=read, write=60.0, pool=30.0),
                 )
                 upstream = await race_kill(session.client.send(upstream_request, stream=True), stream, request.receive)
                 chunks = upstream.aiter_raw()
                 try:
-                    first = await race_kill(
-                        wait_for(anext(chunks), config.split.stall_timeout), stream, request.receive
-                    )
+                    first = await race_kill(wait_for(anext(chunks), first_byte), stream, request.receive)
                 except StopAsyncIteration:
                     first = b""
             except (httpx.HTTPError, TimeoutError, StreamKilled) as exc:

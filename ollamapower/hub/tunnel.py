@@ -167,7 +167,12 @@ async def measure(client: TunnelClient, bulk_bytes: int = BULK_BYTES) -> dict[st
                 left -= len(data)
 
         t = time.perf_counter()
-        await asyncio.gather(send(), receive())
+        try:
+            async with asyncio.TaskGroup() as group:  # if one side fails, the other is cancelled too
+                group.create_task(send())
+                group.create_task(receive())
+        except ExceptionGroup as eg:
+            raise eg.exceptions[0] from None  # callers handle the plain error (OSError, ...)
         seconds = time.perf_counter() - t
     finally:
         writer.close()

@@ -40,11 +40,12 @@ import socket
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from ...aio import wait_for
+from ...aio import reap, wait_for
 from ...core.tunnel import TunnelError, TunnelIdentity, check_cert_pem
 from ...llamacpp.binaries import LlamaCpp
 from ...llamacpp.install import Pins
@@ -66,6 +67,7 @@ RPC_READY_TIMEOUT = 60.0
 OLLAMA_RELEASE_TIMEOUT = 30.0
 STOP_GRACE = 10.0
 IDLE_CHECK = 5.0
+BENCH_TIMEOUT = 120.0  # seconds a whole tunnel test may take
 DRAIN_TIMEOUT = 30.0  # seconds running answers get to finish when a helper leaves on purpose
 WARNING_TTL = 600.0
 ENGINE_SPLIT = "split"
@@ -73,6 +75,10 @@ ENGINE_SPLIT = "split"
 
 class SplitUnavailable(Exception):
     """Split mode can't serve this request now; Ollama will (the message says why)."""
+
+
+class HelperAway(SplitUnavailable):
+    """A helper stopped lending on purpose (pause, schedule, auto-yield): not a failure of the plan."""
 
 
 @dataclass
@@ -114,6 +120,9 @@ class SplitSession:
     output: deque[str] = field(default_factory=lambda: deque(maxlen=60))
     error: str = ""
     draining: bool = False  # a helper stopped lending: finish the current answers, then stop
+    # llama-server runs with one slot (-np 1): requests queue here, in the hub, so time spent
+    # waiting for the slot never counts as llama-server stalling.
+    slot: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
 
     def transfer(self) -> dict[str, Any] | None:
         """Model weights sent to the helpers so far (secure mode counts them), for a progress bar."""
@@ -168,6 +177,9 @@ class SplitEngine:
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._warnings: deque[tuple[float, str]] = deque(maxlen=20)
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._acquire_tasks: set[asyncio.Task[Any]] = set()
+        self._acquiring = 0  # _acquire calls in progress (waiting for the lock or starting)
+        self._pending_nodes: dict[str, Node] = {}  # rpc_start session id -> helper asked
 
     def holds(self, model: str) -> bool:
         """Is a session for ``model`` starting or running (holding, or about to hold, the GPU)?"""
@@ -186,14 +198,19 @@ class SplitEngine:
     async def acquire(self, model: str, spec: SplitSpec) -> SplitSession:
         """A ready session for ``model`` started with ``spec`` (started if needed); pair with ``release``."""
         task = asyncio.ensure_future(self._acquire(model, spec))
+        self._acquire_tasks.add(task)
+        task.add_done_callback(self._acquire_tasks.discard)
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
-            # The client left: let a start in progress finish (others may wait for it), but don't hold it.
+            # The client left. If others wait too, let a start in progress finish for them;
+            # if nobody does, abandon it - a start nobody waits for would keep the GPU from Ollama.
             def done(t: asyncio.Task[SplitSession]) -> None:
                 if not t.cancelled() and t.exception() is None:
                     self.release(t.result())
 
+            if not task.done() and self._acquiring <= 1:
+                task.cancel()
             task.add_done_callback(done)
             raise
 
@@ -201,9 +218,16 @@ class SplitEngine:
         from ..runtime import model_key
 
         key = model_key(model)
+        self._acquiring += 1
+        try:
+            return await self._acquire_locked(key, spec)
+        finally:
+            self._acquiring -= 1
+
+    async def _acquire_locked(self, key: str, spec: SplitSpec) -> SplitSession:
         async with self._lock:
             current = self.session
-            reusable = current is not None and current.alive() and not current.draining
+            reusable = current is not None and current.alive() and not current.draining and not current.error
             if reusable and current.model == key and current.spec == spec:
                 current.active += 1
                 current.idle.clear()
@@ -231,10 +255,12 @@ class SplitEngine:
                     log.exception("split start failed")
                 session.error = reason
                 tail = list(session.output)
-                await self._stop(session, reason, failed=True)
-                self.hub.plans.fail(key, reason, tail)
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
+                cancelled = isinstance(exc, asyncio.CancelledError)
+                await self._stop(session, reason, failed=not cancelled)
+                if cancelled:
+                    raise  # abandoned (nobody waits, or the hub stops): not a failure of the plan
+                if not isinstance(exc, HelperAway):
+                    self.hub.plans.fail(key, reason, tail)
                 raise SplitUnavailable(reason) from None
             session.active += 1
             return session
@@ -274,13 +300,14 @@ class SplitEngine:
         if not helpers:
             raise SplitUnavailable("no helper can take part" + (f" ({'; '.join(reasons)})" if reasons else ""))
 
-        await self._release_ollama()
-        await asyncio.to_thread(binaries.probe)  # free memory now that Ollama let go
-        hub_devices = [Device(f"hub {d.name}", d.free_mib * MIB, device=d.name) for d in binaries.devices]
-
-        s.leases = await self._lease(helpers, s.model)
+        # Lease the helpers first: if none agrees, Ollama keeps its models loaded.
+        await self._lease(s, helpers)
         if not s.leases:
             raise SplitUnavailable("no helper agreed to lend memory")
+        await self._release_ollama()
+        # Measure free memory now, right before planning and launching (Ollama just let go).
+        await asyncio.to_thread(binaries.probe)
+        hub_devices = [Device(f"hub {d.name}", d.free_mib * MIB, device=d.name) for d in binaries.devices]
         by_node = {x.node.node_id: x for x in s.leases}
         devices = [
             Device(
@@ -304,6 +331,10 @@ class SplitEngine:
         for lease in s.leases:
             lease.node.split_model = s.model
         await self._launch(s, binaries)
+        away = [x.node.name for x in s.leases if x.node.status != "lending"]
+        if away:
+            # A helper's owner paused it (or its schedule ended) while we were loading.
+            raise HelperAway(f"{', '.join(away)} stopped lending while split mode was starting")
         s.state, s.ready_at, s.last_used = "ready", time.time(), time.monotonic()
         self.hub.event(
             "split_ready",
@@ -382,61 +413,75 @@ class SplitEngine:
             await asyncio.sleep(0.5)
         raise SplitUnavailable("Ollama did not unload its models in time")
 
-    async def _lease(self, helpers: list[Node], model: str) -> list[HelperLease]:
+    async def _lease(self, s: SplitSession, helpers: list[Node]) -> None:
+        """Ask ``helpers`` to start rpc-server; ``s.leases`` ends up holding the ones that are ready.
+
+        The leases are on the session from the first ``rpc_start`` on, so if the start is
+        cancelled or times out meanwhile, stopping the session still releases every helper.
+        """
         leases = []
         for n in helpers:
             mode = n.tunnel_effective
             identity = TunnelIdentity.generate("hub") if mode == "secure" else None
             leases.append(HelperLease(node=n, session_id=secrets.token_hex(12), mode=mode, identity=identity))
+        s.leases = leases
         loop = asyncio.get_running_loop()
-        for lease in leases:
-            self._pending[lease.session_id] = loop.create_future()
-            assert lease.node.channel is not None
-            try:
-                await lease.node.channel.send(
-                    "rpc_start",
-                    session_id=lease.session_id,
-                    device="",
-                    vram_cap_mb=0,
-                    cache=True,
-                    tunnel={"mode": lease.mode, **({"cert": lease.identity.cert_pem} if lease.identity else {})},
-                    model=model,
-                )
-            except Exception:  # noqa: BLE001 - that helper just left
-                self._pending.pop(lease.session_id).cancel()
-        waiting = {x.session_id: x for x in leases if x.session_id in self._pending}
-        if not waiting:
-            return []
-        done, _ = await asyncio.wait([self._pending[k] for k in waiting], timeout=RPC_READY_TIMEOUT)
-        ready = []
-        for session_id, lease in waiting.items():
-            fut = self._pending.pop(session_id)
-            if fut in done and not fut.cancelled() and fut.result().get("type") == "rpc_ready":
-                endpoint = fut.result().get("endpoint") or {}
-                port, free = endpoint.get("port"), endpoint.get("free_mib")
-                if _count(port) and port < 65536 and _count(free) and endpoint.get("mode") == lease.mode:
-                    lease.endpoint = {
-                        "port": port,
-                        "free_mib": min(free, 1 << 24),
-                        "device": safe_text(str(endpoint.get("device", "")), 40),
-                    }
-                    try:
-                        if lease.identity is not None:
-                            lease.endpoint["cert"] = check_cert_pem(endpoint.get("cert"))
-                            client = TunnelClient(lease.node.ip, port, lease.identity, lease.endpoint["cert"])
-                            lease.relay = HubRelay(client)
-                            await lease.relay.start()
-                        ready.append(lease)
-                        continue
-                    except TunnelError as exc:
-                        self._warnings.append((time.monotonic(), f"{lease.node.name}: secure tunnel: {exc}"))
-            elif fut in done and not fut.cancelled():
-                err = safe_text(str(fut.result().get("error", "")), 300)
-                self._warnings.append((time.monotonic(), f"{lease.node.name} refused split mode: {err}"))
-                continue
-            fut.cancel()
-            await self._send_stop(lease)
-        return ready
+        try:
+            for lease in leases:
+                self._pending[lease.session_id] = loop.create_future()
+                self._pending_nodes[lease.session_id] = lease.node
+                assert lease.node.channel is not None
+                try:
+                    await lease.node.channel.send(
+                        "rpc_start",
+                        session_id=lease.session_id,
+                        device="",
+                        vram_cap_mb=0,
+                        cache=True,
+                        tunnel={"mode": lease.mode, **({"cert": lease.identity.cert_pem} if lease.identity else {})},
+                        model=s.model,
+                    )
+                except Exception:  # noqa: BLE001 - that helper just left
+                    self._pending.pop(lease.session_id).cancel()
+            waiting = {x.session_id: x for x in leases if x.session_id in self._pending}
+            if waiting:
+                await asyncio.wait([self._pending[k] for k in waiting], timeout=RPC_READY_TIMEOUT)
+            ready = []
+            for session_id, lease in waiting.items():
+                fut = self._pending.pop(session_id)
+                answer = fut.result() if fut.done() and not fut.cancelled() else None
+                if answer is not None and answer.get("type") == "rpc_ready":
+                    endpoint = answer.get("endpoint") or {}
+                    port, free = endpoint.get("port"), endpoint.get("free_mib")
+                    if _count(port) and port < 65536 and _count(free) and endpoint.get("mode") == lease.mode:
+                        lease.endpoint = {
+                            "port": port,
+                            "free_mib": min(free, 1 << 24),
+                            "device": safe_text(str(endpoint.get("device", "")), 40),
+                        }
+                        try:
+                            if lease.identity is not None:
+                                lease.endpoint["cert"] = check_cert_pem(endpoint.get("cert"))
+                                client = TunnelClient(lease.node.ip, port, lease.identity, lease.endpoint["cert"])
+                                lease.relay = HubRelay(client)
+                                await lease.relay.start()
+                            ready.append(lease)
+                            continue
+                        except TunnelError as exc:
+                            self._warnings.append((time.monotonic(), f"{lease.node.name}: secure tunnel: {exc}"))
+                elif answer is not None:
+                    err = safe_text(str(answer.get("error", "")), 300)
+                    self._warnings.append((time.monotonic(), f"{lease.node.name} refused split mode: {err}"))
+                    continue
+                fut.cancel()
+                await self._send_stop(lease)
+            s.leases = ready
+        finally:
+            for lease in leases:
+                fut = self._pending.pop(lease.session_id, None)
+                if fut is not None:
+                    fut.cancel()
+                self._pending_nodes.pop(lease.session_id, None)
 
     async def _launch(self, s: SplitSession, binaries: LlamaCpp) -> None:
         assert s.plan is not None and s.files is not None and binaries.llama_server is not None
@@ -462,6 +507,8 @@ class SplitEngine:
             "--no-ui",
             "--fit",
             "off",
+            "-fa",
+            "on",  # flash attention keeps compute buffers small and predictable (the planner assumes it)
             "--rpc",
             ",".join(x.address for x in s.leases),
             "--device",
@@ -520,6 +567,7 @@ class SplitEngine:
             lease.identity = TunnelIdentity.generate("hub")
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[lease.session_id] = fut
+        self._pending_nodes[lease.session_id] = node
         try:
             await channel.send(
                 "rpc_start",
@@ -530,12 +578,13 @@ class SplitEngine:
                 tunnel={"mode": mode, **({"cert": lease.identity.cert_pem} if lease.identity else {})},
                 purpose="bench",
             )
-            reply = await wait_for(fut, RPC_READY_TIMEOUT)
-        except TimeoutError:
-            raise SplitUnavailable(f"{node.name} did not answer the tunnel test") from None
-        finally:
-            self._pending.pop(lease.session_id, None)
-        try:
+            try:
+                reply = await wait_for(fut, RPC_READY_TIMEOUT)
+            except TimeoutError:
+                raise SplitUnavailable(f"{node.name} did not answer the tunnel test") from None
+            finally:
+                self._pending.pop(lease.session_id, None)
+                self._pending_nodes.pop(lease.session_id, None)
             if reply["type"] != "rpc_ready":
                 raise SplitUnavailable(f"{node.name}: {safe_text(str(reply.get('error', '')), 300)}")
             endpoint = reply.get("endpoint") or {}
@@ -545,11 +594,12 @@ class SplitEngine:
             try:
                 cert = check_cert_pem(endpoint.get("cert")) if lease.identity else ""
                 client = TunnelClient(node.ip, port, lease.identity, cert)
-                return await measure(client, bulk_bytes)
+                # A helper that drops off the network mid-test sends no FIN: never wait forever.
+                return await wait_for(measure(client, bulk_bytes), BENCH_TIMEOUT)
             except (OSError, TimeoutError, TunnelError, asyncio.IncompleteReadError) as exc:
                 raise SplitUnavailable(f"tunnel test to {node.name} failed ({type(exc).__name__})") from None
         finally:
-            await self._send_stop(lease)
+            await self._send_stop(lease)  # also after a timeout: the helper's test relay goes away
 
     # ----- helper events -----------------------------------------------------------------
 
@@ -560,6 +610,12 @@ class SplitEngine:
             if fut is not None and not fut.done():
                 fut.set_result(message)
                 return
+        else:
+            # Gone while we wait for its rpc_ready: don't make the start wait the full minute.
+            for session_id, asked in list(self._pending_nodes.items()):
+                fut = self._pending.get(session_id)
+                if asked is node and fut is not None and not fut.done():
+                    fut.set_result({"type": "rpc_error", "error": "the helper disconnected"})
         s = self.session
         if s is None or s.state not in ("ready", "starting"):
             return
@@ -605,6 +661,21 @@ class SplitEngine:
             lease.node.split_model = ""
 
     async def _stop(self, s: SplitSession, reason: str, failed: bool = False) -> None:
+        """Stop ``s`` completely, even if the caller is cancelled meanwhile.
+
+        A half-stopped session (llama-server killed but helpers never told, the session
+        still set) would keep the helpers' VRAM until something else happened to stop it,
+        so the cleanup runs as its own task and is waited for before a cancellation goes on.
+        """
+        task = asyncio.ensure_future(self._stop_now(s, reason, failed))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                await task  # bounded by STOP_GRACE; then let the cancellation continue
+            raise
+
+    async def _stop_now(self, s: SplitSession, reason: str, failed: bool) -> None:
         was_ready = s.state == "ready"
         s.state = "stopping"
         if failed:
@@ -614,20 +685,22 @@ class SplitEngine:
             for stream in list(self.hub.streams.values()):
                 if stream.engine == ENGINE_SPLIT and stream.model and model_key(stream.model) == s.model:
                     stream.kill(f"split mode stopped: {reason}")
-        proc = s.process
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
-            try:
-                await wait_for(proc.wait(), STOP_GRACE)
-            except TimeoutError:
+        try:
+            proc = s.process
+            if proc is not None and proc.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                await proc.wait()
-        for lease in s.leases:
-            await self._send_stop(lease)
-        if s.client is not None:
-            await s.client.aclose()
+                    proc.terminate()
+                try:
+                    await wait_for(proc.wait(), STOP_GRACE)
+                except TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    await proc.wait()
+        finally:
+            for lease in s.leases:
+                await self._send_stop(lease)
+            if s.client is not None:
+                await s.client.aclose()
         s.state = "failed" if failed else "stopped"
         if self.session is s:
             self.session = None
@@ -689,9 +762,13 @@ class SplitEngine:
                 elif not s.active and time.monotonic() - s.last_used > self.config.split.keep_alive:
                     await self.stop(s.model, "idle")
         finally:
-            s = self.session
-            if s is not None:
-                await asyncio.shield(self._stop(s, "hub shutting down"))
+            # Shutdown: abandon starts in progress (not a plan failure), finish background
+            # stops and drains, then stop what is left - under the lock, like every stop.
+            await reap(*self._acquire_tasks, *self._tasks)
+            async with self._lock:
+                s = self.session
+                if s is not None:
+                    await self._stop(s, "hub shutting down")
 
     # ----- views -------------------------------------------------------------------------
 
@@ -707,19 +784,34 @@ class SplitEngine:
         }
 
     def ps_entries(self) -> list[dict[str, Any]]:
-        """``/api/ps``-shaped entries for the running split model."""
+        """``/api/ps``-shaped entries for the running split model, as Ollama would describe it."""
+        from ..runtime import model_key
+
         s = self.session
         if s is None or not s.alive() or s.files is None or s.files.gguf is None or s.plan is None:
             return []
         size = s.files.gguf.file_size
         on_gpu = sum(p.bytes for p in s.plan.placements)
+        installed = next((m for m in self.hub.ollama.installed if model_key(m.name) == s.model), None)
+        # When it unloads: keep_alive after the last answer (``ollama ps`` shows "Stopping..." without it).
+        idle_for = 0.0 if s.active else time.monotonic() - s.last_used
+        expires = datetime.now(UTC) + timedelta(seconds=max(0.0, self.config.split.keep_alive - idle_for))
         return [
             {
                 "name": s.model,
                 "model": s.model,
                 "size": size,
                 "size_vram": min(size, on_gpu),
-                "digest": s.files.digest,
+                "digest": (installed.digest if installed and installed.digest else s.files.digest),
+                "details": {
+                    "parent_model": "",
+                    "format": "gguf",
+                    "family": s.files.gguf.architecture,
+                    "families": [s.files.gguf.architecture],
+                    "parameter_size": installed.parameter_size if installed else "",
+                    "quantization_level": installed.quantization if installed else "",
+                },
+                "expires_at": expires.isoformat().replace("+00:00", "Z"),
                 "context_length": s.ctx,
                 "ollamapower": {"engine": ENGINE_SPLIT, "nodes": [x.node.name for x in s.leases]},
             }
