@@ -1,10 +1,22 @@
 """Session encryption for the control plane, inherited from DCP.
 
-Handshake (once per connection):
+Handshake (once per connection, protocol 2):
 
-1. The hub sends its RSA-2048 public key (PEM, length-prefixed).
-2. The node picks a random 256-bit AES key, encrypts it to that public key
-   with RSA-OAEP-SHA256 and sends it back (length-prefixed).
+1. The hub sends its RSA-2048 public key (PEM) followed by ``HUB_NONCE_TAG``
+   and a fresh random 256-bit **hub nonce**, as one length-prefixed blob.
+2. The node picks a random 256-bit secret, encrypts it to that public key with
+   RSA-OAEP-SHA256 and sends back ``NODE_TAG``, its own random 256-bit **node
+   nonce** and the encrypted secret (one length-prefixed blob).
+3. Both sides derive the AES-256 session key with HKDF-SHA256 from the secret,
+   salted with both nonces and bound to the hub key's fingerprint.
+
+The secret only ever crosses the wire RSA-encrypted, so the session key is as
+secret as it was when the RSA-wrapped value was used directly; the nonces are
+public. What the hub nonce adds is freshness: every connection has a key the
+hub helped choose, so a recorded session replayed to the hub (the same RSA
+blob, then the same frames) derives a different key and its first frame fails
+authentication. Protocol 1 used the node's secret as the key directly, which
+let anyone who recorded a session replay all of it.
 
 After that every packet is one frame ``[4-byte length][12-byte nonce][AES-256-GCM
 ciphertext + tag]``. The nonce is fresh random for every message, so a nonce is
@@ -13,6 +25,13 @@ never reused under the same key (2^-48 collision odds only after ~2^32 frames).
 Each frame is also bound (as GCM associated data) to its sender's role and a
 per-direction counter. A frame that is replayed, reordered, dropped-then-skipped
 or reflected back to its sender fails authentication. DCP had no such binding.
+
+Older peers: the hub's first blob still starts with a plain PEM key, which a
+protocol-1 agent reads and ignores the rest of; the hub recognises that
+agent's reply (a bare RSA blob), finishes a ``legacy`` session only so it can
+send a readable "update this helper" reject, and never admits it. A protocol-2
+agent that meets a protocol-1 hub (a bare PEM key) stops with
+``HandshakeVersionError`` before sending anything.
 
 The plain handshake trusts whatever key the server sends, so on its own it can
 be man-in-the-middled. Phase 2 pins the hub key's fingerprint on the agent
@@ -32,6 +51,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 log = logging.getLogger("ollamapower.crypto")
 
@@ -46,6 +66,12 @@ MAX_HANDSHAKE_FRAME = 10 * 1024
 # One encrypted packet. Large enough for streamed chunks and capability reports.
 MAX_FRAME = 30 * 1024 * 1024
 AAD_LABEL = b"ollamapower-frame-v1"
+HANDSHAKE_NONCE_SIZE = 32
+# After the hub's PEM key: marks a protocol-2 hub (a protocol-1 agent's PEM parser ignores it).
+HUB_NONCE_TAG = b"\nollamapower-handshake-v2 nonce:"
+# Starts a protocol-2 node's reply; a protocol-1 node sends the bare RSA blob.
+NODE_TAG = b"OPnode2:"
+KDF_INFO = b"ollamapower-control-session-v2"
 
 Role = Literal["hub", "node"]
 _ROLE_BYTE: dict[str, bytes] = {"hub": b"H", "node": b"N"}
@@ -53,6 +79,10 @@ _ROLE_BYTE: dict[str, bytes] = {"hub": b"H", "node": b"N"}
 
 class CryptoError(ValueError):
     """A frame failed to decrypt or authenticate; the connection must be dropped."""
+
+
+class HandshakeVersionError(CryptoError):
+    """The hub speaks an older handshake (protocol 1) that this agent no longer accepts."""
 
 
 def generate_rsa_keypair() -> rsa.RSAPrivateKey:
@@ -93,6 +123,14 @@ def rsa_decrypt_aes_key(private_key: rsa.RSAPrivateKey, ciphertext: bytes) -> by
         return private_key.decrypt(ciphertext, _oaep())
     except ValueError as exc:
         raise CryptoError("could not decrypt the session key") from exc
+
+
+def derive_session_key(secret: bytes, hub_nonce: bytes, node_nonce: bytes, hub_fingerprint: str) -> bytes:
+    """The AES-256 key of one connection: HKDF-SHA256 over the node's secret, salted with both nonces."""
+    if len(secret) != AES_KEY_SIZE or len(hub_nonce) != HANDSHAKE_NONCE_SIZE or len(node_nonce) != HANDSHAKE_NONCE_SIZE:
+        raise CryptoError("handshake values have the wrong size")
+    info = KDF_INFO + bytes.fromhex(hub_fingerprint)
+    return HKDF(algorithm=hashes.SHA256(), length=AES_KEY_SIZE, salt=hub_nonce + node_nonce, info=info).derive(secret)
 
 
 # ----- AES-256-GCM frames ---------------------------------------------------------------
@@ -147,7 +185,7 @@ class SessionCrypto:
     ``network_io.send_packet`` encrypt while holding the connection's lock).
     """
 
-    def __init__(self, aes_key: bytes, role: Role) -> None:
+    def __init__(self, aes_key: bytes, role: Role, legacy: bool = False) -> None:
         if len(aes_key) != AES_KEY_SIZE:
             raise CryptoError(f"AES key must be {AES_KEY_SIZE} bytes")
         if role not in _ROLE_BYTE:
@@ -161,32 +199,56 @@ class SessionCrypto:
         self.max_frame = MAX_FRAME
         # Set on the node side: the key the hub presented, for pinning.
         self.peer_fingerprint: str | None = None
+        # Hub side: a protocol-1 node's session (no hub nonce, so replayable). It may only be told to update.
+        self.legacy = legacy
 
     @classmethod
     async def hub_handshake(
         cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, rsa_private_key: rsa.RSAPrivateKey
     ) -> SessionCrypto:
-        """Hub side: send our public key, receive and unwrap the node's session key."""
-        writer.write(frame_bytes(rsa_public_key_to_pem(rsa_private_key)))
+        """Hub side: send our public key and a fresh nonce, unwrap the node's secret, derive the key."""
+        hub_nonce = os.urandom(HANDSHAKE_NONCE_SIZE)
+        writer.write(frame_bytes(rsa_public_key_to_pem(rsa_private_key) + HUB_NONCE_TAG + hub_nonce))
         await writer.drain()
-        encrypted_key = await read_frame(reader)
-        aes_key = rsa_decrypt_aes_key(rsa_private_key, encrypted_key)
-        log.debug("handshake complete (hub side)")
-        return cls(aes_key, "hub")
+        reply = await read_frame(reader)
+        rsa_size = rsa_private_key.key_size // 8
+        prefix = len(NODE_TAG) + HANDSHAKE_NONCE_SIZE
+        if len(reply) == prefix + rsa_size and reply.startswith(NODE_TAG):
+            node_nonce = reply[len(NODE_TAG) : prefix]
+            secret = rsa_decrypt_aes_key(rsa_private_key, reply[prefix:])
+            fingerprint = public_key_fingerprint(rsa_private_key.public_key())
+            log.debug("handshake complete (hub side)")
+            return cls(derive_session_key(secret, hub_nonce, node_nonce, fingerprint), "hub")
+        if len(reply) == rsa_size:
+            # A protocol-1 node: its secret is the key. Good for one reject, never for a session.
+            log.debug("protocol-1 handshake (hub side)")
+            return cls(rsa_decrypt_aes_key(rsa_private_key, reply), "hub", legacy=True)
+        raise CryptoError("unrecognised handshake reply")
 
     @classmethod
     async def node_handshake(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> SessionCrypto:
-        """Node side: receive the hub key, send it a fresh session key.
+        """Node side: receive the hub key and nonce, send our nonce and a fresh secret, derive the key.
 
         The caller must check ``peer_fingerprint`` against the pinned hub key
         before sending anything secret (the token).
         """
-        hub_key = rsa_key_from_pem(await read_frame(reader))
-        aes_key = os.urandom(AES_KEY_SIZE)
-        writer.write(frame_bytes(rsa_encrypt_aes_key(hub_key, aes_key)))
+        blob = await read_frame(reader)
+        tail = len(HUB_NONCE_TAG) + HANDSHAKE_NONCE_SIZE
+        if len(blob) <= tail or blob[-tail:-HANDSHAKE_NONCE_SIZE] != HUB_NONCE_TAG:
+            if blob.lstrip().startswith(b"-----BEGIN"):
+                raise HandshakeVersionError(
+                    "the hub runs an older OllamaPower (control protocol 1) that this helper can't use: "
+                    "update OllamaPower on the hub"
+                )
+            raise CryptoError("unrecognised handshake from the hub")
+        hub_key = rsa_key_from_pem(blob[:-tail])
+        hub_nonce = blob[-HANDSHAKE_NONCE_SIZE:]
+        secret, node_nonce = os.urandom(AES_KEY_SIZE), os.urandom(HANDSHAKE_NONCE_SIZE)
+        writer.write(frame_bytes(NODE_TAG + node_nonce + rsa_encrypt_aes_key(hub_key, secret)))
         await writer.drain()
-        session = cls(aes_key, "node")
-        session.peer_fingerprint = public_key_fingerprint(hub_key)
+        fingerprint = public_key_fingerprint(hub_key)
+        session = cls(derive_session_key(secret, hub_nonce, node_nonce, fingerprint), "node")
+        session.peer_fingerprint = fingerprint
         log.debug("handshake complete (node side)")
         return session
 

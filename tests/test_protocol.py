@@ -101,8 +101,9 @@ def test_unknown_fields_are_dropped():
 
 
 def test_version_compatibility():
-    assert p.compatible("1.0") and p.compatible("1.7")
-    assert not p.compatible("2.0") and not p.compatible("garbage")
+    assert p.compatible("2.0") and p.compatible("2.7")
+    assert not p.compatible("1.1") and not p.compatible("3.0") and not p.compatible("garbage")
+    assert p.at_least("2.0", 1, 1) and p.at_least("1.1", 1, 1) and not p.at_least("1.0", 1, 1)
 
 
 def test_non_message_packet_is_refused():

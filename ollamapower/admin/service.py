@@ -94,10 +94,10 @@ class Admin:
 
     async def tunnel_test(self, node: Node) -> dict[str, Any]:
         """Measure the split-mode path to ``node``: secure always, direct too if its owner allows it."""
-        from ..core.protocol import protocol_minor
+        from ..core.protocol import at_least
         from ..hub.engines.split import SplitUnavailable
 
-        if protocol_minor(node.protocol) < 1:
+        if not at_least(node.protocol, 1, 1):  # tunnel tests came with 1.1
             raise AdminError(f"{node.name} runs an older agent without tunnel tests; update OllamaPower there")
         modes = ["secure"] + (["direct"] if node.lending.get("allow_direct") else [])
         results = {}

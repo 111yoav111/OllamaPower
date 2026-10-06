@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import socket
 import sys
 import time
@@ -18,7 +19,16 @@ from ollamapower.config import Config
 from ollamapower.core import protocol
 from ollamapower.core.auth import new_token
 from ollamapower.core.channel import Channel
-from ollamapower.core.encrypt_layer import SessionCrypto, generate_rsa_keypair, public_key_fingerprint
+from ollamapower.core.encrypt_layer import (
+    SessionCrypto,
+    frame_bytes,
+    generate_rsa_keypair,
+    public_key_fingerprint,
+    read_frame,
+    rsa_encrypt_aes_key,
+    rsa_key_from_pem,
+    rsa_public_key_to_pem,
+)
 from ollamapower.hub.nodes import GIB, NodeRegistry, sanitize
 from ollamapower.hub.runtime import Hub
 from ollamapower.state import StateStore
@@ -221,12 +231,120 @@ def _hello(**over) -> dict:
 
 async def test_incompatible_protocol_is_rejected_and_shown(setup):
     ch = await _raw_connect(setup.hub.control.port)
-    await ch.send("hello", **_hello(protocol="2.0"))
+    await ch.send("hello", **_hello(protocol="3.0"))
     reply = await ch.recv()
     assert reply["type"] == "reject" and reply["code"] == "protocol"
     node = setup.node("raw")
-    assert node.status == "incompatible" and "protocol 2.0" in node.summary()["warnings"][0]
+    assert node.status == "incompatible" and "protocol 3.0" in node.summary()["warnings"][0]
     await ch.close()
+
+
+class _Recorder:
+    """A writer wrapper that keeps a copy of everything sent: what a sniffer on the LAN sees."""
+
+    def __init__(self, writer: asyncio.StreamWriter) -> None:
+        self.writer, self.sent = writer, bytearray()
+
+    def write(self, data: bytes) -> None:
+        self.sent += data
+        self.writer.write(data)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.writer, name)
+
+
+async def test_a_recorded_session_cannot_be_replayed(setup):
+    port = setup.hub.control.port
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    recorder = _Recorder(writer)
+    crypto = await SessionCrypto.node_handshake(reader, recorder)  # type: ignore[arg-type]
+    ch = Channel(reader, recorder, crypto)  # type: ignore[arg-type]
+    await ch.send("hello", **_hello())
+    assert (await ch.recv())["type"] == "welcome"
+    await ch.send("lend_state", state="paused", reason="owner")
+    await ch.close("done")
+    assert await until(lambda: setup.node("raw") is not None and not setup.node("raw").connected)
+    joins = sum(e["kind"] == "node_join" for e in setup.hub.recent_events)
+
+    # Replay every byte the helper sent, after reading the hub's (fresh) key blob.
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    await read_frame(reader)
+    writer.write(bytes(recorder.sent))
+    await writer.drain()
+    try:
+        assert await asyncio.wait_for(reader.read(), 3) == b""  # dropped, nothing answered
+    except ConnectionResetError:
+        pass
+    writer.close()
+    assert await until(lambda: any(e["kind"] == "auth_failed" for e in setup.hub.recent_events))
+    failed = [e for e in setup.hub.recent_events if e["kind"] == "auth_failed"][-1]
+    assert failed["reason"] == "bad handshake (CryptoError)"
+    assert sum(e["kind"] == "node_join" for e in setup.hub.recent_events) == joins
+    assert not setup.node("raw").connected
+
+
+async def _protocol1_connect(port: int) -> Channel:
+    """What a protocol-1 agent does: read the PEM key, send its key RSA-wrapped, use it as is."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    hub_key = rsa_key_from_pem(await read_frame(reader))  # the PEM parser skips the v2 nonce after the key
+    aes_key = os.urandom(32)
+    writer.write(frame_bytes(rsa_encrypt_aes_key(hub_key, aes_key)))
+    await writer.drain()
+    return Channel(reader, writer, SessionCrypto(aes_key, "node"))
+
+
+async def test_protocol1_agent_is_told_to_update_and_never_admitted(setup):
+    ch = await _protocol1_connect(setup.hub.control.port)
+    await ch.send("hello", **_hello(protocol="1.1"))
+    reply = await asyncio.wait_for(ch.recv(), 3)
+    assert reply["type"] == "reject" and reply["code"] == "protocol"
+    assert "install OllamaPower" in reply["reason"]
+    await ch.close()
+    assert setup.node("raw").status == "incompatible"
+    # Even claiming the current protocol, the old handshake is never enough for a session.
+    ch = await _protocol1_connect(setup.hub.control.port)
+    await ch.send("hello", **_hello(node_id="raw-node-0002", name="raw2"))
+    reply = await asyncio.wait_for(ch.recv(), 3)
+    assert reply["type"] == "reject" and reply["code"] == "protocol"
+    await ch.close()
+    assert not setup.node("raw2").connected
+    # A wrong token over the old handshake is still a failed login.
+    ch = await _protocol1_connect(setup.hub.control.port)
+    await ch.send("hello", **_hello(protocol="1.1", token=new_token()))
+    assert (await asyncio.wait_for(ch.recv(), 3))["code"] == "bad_token"
+    await ch.close()
+    assert any(e["kind"] == "auth_failed" for e in setup.hub.recent_events)
+
+
+async def test_protocol1_session_cannot_flag_a_connected_helper(setup):
+    agent = setup.agent()
+    setup.run(agent)
+    assert await until(lambda: setup.node() is not None and setup.node().connected)
+    ch = await _protocol1_connect(setup.hub.control.port)  # e.g. a session recorded before the upgrade
+    await ch.send("hello", **_hello(protocol="1.1", node_id=agent.state.node_id, name="desk"))
+    assert (await asyncio.wait_for(ch.recv(), 3))["code"] == "protocol"
+    await ch.close()
+    assert setup.node().status == "lending" and setup.node().connected
+
+
+async def test_agent_explains_a_protocol1_hub(tmp_path, hub_key):
+    async def old_hub(reader, writer):  # sends the bare PEM key, as protocol 1 did
+        writer.write(frame_bytes(rsa_public_key_to_pem(hub_key)))
+        await writer.drain()
+        await reader.read()
+
+    server = await asyncio.start_server(old_hub, "127.0.0.1", 0)
+    try:
+        cfg = AgentConfig(config_dir=tmp_path / "a")
+        cfg.llamacpp.auto_install = False
+        agent = AgentClient(cfg, TOKEN, "127.0.0.1", server.sockets[0].getsockname()[1], telemetry=FakeTelemetry())
+        task = asyncio.ensure_future(agent.run())
+        assert await until(lambda: "update OllamaPower on the hub" in agent.state.error)
+        assert agent.state.connection != "connected"
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    finally:
+        server.close()
 
 
 async def test_big_frame_before_auth_is_refused(setup):

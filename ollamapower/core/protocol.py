@@ -9,6 +9,8 @@ Rules:
 
 * ``PROTOCOL_VERSION`` is ``"MAJOR.MINOR"``. Peers with different majors
   refuse each other with a clear message; minors only add optional fields.
+  Major 2 changed the handshake (a hub nonce in the session key, see
+  ``encrypt_layer``); the messages themselves are those of 1.1.
 * A message of the wrong direction, of an unknown type, missing a required
   field or with a field of the wrong type is a ``ProtocolError`` - the
   connection is dropped. Unknown *fields* are dropped silently (a newer minor
@@ -24,7 +26,7 @@ from typing import Any
 
 from .packets import MAX_DECOMPRESSED_BYTES, PACKET_FLAGS, PayloadKind, TaskPacket
 
-PROTOCOL_VERSION = "1.1"
+PROTOCOL_VERSION = "2.0"
 MAX_STRING = 4096
 MAX_TOKEN = 512
 
@@ -51,6 +53,11 @@ def protocol_minor(version: str) -> int:
         return int(str(version).split(".", 1)[1])
     except (IndexError, ValueError):
         return -1
+
+
+def at_least(version: str, major: int, minor: int) -> bool:
+    """Is ``version`` ``major.minor`` or newer?"""
+    return (protocol_major(version), protocol_minor(version)) >= (major, minor)
 
 
 def compatible(version: str) -> bool:

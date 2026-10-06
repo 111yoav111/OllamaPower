@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 
@@ -159,6 +160,91 @@ async def test_handshake_agrees_on_key_and_reports_fingerprint():
     assert node.aes_key == hub.aes_key
     assert node.peer_fingerprint == e.public_key_fingerprint(hub_key.public_key())
     assert len(node.peer_fingerprint) == 64
+
+
+class _Sink:
+    def write(self, data):
+        pass
+
+    async def drain(self):
+        pass
+
+
+async def _handshake_pair(hub_key) -> tuple[e.SessionCrypto, e.SessionCrypto]:
+    done: asyncio.Future[e.SessionCrypto] = asyncio.get_running_loop().create_future()
+
+    async def on_connect(reader, writer):
+        done.set_result(await e.SessionCrypto.hub_handshake(reader, writer, hub_key))
+        writer.close()
+
+    server = await asyncio.start_server(on_connect, "127.0.0.1", 0)
+    async with server:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+        node = await e.SessionCrypto.node_handshake(reader, writer)
+        hub = await asyncio.wait_for(done, 5)
+        writer.close()
+    return hub, node
+
+
+async def test_every_handshake_gets_a_fresh_derived_key():
+    hub_key = e.generate_rsa_keypair()
+    keys = set()
+    for _ in range(3):
+        hub, node = await _handshake_pair(hub_key)
+        assert hub.aes_key == node.aes_key and not hub.legacy
+        keys.add(hub.aes_key)
+    assert len(keys) == 3
+
+
+def test_session_key_depends_on_every_input():
+    fp = "ab" * 32
+    secret, a, b = b"s" * 32, b"a" * 32, b"b" * 32
+    base = e.derive_session_key(secret, a, b, fp)
+    assert len(base) == e.AES_KEY_SIZE and base != secret
+    assert e.derive_session_key(secret, a, b, fp) == base
+    assert base not in {
+        e.derive_session_key(b"t" * 32, a, b, fp),
+        e.derive_session_key(secret, b"c" * 32, b, fp),
+        e.derive_session_key(secret, a, b"c" * 32, fp),
+        e.derive_session_key(secret, b, a, fp),
+        e.derive_session_key(secret, a, b, "cd" * 32),
+    }
+    with pytest.raises(e.CryptoError):
+        e.derive_session_key(secret, a[:16], b, fp)
+
+
+async def test_replayed_node_handshake_gets_a_different_key():
+    """The hub nonce makes the same RSA blob yield a new key on every connection."""
+    hub_key = e.generate_rsa_keypair()
+    secret, node_nonce = os.urandom(32), os.urandom(32)
+    blob = e.NODE_TAG + node_nonce + e.rsa_encrypt_aes_key(hub_key.public_key(), secret)
+    keys = []
+    for _ in range(2):
+        session = await e.SessionCrypto.hub_handshake(_reader(e.frame_bytes(blob)), _Sink(), hub_key)  # type: ignore[arg-type]
+        keys.append(session.aes_key)
+    assert keys[0] != keys[1] and secret not in keys
+
+
+async def test_node_refuses_a_protocol1_hub_and_garbage():
+    pem = e.rsa_public_key_to_pem(e.generate_rsa_keypair())
+    with pytest.raises(e.HandshakeVersionError, match="update OllamaPower on the hub"):
+        await e.SessionCrypto.node_handshake(_reader(e.frame_bytes(pem)), _Sink())  # type: ignore[arg-type]
+    with pytest.raises(e.CryptoError):
+        await e.SessionCrypto.node_handshake(_reader(e.frame_bytes(b"x" * 100)), _Sink())  # type: ignore[arg-type]
+
+
+async def test_hub_refuses_an_unrecognised_reply():
+    hub_key = e.generate_rsa_keypair()
+    with pytest.raises(e.CryptoError, match="unrecognised"):
+        await e.SessionCrypto.hub_handshake(_reader(e.frame_bytes(b"z" * 100)), _Sink(), hub_key)  # type: ignore[arg-type]
+
+
+def test_protocol1_agents_can_still_read_the_hub_key():
+    """A protocol-1 agent parses the hub's first blob as PEM; the nonce after the key must not break that."""
+    key = e.generate_rsa_keypair()
+    blob = e.rsa_public_key_to_pem(key) + e.HUB_NONCE_TAG + os.urandom(e.HANDSHAKE_NONCE_SIZE)
+    parsed = e.rsa_key_from_pem(blob)
+    assert e.public_key_fingerprint(parsed) == e.public_key_fingerprint(key.public_key())
 
 
 async def test_handshake_rejects_oversized_key_frame():

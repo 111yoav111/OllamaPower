@@ -5,10 +5,12 @@ A connection goes through, in order:
 1. **Network allowlist** (``control.allowed_networks``, private ranges by
    default) and the **ban list** - dropped before any byte is read.
 2. **RSA handshake** with the hub's persistent key (agents pin its
-   fingerprint, so a man in the middle can't pose as the hub).
+   fingerprint, so a man in the middle can't pose as the hub) and a fresh
+   hub nonce in the session key, so a recorded session can't be replayed.
 3. **hello** inside the encrypted session, with frames capped at 64 KB: the
    token is checked in constant time, then the protocol major version.
-   Failures count towards a temporary ban of that IP.
+   Failures count towards a temporary ban of that IP. A protocol-1 agent
+   (old handshake, no hub nonce) is only ever told to update.
 4. **welcome**, then the session: capabilities, heartbeats every 2 s, lend
    state, network tests. A node silent for ``heartbeat_timeout`` is dropped.
 
@@ -245,13 +247,16 @@ class ControlServer:
             self._fail(ip, "bad token")
             await self._reject(channel, "bad_token", "wrong cluster token (copy OLLAMAPOWER_TOKEN from the hub)")
             return None
-        self.bans.succeeded(ip)
-        if not protocol.compatible(hello["protocol"]):
+        legacy = channel.crypto.legacy
+        if legacy or not protocol.compatible(hello["protocol"]):
             reason = (
                 f"protocol {hello['protocol']} doesn't match the hub's {protocol.PROTOCOL_VERSION}: "
                 f"install OllamaPower {__version__} on this helper"
             )
-            self.registry.mark_incompatible(hello, ip, reason)
+            known = self.registry.nodes.get(hello["node_id"])
+            # A protocol-1 session can be a replay of one recorded earlier: it may not touch a live helper.
+            if not (legacy and known is not None and known.connected):
+                self.registry.mark_incompatible(hello, ip, reason)
             await self._reject(channel, "protocol", reason)
             return None
         known = self.registry.nodes.get(hello["node_id"])
@@ -259,6 +264,7 @@ class ControlServer:
             await self._reject(channel, "full", f"the hub already has {self.config.max_nodes} helpers")
             return None
         node, replaced = self.registry.attach(hello, ip, channel)
+        self.bans.succeeded(ip)  # only a real login (never a protocol-1 session) clears the count
         if replaced is not None:
             self._spawn(replaced.close("replaced by a new connection"))
         channel.limit_frames(MAX_FRAME)
