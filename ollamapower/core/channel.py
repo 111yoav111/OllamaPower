@@ -77,16 +77,20 @@ class Channel:
         if self.closed:
             return
         self.closed = True
-        if reason is not None:
-            with contextlib.suppress(Exception):
-                await wait_for(self.send("bye", reason=reason[: protocol.MAX_STRING]), 2)
-                # Half-close and give the peer a moment to read the bye and hang up: closing
-                # at once can turn its next write into a reset that discards the bye unread.
-                if self.writer.can_write_eof():
-                    self.writer.write_eof()
-                deadline = asyncio.get_running_loop().time() + BYE_GRACE
-                while not self.reader.at_eof() and asyncio.get_running_loop().time() < deadline:
-                    await asyncio.sleep(0.02)
-        self.writer.close()
+        try:
+            if reason is not None:
+                with contextlib.suppress(Exception):
+                    await wait_for(self.send("bye", reason=reason[: protocol.MAX_STRING]), 2)
+                    # Half-close and give the peer a moment to read the bye and hang up: closing
+                    # at once can turn its next write into a reset that discards the bye unread.
+                    if self.writer.can_write_eof():
+                        self.writer.write_eof()
+                    deadline = asyncio.get_running_loop().time() + BYE_GRACE
+                    while not self.reader.at_eof() and asyncio.get_running_loop().time() < deadline:
+                        await asyncio.sleep(0.02)
+        finally:
+            # Also when cancelled during the goodbye: ``closed`` is already set, so a later
+            # close() returns at once and nothing else would close the socket.
+            self.writer.close()
         with contextlib.suppress(Exception):
             await wait_for(self.writer.wait_closed(), 2)

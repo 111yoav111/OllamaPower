@@ -405,6 +405,21 @@ async def test_reconnect_replaces_the_old_connection(setup):
     await second.close()
 
 
+async def test_a_close_cancelled_during_its_goodbye_still_closes_the_socket(setup):
+    peer = await _raw_connect(setup.hub.control.port)
+    await peer.send("hello", **_hello())
+    assert (await peer.recv())["type"] == "welcome"
+    channel = setup.node("raw").channel
+    # The peer doesn't hang up after the bye, so close() waits; the hub shutting down
+    # cancels that wait (ControlServer.close cancels its pending close tasks).
+    closing = asyncio.ensure_future(channel.close("hub shutting down"))
+    await asyncio.sleep(0.1)
+    closing.cancel()
+    await asyncio.gather(closing, return_exceptions=True)
+    assert channel.writer.is_closing()  # was left open: closed=True, so nobody closed it after
+    await peer.close()
+
+
 async def test_pause_resume_and_hub_pause(setup):
     agent = setup.agent()
     setup.run(agent)
