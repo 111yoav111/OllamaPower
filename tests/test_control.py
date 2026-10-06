@@ -705,3 +705,23 @@ def test_control_socket_is_dual_stack():
                 c.connect((host, port))
     finally:
         sock.close()
+
+
+async def test_reconnect_fails_what_waited_on_the_old_connection(setup):
+    from ollamapower.hub.engines.split import SplitUnavailable
+
+    first = await _raw_connect(setup.hub.control.port)
+    await first.send("hello", **_hello())
+    assert (await first.recv())["type"] == "welcome"
+    node = setup.node("raw")
+    bench = asyncio.ensure_future(setup.hub.split.bench(node, "direct"))
+    assert (await first.recv())["type"] == "rpc_start"
+    # The helper reconnects (its old socket half-open): it stopped everything it had
+    # started on the old connection, so nothing may keep waiting for an answer there.
+    second = await _raw_connect(setup.hub.control.port)
+    await second.send("hello", **_hello())
+    assert (await second.recv())["type"] == "welcome"
+    with pytest.raises(SplitUnavailable, match="disconnected"):
+        await asyncio.wait_for(bench, 3)
+    await first.close()
+    await second.close()

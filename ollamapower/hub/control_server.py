@@ -147,8 +147,8 @@ class ControlServer:
             for node in self.registry.timed_out():
                 log.warning("node %s (%s) missed its heartbeats", node.name, node.node_id[:8])
                 channel = node.channel
-                self.registry.detach(node, channel, "heartbeat timeout")  # type: ignore[arg-type]
                 if channel is not None:
+                    self._gone(node, channel, "heartbeat timeout")
                     self._spawn(channel.close("heartbeat timeout"))
 
     # ----- connections ---------------------------------------------------------------------
@@ -266,6 +266,11 @@ class ControlServer:
         node, replaced = self.registry.attach(hello, ip, channel)
         self.bans.succeeded(ip)  # only a real login (never a protocol-1 session) clears the count
         if replaced is not None:
+            # The helper ended everything it had started over the old connection when it
+            # lost it: split mode must not keep waiting there (on_rpc fires before the new
+            # connection can carry anything, so it can't fail a request made over that one).
+            if self.on_rpc is not None:
+                self.on_rpc(node, None)
             self._spawn(replaced.close("replaced by a new connection"))
         channel.limit_frames(MAX_FRAME)
         await channel.send(
@@ -300,9 +305,15 @@ class ControlServer:
             log.exception("unexpected error in the session with %s", node.name)
             reason = "internal error"
         finally:
-            self.registry.detach(node, channel, reason)
-            if self.on_rpc is not None and not node.connected:
-                self.on_rpc(node, None)  # gone: any split session using it is broken
+            self._gone(node, channel, reason)
+
+    def _gone(self, node: Node, channel: Channel, reason: str) -> None:
+        """``channel`` stopped being ``node``'s connection (unless a newer one replaced it already)."""
+        if node.channel is not channel:
+            return  # replaced: _admit has told split mode
+        self.registry.detach(node, channel, reason)
+        if self.on_rpc is not None:
+            self.on_rpc(node, None)  # gone: any split session using it is broken
 
     async def _on_message(self, node: Node, channel: Channel, m: dict[str, Any]) -> None:
         kind = m["type"]
@@ -420,6 +431,6 @@ class ControlServer:
         channel = node.channel
         if channel is None:
             raise ValueError(f"{node.name} is not connected")
-        self.registry.detach(node, channel, "kicked")
+        self._gone(node, channel, "kicked")
         self.emit("node_kicked", node=node.node_id, name=node.name)
         await channel.close("kicked by the hub owner")
