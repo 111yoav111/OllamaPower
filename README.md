@@ -202,7 +202,8 @@ ollamapower agent status [--json] [--watch]
 ollamapower agent pause | resume
 ollamapower agent rules --max-vram-gb 8 --gpus 0
 ollamapower agent net-test
-ollamapower agent forget-hub          # only after you replaced the hub's key yourself
+ollamapower agent forget-hub [--hub 192.168.1.10[:9000] | --hub [fd00::1]:9000]
+                                      # only after you replaced the hub's key yourself (default: all)
 ```
 
 ### Managing helpers from the hub

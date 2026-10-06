@@ -25,7 +25,7 @@ def test_parse_hub_address():
     assert parse_hub_address("[fd00::1]:9100", 9000) == ("fd00::1", 9100)
     assert parse_hub_address("fd00::1", 9000) == ("fd00::1", 9000)
     assert parse_hub_address("hub.lan", 9000) == ("hub.lan", 9000)
-    for bad in ("", ":9000", "host:http", "host:70000"):
+    for bad in ("", ":9000", "host:http", "host:70000", "host:", "[fd00::1", "[fd00::1]x", "[fd00::1]:", "h:١٢"):
         with pytest.raises(typer.BadParameter):
             parse_hub_address(bad, 9000)
 

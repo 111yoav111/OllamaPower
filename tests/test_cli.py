@@ -77,6 +77,50 @@ def test_init_replaces_a_weak_token_in_the_file(cfg_env):
     assert len(read_env_file(cfg_env / ".env")[TOKEN_ENV]) > 40
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["nodes", "tunnel", "desk", "plaintext", "--yes"],
+        ["models", "pin", "llama3:8b", "fast"],
+        ["models", "pin", "llama3:8b", "split", "--ctx", "10"],
+        ["models", "benchmark", "llama3:8b", "--ctx", "99999999"],
+        ["models", "plan", "llama3:8b", "--split", "--ctx", "-1"],
+        ["models", "plan", "llama3:8b"],
+        ["logs", "--limit", "0"],
+        ["logs", "--file", "bogus"],
+        ["llamacpp", "install", "--backend", "gpu"],
+        ["agent", "rules", "--max-vram-percent", "150"],
+        ["agent", "rules", "--schedule", "late"],
+        ["agent", "rules", "--gpus", "a,b"],
+        ["agent", "--no-tui", "--allow-root", "--hub", "[fd00::1"],
+        ["agent", "forget-hub", "--hub", "10.0.0.1:99999", "--yes"],
+    ],
+)
+def test_usage_errors_exit_2(cfg_env, args):
+    # None of these reach a running hub or agent (none runs): the arguments are refused first.
+    result = run(*args)
+    assert result.exit_code == 2, result.output
+
+
+def test_forget_hub_parses_the_address_like_agent_hub(cfg_env):
+    from ollamapower.agent.pinning import KnownHubs
+
+    known = KnownHubs(cfg_env / "known_hub")
+    known.pin("fd00::1:9000", "ab" * 32)
+    known.pin("192.168.1.10:9000", "cd" * 32)
+    known.pin("192.168.1.10:9100", "ef" * 32)
+
+    missing = run("agent", "forget-hub", "--hub", "192.168.1.11", "--yes")
+    assert missing.exit_code == 1 and "No pinned key for 192.168.1.11:9000" in missing.output
+    assert len(known.entries()) == 3
+
+    assert "Forgot 1" in run("agent", "forget-hub", "--hub", "[fd00::1]:9000", "--yes").output
+    by_dir = run("agent", "forget-hub", "--config-dir", str(cfg_env), "--hub", "192.168.1.10", "--yes")
+    assert "Forgot 1" in by_dir.output
+    assert known.entries() == ["192.168.1.10:9100"]  # the default port (9000) was meant, not this one
+    assert "Forgot 1" in run("agent", "forget-hub", "--yes").output and known.entries() == []
+
+
 def test_status_when_not_running(cfg_env):
     result = run("status")
     assert result.exit_code == 3 and "not running" in result.output

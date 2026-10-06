@@ -68,20 +68,27 @@ def _load_agent(config_dir: Path) -> Any:
 def parse_hub_address(value: str, default_port: int) -> tuple[str, int]:
     """``192.168.1.10``, ``192.168.1.10:9000``, ``[fd00::1]:9000`` or ``hub.lan``."""
     value = value.strip()
+    port: str | None = None
     if value.startswith("["):
-        host, _, rest = value[1:].partition("]")
-        port = rest.removeprefix(":")
+        host, closed, rest = value[1:].partition("]")
+        if not closed:
+            raise typer.BadParameter(f"{value!r}: an IPv6 address needs its closing ']'")
+        if rest and not rest.startswith(":"):
+            raise typer.BadParameter(f"{value!r}: expected [address]:port")
+        port = rest[1:] if rest else None
     elif value.count(":") == 1:
         host, _, port = value.partition(":")
     else:
-        host, port = value, ""
+        host = value  # a name, an IPv4 address or a bare IPv6 address
     if not host:
         raise typer.BadParameter("missing host")
-    if port:
-        if not port.isdigit() or not 1 <= int(port) <= 65535:
-            raise typer.BadParameter(f"bad port {port!r}")
-        return host, int(port)
-    return host, default_port
+    if "[" in host or "]" in host or any(ch.isspace() for ch in host):
+        raise typer.BadParameter(f"bad host {host!r}")
+    if port is None:
+        return host, default_port
+    if not (port.isascii() and port.isdigit()) or not 1 <= int(port) <= 65535:
+        raise typer.BadParameter(f"bad port {port!r} (1-65535)")
+    return host, int(port)
 
 
 @agent_cli.callback(invoke_without_command=True)
@@ -334,6 +341,12 @@ def agent_rules(
         changes["gpus"] = [int(p) for p in parts]
     if schedule is not None:
         changes["schedule"] = [w.strip() for w in schedule.split(",") if w.strip()]
+    from .config import LendingRules
+
+    try:  # a bad value is a usage error (exit 2), caught before the running agent is asked
+        LendingRules(**changes).validate()
+    except ConfigError as exc:
+        raise typer.BadParameter(str(exc)) from None
     d = _config_dir(config_dir)
     rules = (
         call(d, "agent.rules", name=RUN_DIR, **changes) if changes else call(d, "agent.status", name=RUN_DIR)["lending"]
@@ -344,15 +357,24 @@ def agent_rules(
 
 @agent_cli.command("forget-hub")
 def agent_forget_hub(
-    hub: str = typer.Option("", "--hub", help="ip:port to forget (default: all)"),
+    hub: str = typer.Option(
+        "", "--hub", help="The hub to forget: ip[:port] or [ipv6]:port, as given to --hub (default: all)"
+    ),
     config_dir: Path | None = ConfigDirOption,
-    yes: bool = typer.Option(False, "--yes", "-y"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation"),
 ) -> None:
     """Forget a pinned hub key (only after you replaced the hub's key yourself)."""
-    from .pinning import KnownHubs
+    from .pinning import KnownHubs, hub_entry
 
     cfg = _load_agent(_config_dir(config_dir))
+    entry = hub_entry(*parse_hub_address(hub, cfg.hub.port)) if hub else None
+    known = KnownHubs(cfg.known_hub_path)
+    if entry is not None and known.get(entry) is None:
+        pinned = ", ".join(sorted(known.entries())) or "none"
+        typer.secho(f"No pinned key for {entry} (pinned: {pinned}).", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
     if not yes:
-        typer.confirm("Forget the pinned hub key? The next connection will ask you to trust it again.", abort=True)
-    removed = KnownHubs(cfg.known_hub_path).forget(hub or None)
+        what = f"the pinned key of {entry}" if entry else "every pinned hub key"
+        typer.confirm(f"Forget {what}? The next connection will ask you to trust it again.", abort=True)
+    removed = known.forget(entry)
     typer.echo(f"Forgot {removed} pinned hub key(s).")

@@ -41,7 +41,7 @@ from ..telemetry import Telemetry, network_info
 from ..textsafe import safe_text
 from .config import AgentConfig, LendingRules, load_agent_config, save_agent_config
 from .lending import TUNNEL_QUIET, LendingGuard
-from .pinning import KnownHubs, format_fingerprint, normalize_fingerprint
+from .pinning import KnownHubs, format_fingerprint, hub_entry, normalize_fingerprint
 from .rpc_manager import RpcManager, RpcRefused
 
 log = logging.getLogger("ollamapower.agent")
@@ -129,7 +129,7 @@ class AgentClient:
 
     @property
     def hub_key(self) -> str:
-        return f"{self.address}:{self.port}"
+        return hub_entry(self.address, self.port)
 
     # ----- main loop -------------------------------------------------------------------
 

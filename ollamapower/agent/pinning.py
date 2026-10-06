@@ -16,6 +16,11 @@ from pathlib import Path
 from ..files import write_private
 
 
+def hub_entry(host: str, port: int) -> str:
+    """The ``known_hub`` key for a hub. IPv6 hosts are stored unbracketed (``fd00::1:9000``), as always."""
+    return f"{host}:{port}"
+
+
 def normalize_fingerprint(value: str) -> str:
     """Accept ``AB:CD:...``, spaces or plain hex; return lower-case hex."""
     return "".join(ch for ch in value.lower() if ch in "0123456789abcdef")
@@ -58,6 +63,10 @@ class KnownHubs:
 
     def get(self, address: str) -> str | None:
         return self._read().get(address)
+
+    def entries(self) -> list[str]:
+        """The pinned hub addresses."""
+        return list(self._read())
 
     def pin(self, address: str, fingerprint: str) -> None:
         entries = self._read()

@@ -48,6 +48,14 @@ cli.add_typer(token_cli, name="token")
 cli.add_typer(llamacpp_cli, name="llamacpp")
 
 STATUS_ICON = {"lending": "🟢", "paused": "🟡", "yielding": "🟡", "offline": "🔴", "incompatible": "⚠ "}
+# --ctx bounds, the same the hub enforces: a bad value is a usage error (exit 2), not a failed command.
+MIN_CTX, MAX_CTX = 256, 1 << 20
+
+
+def _one_of(value: str, allowed: tuple[str, ...], what: str) -> None:
+    """Reject a bad argument as a usage error (exit 2) before anything is asked or sent."""
+    if value not in allowed:
+        raise typer.BadParameter(f"{what} must be {' or '.join(allowed)}, not {value!r}")
 
 
 @cli.callback()
@@ -576,6 +584,7 @@ def nodes_tunnel(
     yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation"),
 ) -> None:
     """Choose how split-mode traffic to a helper travels: secure (TLS, default) or direct."""
+    _one_of(mode, ("secure", "direct"), "mode")
     if mode == "direct" and not yes:
         typer.secho(
             "Direct mode sends split-mode traffic (weights, activations) UNENCRYPTED over your LAN. Only use it on a "
@@ -694,7 +703,9 @@ def models_show(
 @models_cli.command("benchmark")
 def models_benchmark(
     model: str,
-    ctx: int | None = typer.Option(None, "--ctx", help="Context size (default: the plan's, else split.default_ctx)"),
+    ctx: int | None = typer.Option(
+        None, "--ctx", min=MIN_CTX, max=MAX_CTX, help="Context size (default: the plan's, else split.default_ctx)"
+    ),
     config_path: Path | None = ConfigOption,
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
@@ -771,10 +782,11 @@ def models_benchmarks(
 def models_pin(
     model: str,
     engine: str = typer.Argument(..., help="split or local"),
-    ctx: int | None = typer.Option(None, "--ctx", help="Context size for split mode"),
+    ctx: int | None = typer.Option(None, "--ctx", min=MIN_CTX, max=MAX_CTX, help="Context size for split mode"),
     config_path: Path | None = ConfigOption,
 ) -> None:
     """Always use one engine for a model (overrides the benchmark; `unpin` goes back to automatic)."""
+    _one_of(engine, ("split", "local"), "engine")
     config = load(config_path)
     d = call(config.config_dir, "models.pin", model=model, engine=engine, ctx=ctx, timeout=_split_wait(config))
     typer.echo(f"{safe(d['model'])}: pinned to {engine} - now served by {d['engine']}.")
@@ -812,7 +824,9 @@ def models_exclude(
 def models_plan(
     model: str = typer.Argument(..., help="An installed Ollama model, e.g. llama3.1:70b"),
     split: bool = typer.Option(False, "--split", help="Run it in split mode across helper GPUs"),
-    ctx: int | None = typer.Option(None, "--ctx", help="Context size for split mode (default: split.default_ctx)"),
+    ctx: int | None = typer.Option(
+        None, "--ctx", min=MIN_CTX, max=MAX_CTX, help="Context size for split mode (default: split.default_ctx)"
+    ),
     config_path: Path | None = ConfigOption,
     as_json: bool = typer.Option(False, "--json", help="Print JSON"),
 ) -> None:
@@ -966,7 +980,7 @@ def logs(
     follow: bool = typer.Option(False, "--follow", "-f", help="Keep printing new entries"),
     kind: list[str] = typer.Option([], "--kind", "-k", help="Only these kinds (repeatable), e.g. request, node_join"),
     which: str = typer.Option("all", "--file", help="events, requests or all"),
-    limit: int = typer.Option(50, "--limit", "-n", help="How many recent entries to show"),
+    limit: int = typer.Option(50, "--limit", "-n", min=1, help="How many recent entries to show"),
     as_json: bool = typer.Option(False, "--json", help="Print raw JSON lines"),
 ) -> None:
     """Show the event and request logs (metadata only, never prompts or responses)."""
