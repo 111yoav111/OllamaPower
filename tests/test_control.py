@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import sys
 import time
 from typing import Any
 
@@ -184,8 +185,11 @@ async def test_wrong_token_stops_and_repeat_offenders_are_banned(tmp_path, hub_k
     await s.start()
     try:
         for _ in range(3):
+            bad = s.agent(token=new_token())
+            # Known key: no hang-up to ask the owner first, which would count as a (quiet) failure too.
+            bad.config.hub.fingerprint = public_key_fingerprint(hub_key.public_key())
             with pytest.raises(AgentStopped, match="wrong cluster token"):
-                await asyncio.wait_for(s.agent(token=new_token()).run(), 5)
+                await asyncio.wait_for(bad.run(), 5)
         assert "127.0.0.1" in s.hub.control.bans.active()
         assert any(e["kind"] == "ip_banned" for e in s.hub.recent_events)
         # Even the right token is turned away while banned (closed before the handshake).
@@ -198,8 +202,8 @@ async def test_wrong_token_stops_and_repeat_offenders_are_banned(tmp_path, hub_k
         await s.close()
 
 
-async def _raw_connect(port: int, hub_fp: str | None = None) -> Channel:
-    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+async def _raw_connect(port: int, hub_fp: str | None = None, source: str = "127.0.0.1") -> Channel:
+    reader, writer = await asyncio.open_connection("127.0.0.1", port, local_addr=(source, 0))
     crypto = await SessionCrypto.node_handshake(reader, writer)
     return Channel(reader, writer, crypto)
 
@@ -461,6 +465,101 @@ async def test_saving_rules_keeps_one_off_overrides_out_of_agent_toml(setup):
     cfg.agent.name = 'line\nbreak "quoted"'
     save_agent_config(cfg)
     assert load_agent_config(setup.tmp / "toml").agent.name == 'line\nbreak "quoted"'
+
+
+async def _stall(port: int, source: str = "127.0.0.1") -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """A peer that connects and then never answers the hub's key."""
+    return await asyncio.open_connection("127.0.0.1", port, local_addr=(source, 0))
+
+
+async def _closed_at_once(reader: asyncio.StreamReader) -> bool:
+    """Did the hub hang up without sending anything (not even its key)?"""
+    try:
+        return await asyncio.wait_for(reader.read(), 2) == b""
+    except ConnectionResetError:
+        return True
+
+
+async def test_one_ip_cannot_hold_every_handshake_slot(tmp_path, hub_key):
+    s = Setup(tmp_path, hub_key, max_pending_per_ip=2, ban_failures=100, handshake_timeout=5.0)
+    port = await s.start()
+    try:
+        stalled = [await _stall(port) for _ in range(2)]
+        assert await until(lambda: s.hub.control._pending == 2)
+        reader, writer = await _stall(port)
+        assert await _closed_at_once(reader)  # over the per-IP limit: dropped before any work
+        writer.close()
+        assert await until(lambda: any(e["kind"] == "auth_failed" for e in s.hub.recent_events))
+        if sys.platform.startswith("linux"):  # all of 127/8 is local there: a second source address
+            ch = await _raw_connect(port, source="127.0.0.2")
+            await ch.send("hello", **_hello())
+            assert (await asyncio.wait_for(ch.recv(), 3))["type"] == "welcome"
+            await ch.close()
+        for _, w in stalled:
+            w.close()
+        assert await until(lambda: s.hub.control._pending == 0 and not s.hub.control._pending_by_ip)
+        agent = s.agent()
+        s.run(agent)
+        assert await until(lambda: agent.state.connection == "connected")
+    finally:
+        await s.close()
+
+
+async def test_abandoned_and_timed_out_handshakes_count_towards_a_ban(tmp_path, hub_key):
+    s = Setup(tmp_path, hub_key, ban_failures=3, handshake_timeout=0.3)
+    port = await s.start()
+    try:
+        for _ in range(2):  # connect and hang up: no token was ever tried
+            _, writer = await _stall(port)
+            writer.close()
+            await asyncio.sleep(0.05)
+        assert await until(lambda: s.hub.control._pending == 0)
+        assert not s.hub.control.bans.active()
+        assert not any(e["kind"] == "auth_failed" for e in s.hub.recent_events)  # quiet, but counted
+        reader, writer = await _stall(port)  # hold the slot past the deadline
+        assert await until(lambda: "127.0.0.1" in s.hub.control.bans.active(), 3)
+        writer.close()
+        reader, writer = await _stall(port)
+        assert await _closed_at_once(reader)  # banned: dropped before the handshake
+        writer.close()
+    finally:
+        await s.close()
+
+
+async def test_a_successful_login_clears_abandoned_handshakes(tmp_path, hub_key):
+    s = Setup(tmp_path, hub_key, ban_failures=2)
+    port = await s.start()
+    try:
+        _, writer = await _stall(port)
+        writer.close()
+        assert await until(lambda: s.hub.control._pending == 0)
+        agent = s.agent()
+        agent.config.hub.fingerprint = public_key_fingerprint(hub_key.public_key())
+        task = s.run(agent)
+        assert await until(lambda: agent.state.connection == "connected")
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        _, writer = await _stall(port)  # without the reset this would be the second failure
+        writer.close()
+        assert await until(lambda: s.hub.control._pending == 0)
+        await asyncio.sleep(0.1)
+        assert not s.hub.control.bans.active()
+    finally:
+        await s.close()
+
+
+def test_success_forgets_failures_but_not_bans():
+    from ollamapower.hub.bans import BanList
+
+    bans = BanList(failures=2, window=60, ban_seconds=10, max_seconds=100)
+    bans.fail("10.0.0.1", now=0)
+    bans.succeeded("10.0.0.1", now=1)
+    assert bans.fail("10.0.0.1", now=2) is None  # the count started again
+    assert bans.fail("10.0.0.1", now=3) == 10
+    bans.succeeded("10.0.0.1", now=4)
+    assert bans.banned("10.0.0.1", now=5)  # an active ban stays
+    bans.fail("10.0.0.1", now=20)
+    assert bans.fail("10.0.0.1", now=21) == 20  # and so does the repeat-offence doubling
 
 
 def test_active_bans_survive_a_full_table():

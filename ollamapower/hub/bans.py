@@ -2,6 +2,8 @@
 
 ``failures`` failed attempts from one IP within ``window`` seconds ban it for
 ``ban_seconds``; every repeat offence doubles the ban, up to ``max_seconds``.
+A successful login forgets that IP's recent failures (not its ban history), so
+a helper that sometimes hangs up mid-handshake never piles up towards a ban.
 """
 
 from __future__ import annotations
@@ -50,6 +52,15 @@ class BanList:
         record.strikes += 1
         record.banned_until = now + seconds
         return seconds
+
+    def succeeded(self, ip: str, now: float | None = None) -> None:
+        """A login from ``ip`` succeeded: forget its recent failures (an active ban stays)."""
+        record = self._records.get(ip)
+        if record is None:
+            return
+        record.failures.clear()
+        if record.strikes == 0 and record.banned_until <= (time.monotonic() if now is None else now):
+            del self._records[ip]
 
     def active(self, now: float | None = None) -> dict[str, float]:
         """IP -> seconds left, for status views."""

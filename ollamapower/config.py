@@ -87,8 +87,11 @@ class ControlConfig:
     allowed_networks: list[str] = field(default_factory=lambda: list(DEFAULT_AGENT_NETWORKS))
     # An agent silent for this long is treated as gone (it beats every 2 s).
     heartbeat_timeout: float = 10.0
+    # Everything before the token is checked (RSA exchange + hello) must finish in this many seconds.
     handshake_timeout: float = 10.0
     max_nodes: int = 32
+    # Unfinished handshakes one IP may hold open at once (a helper needs one).
+    max_pending_per_ip: int = 4
     # Failed logins from one IP within ban_window seconds -> banned, doubling on repeat.
     ban_failures: int = 5
     ban_window: int = 600
@@ -205,6 +208,8 @@ class Config:
                 raise ConfigError(f"control.{name} must be a positive number")
         if c.max_nodes < 1 or c.ban_failures < 1 or c.ban_window < 1 or c.ban_seconds < 1:
             raise ConfigError("control.max_nodes, ban_failures, ban_window and ban_seconds must be positive")
+        if c.max_pending_per_ip < 1:
+            raise ConfigError("control.max_pending_per_ip must be positive")
         if c.max_ban_seconds < c.ban_seconds:
             raise ConfigError("control.max_ban_seconds must be at least control.ban_seconds")
         if c.enabled and not c.allowed_networks:

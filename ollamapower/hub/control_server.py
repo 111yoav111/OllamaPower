@@ -12,9 +12,17 @@ A connection goes through, in order:
 4. **welcome**, then the session: capabilities, heartbeats every 2 s, lend
    state, network tests. A node silent for ``heartbeat_timeout`` is dropped.
 
-The handshake must finish within ``handshake_timeout``. A second connection
-from the same node id replaces the first (an agent reconnecting after a
-network glitch while its old socket is still half-open).
+Everything before the token is checked (RSA exchange and hello) must finish
+within ``handshake_timeout`` of the connection being accepted. Unauthenticated
+peers can't hold the hub's handshake slots: at most ``max_nodes`` handshakes
+run at once, and at most ``max_pending_per_ip`` of them from one IP. A
+handshake that times out, goes over the per-IP limit or is abandoned before
+the hello counts as a failed login towards the ban; a successful login clears
+that IP's count, so a helper that once hung up to ask its owner about the
+hub's key (or was stopped mid-handshake) isn't penalised.
+
+A second connection from the same node id replaces the first (an agent
+reconnecting after a network glitch while its old socket is still half-open).
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ NET_TEST_PINGS = 10
 NET_TEST_CHUNKS = 8
 NET_TEST_CHUNK_BYTES = 1024 * 1024
 NET_TEST_TIMEOUT = 30.0
+REJECT_TIMEOUT = 2.0  # a peer that doesn't read our reject doesn't get to hold the connection
 
 
 class NetTestError(Exception):
@@ -88,6 +97,7 @@ class ControlServer:
         self._tests: dict[str, _NetTest] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         self._pending = 0
+        self._pending_by_ip: dict[str, int] = {}
         # Split mode's handler for rpc_ready/rpc_error; called with None when a helper leaves.
         self.on_rpc: Callable[[Node, dict[str, Any] | None], None] | None = None
         # Split mode's handler for a helper that stopped (or started again) lending.
@@ -150,8 +160,12 @@ class ControlServer:
             addr = addr.ipv4_mapped
         return any(addr in net for net in self.networks)
 
-    def _fail(self, ip: str, reason: str) -> None:
-        self.emit("auth_failed", ip=ip, reason=reason)
+    def _fail(self, ip: str, reason: str, alert: bool = True) -> None:
+        """Count a failed login from ``ip``; ``alert=False`` for the quiet kind (an abandoned handshake)."""
+        if alert:
+            self.emit("auth_failed", ip=ip, reason=reason)
+        else:
+            log.debug("counted a failure for %s: %s", ip, reason)
         banned_for = self.bans.fail(ip)
         if banned_for is not None:
             log.warning("banned %s for %d s after repeated failed logins", ip, banned_for)
@@ -163,7 +177,12 @@ class ControlServer:
         if not self.allowed(ip) or self.bans.banned(ip) or self._pending >= self.config.max_nodes:
             writer.close()
             return
+        if self._pending_by_ip.get(ip, 0) >= self.config.max_pending_per_ip:
+            writer.close()
+            self._fail(ip, "too many unfinished handshakes")
+            return
         self._pending += 1
+        self._pending_by_ip[ip] = self._pending_by_ip.get(ip, 0) + 1
         channel: Channel | None = None
         try:
             try:
@@ -175,10 +194,16 @@ class ControlServer:
                 self._fail(ip, f"bad handshake ({type(exc).__name__})")
                 return
             except (OSError, asyncio.IncompleteReadError):
-                return  # closed during the RSA exchange: e.g. an agent refusing our key
+                # Closed during the RSA exchange: an agent refusing our key, or someone
+                # cycling connections to make us work. Quiet, but it counts.
+                self._fail(ip, "handshake abandoned", alert=False)
+                return
             finally:
-                self._pending -= 1
+                self._release(ip)
             if hello is None:
+                # Closed before the hello: an agent asking its owner about our key does
+                # this once (and its next login clears the count); repeated, it's a flood.
+                self._fail(ip, "handshake abandoned", alert=False)
                 return
             node = await self._admit(hello, ip, channel)
             if node is None:
@@ -189,6 +214,14 @@ class ControlServer:
                 await channel.close()
             else:
                 writer.close()
+
+    def _release(self, ip: str) -> None:
+        self._pending -= 1
+        left = self._pending_by_ip.get(ip, 1) - 1
+        if left > 0:
+            self._pending_by_ip[ip] = left
+        else:
+            self._pending_by_ip.pop(ip, None)
 
     async def _handshake(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -205,13 +238,14 @@ class ControlServer:
 
     async def _reject(self, channel: Channel, code: str, reason: str) -> None:
         with contextlib.suppress(Exception):
-            await channel.send("reject", code=code, reason=reason)
+            await wait_for(channel.send("reject", code=code, reason=reason), REJECT_TIMEOUT)
 
     async def _admit(self, hello: dict[str, Any], ip: str, channel: Channel) -> Node | None:
         if not check_token(hello["token"], self.token):
             self._fail(ip, "bad token")
             await self._reject(channel, "bad_token", "wrong cluster token (copy OLLAMAPOWER_TOKEN from the hub)")
             return None
+        self.bans.succeeded(ip)
         if not protocol.compatible(hello["protocol"]):
             reason = (
                 f"protocol {hello['protocol']} doesn't match the hub's {protocol.PROTOCOL_VERSION}: "
