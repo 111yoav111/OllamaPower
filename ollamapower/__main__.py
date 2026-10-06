@@ -1,10 +1,11 @@
 """Command-line entry point.
 
 ``hub`` runs the hub and ``agent`` runs a helper. Commands that show or change
-a running process (``status``, ``nodes``, ``models``, ``agent pause|resume|
-status``) talk to it over the local-only admin channel (see ``admin/ipc.py``);
-``init``, ``doctor``, ``logs`` and ``token`` work on the files directly, so
-they also work while nothing runs.
+a running process (``status``, ``nodes``, ``models``, ``agent status|pause|
+resume|rules|net-test``) talk to it over the local-only admin channel (see
+``admin/ipc.py``); ``init``, ``doctor``, ``logs``, ``token``, ``llamacpp``
+and ``agent forget-hub`` work on the files directly, so they also work while
+nothing runs.
 """
 
 from __future__ import annotations
@@ -833,7 +834,12 @@ def models_plan(
 ) -> None:
     """Pin a model to split mode (same as `models pin <model> split`, with a preview)."""
     if not split:
-        typer.secho("Say how: --split (the only plan so far; `models unplan` goes back to Ollama).", fg="red", err=True)
+        typer.secho(
+            "Say how: --split. To serve it with Ollama use `models pin <model> local`; "
+            "`models unplan` lets the benchmark decide again.",
+            fg="red",
+            err=True,
+        )
         raise typer.Exit(2)
     config = load(config_path)
     d = call(config.config_dir, "models.plan", model=model, ctx=ctx)

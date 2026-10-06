@@ -102,6 +102,11 @@ def test_usage_errors_exit_2(cfg_env, args):
     assert result.exit_code == 2, result.output
 
 
+def test_help_and_hints_match_current_behaviour(cfg_env):
+    plan = run("models", "plan", "llama3:8b")
+    assert plan.exit_code == 2 and "models pin <model> local" in plan.output
+
+
 def test_forget_hub_parses_the_address_like_agent_hub(cfg_env):
     from ollamapower.agent.pinning import KnownHubs
 

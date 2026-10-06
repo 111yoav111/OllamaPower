@@ -98,7 +98,9 @@ def parse_hub_address(value: str, default_port: int) -> tuple[str, int]:
 @agent_cli.callback(invoke_without_command=True)
 def agent(
     ctx: typer.Context,
-    hub: str = typer.Option("", "--hub", help="The hub's address: ip[:port] (or set hub.address in agent.toml)"),
+    hub: str = typer.Option(
+        "", "--hub", help="The hub's address: ip[:port] or [ipv6]:port (or set hub.address in agent.toml)"
+    ),
     hub_fingerprint: str = typer.Option("", "--hub-fingerprint", help="Trust this hub key on first connect"),
     name: str = typer.Option("", "--name", help="How this helper appears on the hub"),
     no_tui: bool = typer.Option(False, "--no-tui", help="Run headless with plain logs"),

@@ -84,7 +84,7 @@ listen on anything but loopback (remote access is OllamaGate's job).
 | Tab | Shows |
 |---|---|
 | **1 Overview** | front door, Ollama, queue, the running split session (layers per device), requests, helpers and lendable VRAM, control-plane port and key fingerprint, the hub's GPU/VRAM bars, loaded models (VRAM %, last tok/s, spill warning), active requests, recent events, warnings |
-| **2 Nodes** | every helper: status (🟢 lending · 🟡 paused · 🔴 offline · ⚠ incompatible), name, IP, GPU, VRAM total/free/lendable, GPU %, CPU/RAM, link (RTT, Mbps, wired/Wi-Fi), role, tunnel mode |
+| **2 Nodes** | every helper: status (🟢 lending · 🟡 paused or stepping back · 🔴 offline · ⚠ incompatible), name, IP, GPU, VRAM total/free/lendable, GPU %, CPU/RAM, link (RTT, Mbps, wired/Wi-Fi), role, tunnel mode |
 | **3 Node detail** | full capabilities, GPU/VRAM/CPU sparklines, network-test history, last tunnel test (secure vs direct) |
 | **4 Models** | installed models: size, loaded VRAM %, whether they fit the hub's VRAM, engine and mode (auto/pinned), Ollama vs split tok/s from the last benchmark, why; benchmark and first-load progress |
 | **5 Log** | filterable event feed: joins, leaves, pauses, bans, failed logins, net tests |
@@ -130,7 +130,9 @@ ollamapower logs [--follow] [--kind request] [--file events|requests] [-n 50] [-
 ```
 
 `status` warns when a loaded model doesn't fully fit in VRAM (Ollama spilled
-part of it to the CPU): that is the case helpers will speed up.
+part of it to the CPU): the case where split mode may help. The hub benchmarks
+such a model with helpers while it is idle (`planner.auto_benchmark`) and switches
+only if split mode is measurably faster.
 
 Logs are JSON lines in `<config dir>/logs/` (`events.jsonl`, `requests.jsonl`),
 rotated at 10 MB x 5. They hold metadata only (path, model, priority, status,
