@@ -4,14 +4,16 @@ name: CI
 # - runs on pushes to main/dev and on pull requests, not on every branch push
 # - skips docs-only changes
 # - Linux on Python 3.11-3.13 plus one Windows job (helpers are mostly Windows
-#   gaming PCs); the full Linux/Windows/macOS x 3.11-3.13 grid via "Run workflow"
-#   (full_matrix)
+#   gaming PCs); one macOS job on pushes to main; the full Linux/Windows/macOS
+#   x 3.11-3.13 grid nightly and via "Run workflow" (full_matrix)
 on:
   push:
     branches: [main, dev]
     paths-ignore: ["**.md"]
   pull_request:
     paths-ignore: ["**.md"]
+  schedule:
+    - cron: "17 3 * * *"  # nightly full grid
   workflow_dispatch:
     inputs:
       full_matrix:
@@ -31,12 +33,15 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        os: ${{ fromJSON(inputs.full_matrix && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest"]') }}
+        os: ${{ fromJSON((inputs.full_matrix || github.event_name == 'schedule') && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest"]') }}
         python: ["3.11", "3.12", "3.13"]
         include:
           # Always test on Windows once, on the oldest supported Python (merged
           # into the grid when full_matrix already has it).
           - os: windows-latest
+            python: "3.11"
+          # macOS once on pushes to main (elsewhere this resolves to an existing Linux job).
+          - os: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'macos-latest' || 'ubuntu-latest' }}
             python: "3.11"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
