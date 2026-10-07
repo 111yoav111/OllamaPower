@@ -380,7 +380,8 @@ def test_helper_owner_pausing_mid_session_ends_it(cluster, client):
     c.run(c.agent.set_paused(True))
     assert wait_for(lambda: not c.call(lambda: c.hub.split.is_running("tiny")), 10)
     assert c.agent.rpc.session is None
-    assert any("paused by the helper's owner" in w for w in c.call(c.hub.warnings))
+    # The helper's reason arrives in its own message, which may land just after the session stopped.
+    assert wait_for(lambda: any("paused by the helper's owner" in w for w in c.call(c.hub.warnings)), 5)
 
 
 def test_helper_leaving_mid_session_ends_it(cluster, client):
@@ -389,7 +390,7 @@ def test_helper_leaving_mid_session_ends_it(cluster, client):
     assert chat(client, c).status_code == 200
     c.run(c.hub.control.kick(c.node))
     assert wait_for(lambda: not c.call(lambda: c.hub.split.is_running("tiny")), 10)
-    assert any("desk disconnected" in w for w in c.call(c.hub.warnings))
+    assert wait_for(lambda: any("desk disconnected" in w for w in c.call(c.hub.warnings)), 5)
 
 
 def test_relay_only_accepts_the_hub(cluster, client):
