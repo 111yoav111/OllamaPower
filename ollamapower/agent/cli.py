@@ -28,8 +28,7 @@ RUN_DIR = "agent-run"
 
 ConfigDirOption = typer.Option(
     None,
-    "--config-dir",
-    "-c",
+    "--config-dir",  # long-only: -c means --config everywhere (as in OllamaGate)
     file_okay=False,
     help="Directory with agent.toml, .env and known_hub (default: the OllamaPower config dir)",
 )

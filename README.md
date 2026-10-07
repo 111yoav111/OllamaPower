@@ -401,7 +401,7 @@ as numbers, and `ollama.url` needs an explicit port. The cluster token lives onl
 env var). On disk, all owner-only: `config.toml`, `.env`, `hub_key.pem`,
 `state.json` (+ `.bak`), `logs/`, and while running `run/`. A helper keeps
 `agent.toml`, `.env`, `known_hub` and `node_id` in the same kind of directory
-(`--config-dir` or `-c` on `agent` commands to choose another; `llamacpp
+(`--config-dir` on `agent` commands to choose another; `llamacpp
 install|status --config-dir` too), and `agent-run/` while running.
 
 ## How it works

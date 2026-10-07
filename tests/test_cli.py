@@ -135,7 +135,7 @@ def test_forget_hub_parses_the_address_like_agent_hub(cfg_env):
     assert "Forgot 1" in run("agent", "forget-hub", "--yes").output and known.entries() == []
 
 
-def test_config_dir_short_option_and_llamacpp_config_dir(cfg_env, tmp_path):
+def test_config_dir_option_and_llamacpp_config_dir(cfg_env, tmp_path):
     from ollamapower.agent.pinning import KnownHubs
     from ollamapower.llamacpp.install import Pins
 
@@ -144,9 +144,10 @@ def test_config_dir_short_option_and_llamacpp_config_dir(cfg_env, tmp_path):
     helper = tmp_path / "helper"
     helper.mkdir()
     KnownHubs(helper / "known_hub").pin("10.0.0.2:9000", "ab" * 32)
-    forgot = run("agent", "forget-hub", "-c", str(helper), "--hub", "10.0.0.2", "--yes")
+    forgot = run("agent", "forget-hub", "--config-dir", str(helper), "--hub", "10.0.0.2", "--yes")
     assert forgot.exit_code == 0 and "Forgot 1" in forgot.output
-    assert run("agent", "status", "-c", str(helper)).exit_code == 3  # -c reached the agent's run dir
+    assert run("agent", "status", "--config-dir", str(helper)).exit_code == 3  # reached the agent's run dir
+    assert run("agent", "status", "-c", str(helper)).exit_code == 2  # -c is --config everywhere, not on agent
 
     build = Pins.load().build
     fakes = install_fakes(tmp_path / "bin", [], build)
