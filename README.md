@@ -29,6 +29,8 @@ model. VRAM moves hundreds of GB/s, system RAM tens of GB/s, a gigabit LAN about
 | The model doesn't fit, so Ollama spills layers to the Hub's CPU/RAM | **Often yes**, over a wired LAN: those layers run on a helper's GPU instead (llama.cpp RPC). It also lets you load models that don't fit at all. |
 | Several requests at once (agents, batch jobs, several users) | **A little**: helper VRAM leaves the Hub room for a larger context and more parallel requests, but every request still runs through the Hub. Helpers never run Ollama or their own copy of a model. |
 | Helper on Wi-Fi or across the internet | **No** for split mode. Wi-Fi helpers get a loud warning. |
+| Helper without a GPU (a laptop) | **Rarely.** With `allow_cpu = true` it lends CPU/RAM, which can let a model load that doesn't fit at all, but CPU layers over the LAN are usually slower than the Hub's own CPU, so the benchmark normally keeps the model on Ollama. A laptop's built-in GPU counts only as the shared RAM it is. Laptops on Wi-Fi: see above. |
+| Phone or tablet | **No.** Helpers run on Windows, macOS and Linux PCs (llama.cpp's `rpc-server`); phones are clients, not helpers (remote use from a phone is OllamaGate's job). |
 
 **Golden rule: OllamaPower must never make things slower.** A model that fits
 on the hub's GPU is never split. Any other model runs split only after a
