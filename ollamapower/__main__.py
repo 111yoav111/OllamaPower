@@ -265,6 +265,7 @@ def hub(
         typer.echo(f"OllamaPower {__version__}: front door {config.frontdoor_url} -> Ollama {config.ollama.url}")
         if control_sock is not None:
             typer.echo(f"Helpers connect to port {config.control.port}; hub key fingerprint:\n  {fingerprint}")
+        typer.echo(f"Try it: curl {config.frontdoor_url}/api/tags   (and `ollamapower status` in another terminal)")
 
     async def main() -> None:
         try:
