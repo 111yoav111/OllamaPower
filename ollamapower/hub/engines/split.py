@@ -542,7 +542,9 @@ class SplitEngine:
         llama.cpp's own device list once it is installed (that is what llama-server
         will use), the hub's hardware facts before that.
         """
-        if self.binaries is not None and self.binaries.devices:
+        if self.binaries is not None:
+            # What llama-server will use, even if that is no GPU at all (a CPU build): the hardware
+            # report would count a GPU this llama.cpp can't drive.
             return [_hub_device(d, free=False) for d in preferred(self.binaries.devices)]
         return [
             Device(f"hub {g.get('name', 'GPU')}", int(g.get("vram_total") or 0))
