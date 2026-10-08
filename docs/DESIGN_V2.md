@@ -100,21 +100,28 @@ Raspberry Pi 5 at ~13 tok/s with tensor parallelism.
 
 ## Phases
 
-- **A: RAM pooling and MoE-aware placement** (biggest win).
-  Done: rpc-server on all physical cores (it defaulted to 2 threads); RAM
-  bandwidth probe on every machine; MoE-aware cost model; the hub's RAM and
-  helpers' RAM as devices (helpers' first, a model that fits nowhere refused
-  with what is missing); a model too big for the hub routed to split at once
-  and benchmarked without the Ollama run; Wi-Fi helpers. Next: per-machine
-  GPU/RAM split (`-d GPU,CPU` + `-ot` for experts; needs verifying on real
-  GPUs, which the development container lacks).
-- **B: `models suggest`**, and calibrating the cost model from real
-  benchmarks.
-- **C: speculative decoding** in split mode (MTP when the model has it, a
-  draft model on the hub otherwise).
-- **D: tensor split** for dense models on wired machines, benchmark-gated.
-- **E: later**: helpers fetch their slice from the registry themselves
-  (hub uplink not the bottleneck); keep the most-used experts on GPUs.
+- **A: RAM pooling and MoE-aware placement (done).** rpc-server on all
+  physical cores (it defaulted to 2 threads); a RAM bandwidth probe on every
+  machine; an MoE-aware cost model; the hub's RAM and helpers' RAM as
+  devices (helpers' first; a model that fits nowhere refused with what is
+  missing); a helper lends its GPU and its RAM in one session (`-d GPU,CPU`,
+  two contiguous blocks, ~0.3 ms per token); on the hub, MoE experts stay
+  in RAM while the hot parts fill the GPU (`-ot ...exps=CPU`, no network);
+  a model too big for the hub routed to split at once and benchmarked
+  without the Ollama run; Wi-Fi helpers. Not done on purpose: splitting each
+  layer between a *helper's* GPU and RAM (round trips per layer, measured
+  too slow).
+- **B: `ollamapower models suggest` (done).** Installed models (from their
+  GGUF headers) and a curated catalog of popular large ones (approximate),
+  with predicted speed alone and pooled, and measured speed once benchmarked.
+- **C: speculative decoding (done)** for models with MTP heads
+  (`--spec-type draft-mtp`), as a benchmark variant.
+- **D: tensor split (done)** for dense models on wired helpers with every
+  layer on a GPU or a helper (`-sm tensor`), as a benchmark variant;
+  verified to run over the secure tunnel on b11347.
+- **E: later.** Helpers fetch their slice of the model from the registry
+  themselves; keep the most-used experts on GPUs; a draft model on the hub
+  for models without MTP heads.
 
 ## Limits
 

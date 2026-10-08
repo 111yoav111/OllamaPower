@@ -9,16 +9,18 @@ Qwen3-235B, ...) run at a usable speed. Clients keep talking to the Hub exactly
 as they talk to Ollama today, and plain Ollama stays the fallback: OllamaPower
 never makes anything slower.
 
-> **Status: v1 built, v2 in progress.** v1 (phases 0-6) works: a front door
-> for your Ollama with a queue and a terminal UI, helpers that join over
-> encrypted tunnels and lend on their owners' terms (caps, schedule, pause,
-> auto-yield), and split mode (llama.cpp RPC) used only when a benchmark
-> proves it faster. v1 lends mainly GPUs. **v2** makes any PC useful: RAM
-> pooling, MoE-aware placement, CPU-only hubs and helpers, Wi-Fi helpers,
-> `models suggest` and speculative decoding; see
-> [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md) and the roadmap below. Not yet
-> measured on real multi-machine hardware: see
-> [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+> **Status: v2 built (phases A-D).** A front door for your Ollama with a
+> queue and a terminal UI; helpers that join over encrypted tunnels and lend
+> on their owners' terms (caps, schedule, pause, auto-yield). Any PC counts:
+> the hub's and helpers' RAM are pooled (a GPU-less hub or helper is fine), a
+> helper lends its GPU and its RAM together, MoE models keep their experts in
+> RAM and their hot parts on the GPUs, a model too big for the hub goes to
+> split mode on its first request, `models suggest` tells what your PCs can
+> run and how fast, and the benchmark also tries MTP speculation and tensor
+> split, keeping whatever is fastest. Never slower than plain Ollama, which
+> stays the fallback. Not yet measured on real multi-machine hardware: see
+> [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) and
+> [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md).
 
 ## What it can and can't do
 
@@ -472,10 +474,10 @@ clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
 
 | Phase | Delivers |
 |---|---|
-| **A RAM pooling** (mostly done) | Done: the hub's and helpers' RAM pooled (CPU-only hubs and helpers first-class), a cost model predicting tok/s from bytes read per token (MoE-aware), a model too big for the hub routed to split mode at once and benchmarked without the hopeless Ollama run, Wi-Fi helpers. Next: inside each machine, its GPU for the hot tensors and its RAM for MoE experts (needs testing on real GPUs) |
-| B `models suggest` | "With these PCs you can run X at about N tok/s", calibrated from real benchmarks |
-| C Speculative decoding | MTP heads or a draft model in split mode: several tokens per trip through the network |
-| D Tensor split | Dense models on wired machines, every machine working on every token (benchmark-gated) |
+| A RAM pooling (done) | The hub's and helpers' RAM pooled (GPU-less hubs and helpers first-class); a helper lends its GPU and its RAM together; MoE experts in each machine's RAM, hot parts on its GPU (hub); an MoE-aware cost model predicting tok/s; a model too big for the hub routed to split at once and benchmarked without the hopeless Ollama run; Wi-Fi helpers |
+| B `models suggest` (done) | "With these PCs you can run X at about N tok/s", for installed models and a catalog of popular ones |
+| C Speculative decoding (done) | Models with MTP heads: drafted tokens checked in one trip through every machine; benchmarked, kept only if faster |
+| D Tensor split (done) | Dense models on wired machines, every machine working on every token (llama.cpp's experimental `-sm tensor`); benchmarked, kept only if faster |
 | E Later | Helpers fetch their slice of the model themselves; most-used experts pinned to GPUs |
 
 OllamaPower only makes the Hub stronger. Remote access, device pairing and
