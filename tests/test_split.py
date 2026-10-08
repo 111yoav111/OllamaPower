@@ -76,6 +76,14 @@ class Cluster:
         return json.loads((self.hub_bin / "args.json").read_text())
 
 
+async def _no_local_gpus(hub: Any) -> None:
+    for _ in range(500):  # the hub reads its hardware in the background once; wait for it, then hide its GPUs
+        if hub.local_static:
+            break
+        await asyncio.sleep(0.02)
+    hub.local_static = {**hub.local_static, "gpus": []}
+
+
 def make_cluster(
     tmp_path: Path,
     fake_ollama: Any,
@@ -103,6 +111,8 @@ def make_cluster(
     app = create_app(hub)
     server = ThreadedServer(server=build_server(hub, app, own_logging=False)).start()
     cfg.hub.port = server.port  # the harness binds its own port; benchmarks call the front door by config
+    # Hermetic: the hub's GPUs are the fake llama.cpp's, never the test machine's (a Mac has one).
+    asyncio.run_coroutine_threadsafe(_no_local_gpus(hub), app.state.loop).result(15)
 
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
@@ -658,3 +668,19 @@ def _small_gpu(choose):
         return name, 1, total  # 1 MiB of VRAM: less than llama.cpp's own reserve
 
     return small
+
+
+def test_the_hubs_gpus_are_what_its_llama_cpp_can_drive(tmp_path, fake_ollama, make_config):
+    """Regression (macOS CI): a GPU in the hardware report that the installed llama.cpp doesn't list
+    (a CPU build, or a GPU it can't drive) must not count, or split mode is refused for "fitting" on it."""
+    from ollamapower.llamacpp.binaries import LlamaCpp
+
+    c, close = make_cluster(tmp_path, fake_ollama, make_config, hub_devices=[])
+    try:
+        c.hub.local_static = {"gpus": [{"name": "Apple M2", "vram_total": 64 * 1024**3, "unified": True}]}
+        c.hub.split.binaries = None
+        assert [d.label for d in c.hub.split.hub_devices()] == ["hub Apple M2"]  # before llama.cpp is there
+        c.hub.split.binaries = LlamaCpp(root=tmp_path, devices=[])  # type: ignore[arg-type]
+        assert c.hub.split.hub_devices() == []
+    finally:
+        close()

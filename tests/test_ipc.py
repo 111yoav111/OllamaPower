@@ -6,7 +6,9 @@ import asyncio
 import json
 import socket
 import sys
+import tempfile
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -79,7 +81,8 @@ async def test_wrong_secret_and_replayed_nonce_are_refused(tmp_path):
 def test_impostor_never_sees_the_secret(tmp_path):
     """A process squatting on the channel learns nothing and can't forge an answer."""
     secret = "s" * 43
-    sock_path = tmp_path / "impostor.sock"
+    # macOS caps Unix socket paths at 104 bytes, and pytest's temp dirs there are long.
+    sock_path = Path(tempfile.mkdtemp(dir="/tmp")) / "impostor.sock"
     info = tmp_path / "admin.json"
     info.write_text(json.dumps({"transport": "unix", "path": str(sock_path), "secret": secret}))
     received: list[bytes] = []
