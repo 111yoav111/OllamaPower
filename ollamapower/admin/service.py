@@ -263,6 +263,10 @@ class Admin:
             }
         if cmd == "models.show":
             return await self.show_model(self._model(args.get("model")))
+        if cmd == "models.suggest":
+            from ..hub.suggest import suggest
+
+            return await suggest(hub, self._ctx(args.get("ctx")))
         if cmd == "split.stop":
             return {"stopped": await hub.split.stop(reason="stopped by the owner")}
         if cmd == "events.list":

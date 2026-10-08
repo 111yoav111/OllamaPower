@@ -93,6 +93,7 @@ def test_init_replaces_a_weak_token_in_the_file(cfg_env):
         ["models", "pin", "llama3:8b", "fast"],
         ["models", "pin", "llama3:8b", "split", "--ctx", "10"],
         ["models", "benchmark", "llama3:8b", "--ctx", "99999999"],
+        ["models", "suggest", "--ctx", "10"],
         ["models", "plan", "llama3:8b", "--split", "--ctx", "-1"],
         ["models", "plan", "llama3:8b"],
         ["logs", "--limit", "0"],
@@ -180,6 +181,17 @@ def test_status_over_the_admin_channel(admin_frontdoor, client):
     assert "Front door:" in plain and "big:70b" in plain and "⚠ big:70b is only 50% in VRAM" in plain
     # The control plane is enabled in the config but was never started (no token): say that, not "off".
     assert "Control:     not running: no usable cluster token" in plain
+
+
+def test_models_suggest_over_the_admin_channel(admin_frontdoor, client):
+    fd = admin_frontdoor
+    assert wait_for(lambda: fd.call(lambda: bool(fd.hub.ollama.installed)))
+    result = run("models", "suggest", "--json")
+    assert result.exit_code == 0, result.output
+    d = json.loads(result.output)
+    assert {r["model"] for r in d["installed"]} == {"small:1b", "big:70b"} and d["catalog"]
+    plain = run("models", "suggest", "--ctx", "2048").output
+    assert "VERDICT" in plain and "big:70b" in plain and "Pool now: no helper lending" in plain
 
 
 def test_control_text_tells_off_from_not_running():

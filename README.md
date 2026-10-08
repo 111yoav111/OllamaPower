@@ -273,6 +273,7 @@ fit on the hub alone. The hub decides by itself, by measuring:
 
 ```bash
 ollamapower models list                      # engine per model, why, last benchmark (Ollama vs split tok/s)
+ollamapower models suggest [--ctx N] [--json] # what the PCs connected now can run, and how fast
 ollamapower models show <model>              # memory estimate, plan, benchmark history
 ollamapower models benchmark <model> [--ctx N]
 ollamapower models pin <model> split|local   # override the benchmark   (TUI: L / F)
@@ -281,6 +282,27 @@ ollamapower models unpin <model>             # automatic again           (TUI: U
 ollamapower models exclude <model> <helper> [--undo]
 ollamapower models benchmarks [--markdown]   # every result; --markdown for docs/BENCHMARKS.md
 ollamapower llamacpp install | status [--config-dir DIR]   # the pinned llama.cpp (also done automatically)
+```
+
+### Which models can I run? (`models suggest`)
+
+For every installed model: dense or MoE, the planner's predicted speed on the
+hub alone and pooled over what the helpers lend right now (each helper's best
+GPU within its owner's caps, else its RAM if CPU lending is allowed), the
+measured speeds once benchmarked, or how much memory is missing. Then popular
+models you could pull, estimated from a small built-in table of approximate
+sizes. Nothing is started or loaded; `~` marks a prediction. A hub with a
+12 GB GPU and 32 GB RAM, a helper with a 12 GB GPU, a laptop lending RAM:
+
+```text
+MODEL                             SIZE TYPE   ALONE POOLED  VERDICT
+gpt-oss:120b                   60.5 GB MoE     ~1.0    ~13  pooled: ~13 tok/s (vs ~1.0 alone)
+qwen3:8b                        4.8 GB dense    ~52      -  runs fine on the hub
+Could pull (estimates from approximate sizes, not installed):
+qwen3:30b-a3b                  17.7 GB MoE      ~29    ~92  estimate, not installed: pooled: ~92 tok/s (vs ~29 alone)
+llama3.3:70b                   40.0 GB dense   ~0.4   ~1.2  estimate, not installed: pooled: ~1.2 tok/s (vs ~0.4 alone)
+1 more popular model(s) wouldn't fit even pooled (--json lists them).
+Pool now: desk RTX 4070 11.0 GB, laptop CPU 21.0 GB · hub RAM 29.0 GB
 ```
 
 ### How the hub decides

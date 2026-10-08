@@ -1,0 +1,17 @@
+{
+  "approximate": true,
+  "note": "Popular large models for `ollamapower models suggest`. Every number is approximate: download_gb is the size Ollama's library lists for the default tag (decimal GB, usually Q4_K_M), params_b/active_params_b are billions of parameters (active: per token, MoE only, null = dense), kv_heads/head_dim/embedding/vocab size the KV cache and buffers. Estimates made from these are labelled as such; a pulled model is measured from its real GGUF file.",
+  "models": [
+    {"name": "gpt-oss:20b", "download_gb": 14, "layers": 24, "params_b": 21, "active_params_b": 3.6, "kv_heads": 8, "head_dim": 64, "embedding": 2880, "vocab": 201088},
+    {"name": "gpt-oss:120b", "download_gb": 65, "layers": 36, "params_b": 117, "active_params_b": 5.1, "kv_heads": 8, "head_dim": 64, "embedding": 2880, "vocab": 201088},
+    {"name": "qwen3:30b-a3b", "download_gb": 19, "layers": 48, "params_b": 30.5, "active_params_b": 3.3, "kv_heads": 4, "head_dim": 128, "embedding": 2048, "vocab": 151936},
+    {"name": "qwen3:235b-a22b", "download_gb": 142, "layers": 94, "params_b": 235, "active_params_b": 22, "kv_heads": 4, "head_dim": 128, "embedding": 4096, "vocab": 151936},
+    {"name": "mixtral:8x7b", "download_gb": 26, "layers": 32, "params_b": 46.7, "active_params_b": 12.9, "kv_heads": 8, "head_dim": 128, "embedding": 4096, "vocab": 32000},
+    {"name": "llama3.3:70b", "download_gb": 43, "layers": 80, "params_b": 70.6, "active_params_b": null, "kv_heads": 8, "head_dim": 128, "embedding": 8192, "vocab": 128256},
+    {"name": "deepseek-r1:70b", "download_gb": 43, "layers": 80, "params_b": 70.6, "active_params_b": null, "kv_heads": 8, "head_dim": 128, "embedding": 8192, "vocab": 128256},
+    {"name": "qwen2.5:72b", "download_gb": 47, "layers": 80, "params_b": 72.7, "active_params_b": null, "kv_heads": 8, "head_dim": 128, "embedding": 8192, "vocab": 152064},
+    {"name": "qwen3:32b", "download_gb": 20, "layers": 64, "params_b": 32.8, "active_params_b": null, "kv_heads": 8, "head_dim": 128, "embedding": 5120, "vocab": 151936},
+    {"name": "gemma3:27b", "download_gb": 17, "layers": 62, "params_b": 27.4, "active_params_b": null, "kv_heads": 16, "head_dim": 128, "embedding": 5376, "vocab": 262144},
+    {"name": "mistral-small3.2:24b", "download_gb": 15, "layers": 40, "params_b": 24, "active_params_b": null, "kv_heads": 8, "head_dim": 128, "embedding": 5120, "vocab": 131072}
+  ]
+}

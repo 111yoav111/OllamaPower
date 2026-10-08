@@ -53,6 +53,7 @@ include = ["ollamapower*"]
 [tool.setuptools.package-data]
 ollamapower = ["config.example.toml", "agent.example.toml"]
 "ollamapower.llamacpp" = ["pins.json"]
+"ollamapower.hub" = ["catalog.json"]
 "ollamapower.tui" = ["*.tcss"]
 
 [tool.pytest.ini_options]

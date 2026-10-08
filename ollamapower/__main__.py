@@ -704,6 +704,51 @@ def models_show(
             )
 
 
+def render_suggest(d: dict[str, Any]) -> Lines:
+    """`models suggest`: installed models, then catalog models that would run if pulled."""
+    from .hub.suggest import tps_text
+
+    def row(r: dict[str, Any]) -> tuple[str, str | None]:
+        alone = tps_text(r.get("measured_alone_tps") or r.get("alone_tps"), bool(r.get("measured_alone_tps")))
+        pooled = tps_text(r.get("measured_pooled_tps") or r.get("pooled_tps"), bool(r.get("measured_pooled_tps")))
+        size = _human(r["size"]) if r.get("size") else "?"
+        color = typer.colors.YELLOW if r.get("missing_bytes") or "fits_hub" not in r else None
+        return (
+            f"{safe(r['model'])[:28]:28} {size:>9} {r.get('type', '-'):5} {alone:>6} {pooled:>6}  {safe(r['verdict'])}",
+            color,
+        )
+
+    lines: Lines = [(f"{'MODEL':28} {'SIZE':>9} {'TYPE':5} {'ALONE':>6} {'POOLED':>6}  VERDICT", None)]
+    if not d["installed"]:
+        lines.append(("(no models installed in Ollama, or Ollama is not reachable)", None))
+    lines += [row(r) for r in d["installed"]]
+    runnable = [r for r in d["catalog"] if r["fits_hub"] or r["pooled_tps"] is not None]
+    if runnable:
+        lines.append(("Could pull (estimates from approximate sizes, not installed):", None))
+        lines += [row(r) for r in runnable]
+    hidden = len(d["catalog"]) - len(runnable)
+    if hidden:
+        lines.append((f"{hidden} more popular model(s) wouldn't fit even pooled (--json lists them).", None))
+    pool = ", ".join(f"{safe(p['label'])} {_human(p['bytes'])}" for p in d["pool"])
+    lines.append((f"Pool now: {pool or 'no helper lending'} · hub RAM {_human(d['hub']['ram'])}", None))
+    lines += [(f"Not counted: {safe(reason)}", typer.colors.YELLOW) for reason in d["not_counted"]]
+    lines.append(("ALONE/POOLED: generation tok/s; ~ = predicted, plain = measured by `models benchmark`.", None))
+    return lines
+
+
+@models_cli.command("suggest")
+def models_suggest(
+    ctx: int | None = typer.Option(
+        None, "--ctx", min=MIN_CTX, max=MAX_CTX, help="Context size (default: each model's plan context)"
+    ),
+    config_path: Path | None = ConfigOption,
+    as_json: bool = typer.Option(False, "--json", help="Print JSON"),
+) -> None:
+    """Which models the PCs connected now can run, and how fast (predicted; measured once benchmarked)."""
+    d = call(load(config_path).config_dir, "models.suggest", ctx=ctx, timeout=120)
+    show(lambda: d, render_suggest, as_json, False)
+
+
 @models_cli.command("benchmark")
 def models_benchmark(
     model: str,
