@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import ssl
 import sys
 
@@ -355,3 +356,22 @@ def test_unreadable_proc_is_unknown_not_a_refusal(tmp_path):
     from ollamapower.core.tunnel import UNKNOWN, loopback_peer_uid
 
     assert loopback_peer_uid(1, 2, (str(tmp_path / "missing"),)) == UNKNOWN
+
+
+async def test_closing_a_relay_never_breaks_another_socket_in_the_process():
+    """Regression: the relay closed its listener while sock_accept still had it registered with the
+    event loop; the next socket got the same descriptor number, and registering it failed (ENOENT),
+    so another connection in the process (on a helper: its own) couldn't connect."""
+    loop = asyncio.get_running_loop()
+    for _ in range(5):
+        relay = HelperRelay(0, "127.0.0.1", None, "")
+        await relay.start("127.0.0.1")
+        await asyncio.sleep(0)  # the accept loop is now waiting in sock_accept
+        relay.close()
+        other = socket.socket()  # likely the descriptor number the listener had
+        try:
+            loop.add_writer(other.fileno(), lambda: None)  # what a connecting socket does
+            loop.remove_writer(other.fileno())
+        finally:
+            other.close()
+        await asyncio.sleep(0)

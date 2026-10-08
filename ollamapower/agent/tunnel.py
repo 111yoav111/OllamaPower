@@ -87,6 +87,16 @@ class HelperRelay:
     async def _accept_loop(self) -> None:
         loop = asyncio.get_running_loop()
         assert self.listener is not None
+        try:
+            await self._accept_until_closed(loop)
+        finally:
+            # Only now, once sock_accept has unregistered the socket from the event loop: closing it
+            # earlier frees its descriptor number, a new socket gets it, and the cancelled sock_accept
+            # then unregisters *that* socket (another connection on this machine fails to connect).
+            self.listener.close()
+
+    async def _accept_until_closed(self, loop: asyncio.AbstractEventLoop) -> None:
+        assert self.listener is not None
         while not self.closed:
             try:
                 conn, peer = await loop.sock_accept(self.listener)
@@ -148,8 +158,8 @@ class HelperRelay:
     def close(self) -> None:
         self.closed = True
         if self._accepting is not None:
-            self._accepting.cancel()
-        if self.listener is not None:
+            self._accepting.cancel()  # its finally closes the listener, after sock_accept let go of it
+        elif self.listener is not None:
             self.listener.close()
         for w in list(self.connections):
             w.close()
