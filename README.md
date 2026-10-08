@@ -1,36 +1,45 @@
 # OllamaPower
 
-Make the PC that runs Ollama (the **Hub**) stronger by borrowing GPU, CPU and
-VRAM from other machines on your network (**Helpers**). Clients keep talking to
-the Hub exactly as they talk to Ollama today; the Hub decides, per model, whether
-a helper can make it faster or let it run a model that doesn't fit, and only
-uses a helper when a benchmark proves it wins.
+Run models bigger than any PC you own, by pooling the PCs you already have.
+Every machine counts: the PC you use Ollama on (the **Hub**) can be an old
+desktop or a laptop without a GPU, and so can every machine that helps it
+(**Helpers**). Together their RAM, CPUs and any GPUs hold a model none of them
+could load alone, and the big mixture-of-experts models (gpt-oss-120b,
+Qwen3-235B, ...) run at a usable speed. Clients keep talking to the Hub exactly
+as they talk to Ollama today, and plain Ollama stays the fallback: OllamaPower
+never makes anything slower.
 
-> **Status: all phases built (0-6).** The hub runs in front of your Ollama
-> with a priority queue and a terminal UI; helpers join and lend their GPUs
-> on their owners' terms (caps, schedule, pause, auto-yield). For a model that
-> doesn't fit the hub's GPU, the hub benchmarks plain Ollama against split
-> mode (the model spread over the hub's and helpers' GPUs with llama.cpp) and
-> uses split mode only if it is measurably faster. Split-mode traffic is
-> encrypted (mutually authenticated TLS 1.3) unless both owners opt in to
-> direct mode. Everything else is served by your local Ollama, exactly as
-> before. Not yet measured on real multi-machine hardware: see
+> **Status: v1 built, v2 in progress.** v1 (phases 0-6) works: a front door
+> for your Ollama with a queue and a terminal UI, helpers that join over
+> encrypted tunnels and lend on their owners' terms (caps, schedule, pause,
+> auto-yield), and split mode (llama.cpp RPC) used only when a benchmark
+> proves it faster. v1 lends mainly GPUs. **v2** makes any PC useful: RAM
+> pooling, MoE-aware placement, CPU-only hubs and helpers, Wi-Fi helpers,
+> `models suggest` and speculative decoding; see
+> [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md) and the roadmap below. Not yet
+> measured on real multi-machine hardware: see
 > [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## What it can and can't do
 
-LLM generation is limited by **memory bandwidth**: every token reads the whole
-model. VRAM moves hundreds of GB/s, system RAM tens of GB/s, a gigabit LAN about
-0.12 GB/s. That sets hard rules, and OllamaPower follows them:
+LLM generation is limited by **memory**: every token reads the weights it
+uses, so a model must fit somewhere, and its speed is roughly the bytes read
+per token divided by the memory bandwidth. VRAM moves hundreds of GB/s, RAM
+tens of GB/s, a gigabit LAN about 0.12 GB/s. Splitting a model between
+machines at layer boundaries costs only a few network round trips per token,
+so the network matters for loading the model, much less for running it.
+No machine has to be strong: a hub without a GPU and helpers without GPUs
+all count.
 
-| Situation | Does a helper help? |
+| Situation | Does pooling help? |
 |---|---|
-| The model fits in the Hub's VRAM | **No.** Splitting it across machines makes it slower. OllamaPower leaves it on plain Ollama. |
-| The model doesn't fit, so Ollama spills layers to the Hub's CPU/RAM | **Often yes**, over a wired LAN: those layers run on a helper's GPU instead (llama.cpp RPC). It also lets you load models that don't fit at all. |
-| Several requests at once (agents, batch jobs, several users) | **A little**: helper VRAM leaves the Hub room for a larger context and more parallel requests, but every request still runs through the Hub. Helpers never run Ollama or their own copy of a model. |
-| Helper on Wi-Fi or across the internet | **No** for split mode. Wi-Fi helpers get a loud warning. |
-| Helper without a GPU (a laptop) | **Rarely.** With `allow_cpu = true` it lends CPU/RAM, which can let a model load that doesn't fit at all, but CPU layers over the LAN are usually slower than the Hub's own CPU, so the benchmark normally keeps the model on Ollama. A laptop's built-in GPU counts only as the shared RAM it is. Laptops on Wi-Fi: see above. |
-| Phone or tablet | **No.** Helpers run on Windows, macOS and Linux PCs (llama.cpp's `rpc-server`); phones are clients, not helpers (remote use from a phone is OllamaGate's job). |
+| The model fits in the Hub's own memory, at full speed | **No.** OllamaPower leaves it on plain Ollama. |
+| The model doesn't fit in the Hub's RAM/VRAM (Ollama pages it from disk, or refuses) | **Yes, the main case.** Spread over the Hub's and helpers' RAM (and any GPUs), it runs instead of crawling. *(v2: any PC; v1: mainly GPU helpers)* |
+| Mixture-of-experts models (gpt-oss-120b, Qwen3-235B-A22B, ...) | **Yes, the best case.** Each token reads only a few experts, so the pooled RAM of ordinary PCs runs them at usable speed (estimates in [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)). *(v2)* |
+| Dense 70B on ordinary PCs | **It runs** (~1-2 tok/s estimated) where a single PC pages from disk. *(v2)* |
+| Ollama spills part of a model to the Hub's CPU and a helper has a GPU | **Often faster**: those layers run on the helper's GPU. *(v1, works now)* |
+| Helper on Wi-Fi | v1 refuses it. *(v2: allowed for split mode; only the first load is slow)* |
+| Phones, tablets | Clients only, not helpers. |
 
 **Golden rule: OllamaPower must never make things slower.** A model that fits
 on the hub's GPU is never split. Any other model runs split only after a
@@ -435,8 +444,15 @@ clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
 | 5 Planner (done) | Memory estimate, spill detection, benchmarks through the real path, automatic "never slower" choice tied to a benchmark key, pins and exclusions, idle auto-benchmarks, transparent fallback, degraded plans and recovery |
 | **6 Lending & polish** (done) | Lending schedules, auto-yield with graceful drain, `agent.example.toml`, start scripts, `models benchmarks --markdown` for real numbers |
 
-Later ideas, not planned yet: speculative decoding with helpers running the
-draft model, MoE expert offload, several Hubs.
+**v2: any PC helps** ([`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)):
+
+| Phase | Delivers |
+|---|---|
+| **A RAM pooling** (in progress) | A cost model predicting tok/s per placement; contiguous layer blocks per machine, each machine's GPU for the hot tensors and its RAM for MoE experts; CPU-only hubs and helpers first-class; Wi-Fi helpers; no pointless Ollama benchmark for a model that can't fit |
+| B `models suggest` | "With these PCs you can run X at about N tok/s", calibrated from real benchmarks |
+| C Speculative decoding | MTP heads or a draft model in split mode: several tokens per trip through the network |
+| D Tensor split | Dense models on wired machines, every machine working on every token (benchmark-gated) |
+| E Later | Helpers fetch their slice of the model themselves; most-used experts pinned to GPUs |
 
 OllamaPower only makes the Hub stronger. Remote access, device pairing and
 per-device quotas are [OllamaGate](https://github.com/111yoav111/OllamaGate)'s

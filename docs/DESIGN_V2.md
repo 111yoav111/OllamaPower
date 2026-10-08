@@ -5,6 +5,12 @@ GPU) as one machine, so models that don't fit on any single one run, and the
 big mixture-of-experts (MoE) models run at a usable speed. Never slower than
 plain Ollama, and plain Ollama stays the fallback.
 
+**Any PC.** Nothing may require a strong machine: the hub can be a laptop
+without a GPU running Ollama on the CPU, and a helper can be any Windows,
+macOS or Linux PC with spare RAM. GPUs anywhere are used when present, never
+required. Every number the planner needs (RAM, bandwidth, link) is measured
+on the machine itself, so the plan fits what each PC really has.
+
 v1 treated VRAM as the only resource worth borrowing, so it only helped an
 owner who already had a second GPU PC. v2 pools **RAM first, GPUs as a
 bonus**, and is built around what the measurements below show.
