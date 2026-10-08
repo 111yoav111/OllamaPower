@@ -28,7 +28,7 @@ def _start(url, results, key, priority=None, **body) -> threading.Thread:
 def test_higher_priority_goes_first(frontdoor_factory):
     fd = frontdoor_factory(hub__max_concurrency=1)
     results: dict = {}
-    blocker = _start(fd.url, results, "blocker", fake_first_delay=0.6)
+    blocker = _start(fd.url, results, "blocker", fake_first_delay=3.0)  # slow CI runners: room to queue 4
     assert wait_for(lambda: fd.call(lambda: fd.hub.gate.active) == 1)
     threads = []
     for key, prio in (("low", "low"), ("normal", None), ("critical", "critical"), ("high", "high")):

@@ -232,6 +232,7 @@ def test_llama_cpp_devices_are_matched_to_the_owners_gpu_numbers():
     assert telemetry_indexes(devices, []) == [None, 0]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="fake llama.cpp programs are POSIX scripts")
 def test_llama_cpp_runs_with_pci_device_order(tmp_path, monkeypatch):
     import subprocess
 

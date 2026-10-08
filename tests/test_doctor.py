@@ -66,7 +66,7 @@ def test_ollama_host_env_on_all_interfaces(make_config, monkeypatch):
     cfg = make_config(f"http://127.0.0.1:{free_port()}")
     finding = doctor.check_exposure(cfg)[0]
     assert finding.level == "error"
-    assert f"OLLAMA_HOST=127.0.0.1:{cfg.ollama.url.rsplit(':', 1)[1]}" in finding.fix
+    assert f"127.0.0.1:{cfg.ollama.url.rsplit(':', 1)[1]}" in finding.fix  # OLLAMA_HOST=... or setx (Windows)
 
 
 def test_token_checks(make_config, monkeypatch):
@@ -200,6 +200,7 @@ def test_extended_permission_checks(make_config):
     assert [f.level for f in doctor.check_permissions(cfg) if "admin.json" in f.title] == ["error"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="fake llama.cpp programs are POSIX scripts")
 def test_llamacpp_check(make_config, tmp_path):
     from ollamapower.llamacpp.install import Pins
 

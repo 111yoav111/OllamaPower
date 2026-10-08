@@ -358,6 +358,7 @@ def test_unreadable_proc_is_unknown_not_a_refusal(tmp_path):
     assert loopback_peer_uid(1, 2, (str(tmp_path / "missing"),)) == UNKNOWN
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the bug is in selector loops; Windows' proactor loop has none")
 async def test_closing_a_relay_never_breaks_another_socket_in_the_process():
     """Regression: the relay closed its listener while sock_accept still had it registered with the
     event loop; the next socket got the same descriptor number, and registering it failed (ENOENT),

@@ -74,3 +74,16 @@ def test_read_entries_limit_reads_only_what_it_needs(tmp_path):
         ("tick", 199),
     ]
     assert [e["n"] for e in read_entries(tmp_path, ["requests"], kinds=["request"], limit=3)] == [197, 198, 199]
+
+
+def test_entries_keep_their_order_on_a_coarse_clock(tmp_path, monkeypatch):
+    """Windows' time.time() ticks every ~16 ms: entries written within one tick must still merge in order."""
+    import time
+
+    monkeypatch.setattr(time, "time", lambda: 1_700_000_000.0)
+    log = EventLog(tmp_path, 1024 * 1024, 2)
+    log.event("hub_start", version="x")
+    log.request(path="/api/chat", status=200)
+    log.event("hub_stop")
+    log.close()
+    assert [e["kind"] for e in read_entries(tmp_path, ["events", "requests"])] == ["hub_start", "request", "hub_stop"]

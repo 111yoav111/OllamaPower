@@ -136,6 +136,7 @@ def test_forget_hub_parses_the_address_like_agent_hub(cfg_env):
     assert "Forgot 1" in run("agent", "forget-hub", "--yes").output and known.entries() == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="fake llama.cpp programs are POSIX scripts")
 def test_config_dir_option_and_llamacpp_config_dir(cfg_env, tmp_path):
     from ollamapower.agent.pinning import KnownHubs
     from ollamapower.llamacpp.install import Pins
