@@ -425,7 +425,7 @@ class AgentClient:
             return
         if test["kind"] != "down":
             return
-        now = time.monotonic()
+        now = time.perf_counter()  # monotonic ticks every ~16 ms on Windows: too coarse here
         if test["seen"] == 0:
             test["first"] = now  # the first chunk starts the clock
         else:

@@ -346,10 +346,10 @@ class ControlServer:
             return
         echo = test.echoes.get(m["seq"])
         if echo is not None and not echo.done() and "data" not in m:
-            echo.set_result(time.monotonic())
+            echo.set_result(time.perf_counter())
             return
         data = m.get("data") or b""
-        now = time.monotonic()
+        now = time.perf_counter()
         if test.up_first is None:
             test.up_first = now
         else:
@@ -387,7 +387,7 @@ class ControlServer:
         rtts = []
         for seq in range(NET_TEST_PINGS):
             test.echoes[seq] = loop.create_future()
-            sent = time.monotonic()
+            sent = time.perf_counter()
             await channel.send("net_test_data", test_id=test_id, seq=seq, sent_at=sent)
             rtts.append((await test.echoes[seq] - sent) * 1000)
         # 2. Hub -> agent: the agent times the chunks and reports.

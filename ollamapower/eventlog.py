@@ -19,6 +19,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -27,6 +28,22 @@ from typing import Any
 from .files import POSIX, private_dir
 
 LOG_FILES = {"events": "events.jsonl", "requests": "requests.jsonl"}
+
+
+_clock_lock = threading.Lock()
+_last_ts = 0.0
+
+
+def _timestamp() -> float:
+    """Wall-clock time, strictly increasing across every log of this process.
+
+    Logs are merged by timestamp when read; on Windows (Python 3.11) ``time.time()`` ticks
+    every ~16 ms, so entries written within one tick would come back in any order.
+    """
+    global _last_ts
+    with _clock_lock:
+        _last_ts = max(round(time.time(), 6), round(_last_ts + 1e-6, 6))
+        return _last_ts
 
 
 class _PrivateRotatingHandler(logging.handlers.RotatingFileHandler):
@@ -57,7 +74,7 @@ class JsonlLog:
         self._listener.start()
 
     def write(self, kind: str, **fields: Any) -> None:
-        line = json.dumps({"ts": round(time.time(), 6), "kind": kind, **fields}, default=str, ensure_ascii=False)
+        line = json.dumps({"ts": _timestamp(), "kind": kind, **fields}, default=str, ensure_ascii=False)
         try:
             self._queue.put_nowait(logging.LogRecord("ollamapower.jsonl", logging.INFO, "", 0, line, None, None))
         except queue.Full:
