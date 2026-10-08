@@ -52,7 +52,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install --require-hashes -r requirements-dev.lock
       - run: python -m pip install --no-deps -e .
-      - run: python -m pytest -q
+      - run: python -m pytest -q --maxfail=3  # stop early: failures show in full and minutes are saved
 
   checks:
     # Lint, packaging smoke test and dependency audit in one short job.
