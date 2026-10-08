@@ -280,7 +280,7 @@ class AgentClient:
     async def _serve(self, channel: Channel, interval: float) -> float:
         heartbeat = asyncio.ensure_future(self._heartbeat_loop(channel, interval))
         # If heartbeats stop (send failed), end the session: the hub would drop us anyway.
-        heartbeat.add_done_callback(lambda t: t.cancelled() or t.exception() is None or channel.writer.close())
+        heartbeat.add_done_callback(lambda t: self._heartbeats_ended(t, channel))
         try:
             while True:
                 message = await channel.recv()
@@ -295,6 +295,13 @@ class AgentClient:
         finally:
             await reap(heartbeat)
 
+    def _heartbeats_ended(self, task: asyncio.Task[None], channel: Channel) -> None:
+        if task.cancelled() or task.exception() is None:
+            return
+        exc = task.exception()
+        log.error("heartbeats stopped, leaving the hub: %s", type(exc).__name__, exc_info=exc)
+        channel.writer.close()
+
     async def _heartbeat_loop(self, channel: Channel, interval: float) -> None:
         while True:
             try:
@@ -304,7 +311,10 @@ class AgentClient:
                 sample = {}
             self.state.telemetry = sample
             self.state.version += 1
-            await self._check_lending(sample)
+            try:
+                await self._check_lending(sample)
+            except Exception:  # noqa: BLE001 - a bug in the lending rules must not drop the hub connection
+                log.exception("checking the lending rules failed")
             self._heartbeat_seq += 1
             await channel.send("heartbeat", seq=self._heartbeat_seq, telemetry=sample)
             await asyncio.sleep(interval)
