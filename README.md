@@ -34,7 +34,7 @@ all count.
 | Situation | Does pooling help? |
 |---|---|
 | The model fits in the Hub's own memory, at full speed | **No.** OllamaPower leaves it on plain Ollama. |
-| The model doesn't fit in the Hub's RAM/VRAM (Ollama pages it from disk, or refuses) | **Yes, the main case.** Spread over the Hub's and helpers' RAM (and any GPUs), it runs instead of crawling. *(v2: any PC; v1: mainly GPU helpers)* |
+| The model doesn't fit in the Hub's RAM/VRAM (Ollama pages it from disk, or refuses) | **Yes, the main case.** Spread over the Hub's and helpers' RAM (and any GPUs), it runs instead of crawling; the hub sends it to split mode on the first request. Helpers without a GPU lend RAM once their owner allows it (`ollamapower agent rules --allow-cpu`). |
 | Mixture-of-experts models (gpt-oss-120b, Qwen3-235B-A22B, ...) | **Yes, the best case.** Each token reads only a few experts, so the pooled RAM of ordinary PCs runs them at usable speed (estimates in [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)). *(v2)* |
 | Dense 70B on ordinary PCs | **It runs** (~1-2 tok/s estimated) where a single PC pages from disk. *(v2)* |
 | Ollama spills part of a model to the Hub's CPU and a helper has a GPU | **Often faster**: those layers run on the helper's GPU. *(v1, works now)* |
@@ -450,7 +450,7 @@ clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
 
 | Phase | Delivers |
 |---|---|
-| **A RAM pooling** (in progress) | A cost model predicting tok/s per placement; contiguous layer blocks per machine, each machine's GPU for the hot tensors and its RAM for MoE experts; CPU-only hubs and helpers first-class; Wi-Fi helpers; no pointless Ollama benchmark for a model that can't fit |
+| **A RAM pooling** (mostly done) | Done: the hub's and helpers' RAM pooled (CPU-only hubs and helpers first-class), a cost model predicting tok/s from bytes read per token (MoE-aware), a model too big for the hub routed to split mode at once and benchmarked without the hopeless Ollama run, Wi-Fi helpers. Next: inside each machine, its GPU for the hot tensors and its RAM for MoE experts (needs testing on real GPUs) |
 | B `models suggest` | "With these PCs you can run X at about N tok/s", calibrated from real benchmarks |
 | C Speculative decoding | MTP heads or a draft model in split mode: several tokens per trip through the network |
 | D Tensor split | Dense models on wired machines, every machine working on every token (benchmark-gated) |

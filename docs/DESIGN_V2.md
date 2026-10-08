@@ -100,11 +100,14 @@ Raspberry Pi 5 at ~13 tok/s with tensor parallelism.
 
 ## Phases
 
-- **A: RAM pooling and MoE-aware placement** (biggest win): cost model,
-  contiguous blocks, per-machine GPU/RAM split (`-d GPU,CPU` + `-ot`),
-  CPU-only hubs and helpers first-class, Wi-Fi for pipeline, skip pointless
-  Ollama runs. Done in v1 already: rpc-server uses all physical cores (it
-  defaulted to 2 threads).
+- **A: RAM pooling and MoE-aware placement** (biggest win).
+  Done: rpc-server on all physical cores (it defaulted to 2 threads); RAM
+  bandwidth probe on every machine; MoE-aware cost model; the hub's RAM and
+  helpers' RAM as devices (helpers' first, a model that fits nowhere refused
+  with what is missing); a model too big for the hub routed to split at once
+  and benchmarked without the Ollama run; Wi-Fi helpers. Next: per-machine
+  GPU/RAM split (`-d GPU,CPU` + `-ot` for experts; needs verifying on real
+  GPUs, which the development container lacks).
 - **B: `models suggest`**, and calibrating the cost model from real
   benchmarks.
 - **C: speculative decoding** in split mode (MTP when the model has it, a
