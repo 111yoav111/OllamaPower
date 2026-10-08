@@ -239,6 +239,25 @@ def _shared_ram(free: bool) -> int:
     return max(0, int(vm.available) - SHARED_RAM_KEEP) if free else int(vm.total * SHARED_RAM_SHARE)
 
 
+HUB_RAM_KEEP = 3 * 1024 * MIB  # RAM the hub leaves to the system, the front door and the owner's programs
+
+
+def helper_device(node: Node, endpoint: dict[str, Any]) -> Device:
+    """What a helper lent for one session, as the planner sees it (its RAM when it lent its CPU)."""
+    name = safe_text(str(endpoint.get("device", "")), 40)
+    rtt_ms = float(node.link.get("rtt_ms") or 0)
+    ram = name.upper() == "CPU"
+    return Device(
+        f"{node.name} {name}",
+        int(endpoint.get("free_mib", 0)) * MIB,
+        node_id=node.node_id,
+        device=name,
+        ram=ram,
+        bandwidth=float(node.capabilities.get("ram_bandwidth") or 0) if ram else 0.0,
+        rtt=max(0.0, min(rtt_ms, 1000.0)) / 1000,
+    )
+
+
 def _hub_device(d: llamacpp_binaries.Device, free: bool) -> Device:
     """A hub GPU for the planner; an integrated GPU counts no more than the RAM it shares."""
     size = (d.free_mib if free else d.total_mib) * MIB
@@ -410,17 +429,17 @@ class SplitEngine:
         await asyncio.to_thread(binaries.probe)
         hub_devices = [_hub_device(d, free=True) for d in preferred(binaries.devices)]
         by_node = {x.node.node_id: x for x in s.leases}
-        devices = [
-            Device(
-                f"{x.node.name} {x.endpoint.get('device', '')}",
-                int(x.endpoint.get("free_mib", 0)) * MIB,
-                node_id=x.node.node_id,
-                device=safe_text(str(x.endpoint.get("device", "")), 40),
-            )
-            for x in s.leases
-        ]
+        devices = [helper_device(x.node, x.endpoint) for x in s.leases]
         try:
-            s.plan = plan_split(s.model, info, s.ctx, hub_devices, devices, self.config.planner.memory_margin)
+            s.plan = plan_split(
+                s.model,
+                info,
+                s.ctx,
+                hub_devices,
+                devices,
+                self.config.planner.memory_margin,
+                hub_ram=self.hub_ram(free=True),
+            )
         except PlanError as exc:
             raise SplitUnavailable(str(exc)) from None
         # Helpers that got no layers are released now; the rest in llama.cpp's device order (= --rpc order).
@@ -473,6 +492,21 @@ class SplitEngine:
             raise SplitUnavailable("llama-server is missing from the hub's llama.cpp", PERMANENT)
         return self.binaries
 
+    def hub_ram(self, free: bool) -> Device:
+        """The hub's own RAM as a place for layers: what is available (``free``) or installed, minus what
+        the system and Ollama's own process keep, at the bandwidth the hub measured."""
+        import psutil
+
+        vm = psutil.virtual_memory()
+        size = int(vm.available if free else vm.total) - HUB_RAM_KEEP
+        return Device(
+            "hub RAM",
+            max(0, size),
+            device="CPU",
+            ram=True,
+            bandwidth=float(self.hub.local_static.get("ram_bandwidth") or 0),
+        )
+
     def hub_devices(self) -> list[Device]:
         """The hub's GPUs at their total memory: what "fits on the hub" is judged against, everywhere.
 
@@ -499,13 +533,13 @@ class SplitEngine:
                 reasons.append(f"{node.name}: llama.cpp {lc.get('status') or 'unknown'} {lc.get('error', '')}".strip())
             elif lc.get("build") != pins.build:
                 reasons.append(f"{node.name} has llama.cpp build {lc.get('build')}, needs {pins.build}")
-            elif node.link.get("kind") == "wifi":
-                reasons.append(f"{node.name} is on Wi-Fi (too slow for split mode)")
-            else:
+            else:  # Wi-Fi too: a split costs a few round trips per token; only the first load is slow
                 ok.append(node)
 
-        def preference(n: Node) -> tuple[float, int]:
-            return (float(n.link.get("down_mbps") or n.link.get("speed_mbps") or 0), n.lendable_vram())
+        def preference(n: Node) -> tuple[int, float, float]:
+            # A GPU first (fastest memory), then the fastest RAM, then the better link.
+            link = float(n.link.get("down_mbps") or n.link.get("speed_mbps") or 0)
+            return (n.lendable_vram(), float(n.capabilities.get("ram_bandwidth") or 0), link)
 
         ok.sort(key=preference, reverse=True)
         return ok, reasons

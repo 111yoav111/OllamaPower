@@ -222,14 +222,21 @@ def test_a_model_that_fits_nowhere_says_how_much_is_missing():
         plan_split("m", model(layers=12), 1024, [], [ram("laptop", 3.0, node="a")], hub_ram=ram("hub RAM", 2.0))
 
 
-def test_gpus_take_the_top_layers_before_any_ram():
+def test_gpus_take_the_top_layers_then_helpers_ram_then_the_hubs():
     info = model(layers=12, layer_gb=1.0)
     plan = plan_split(
         "m", info, 1024, [gpu("hub", 3.0)], [gpu("g", 4.0, node="g"), ram("r", 20.0, node="r")], hub_ram=ram("hub", 4.0)
     )
     labels = [p.device.label for p in plan.placements]
-    assert labels[-1] == "hub" and labels[-2] == "g"  # GPUs nearest the output
-    assert plan.cpu_layers > 0  # then the hub's RAM, before a helper's
+    assert labels == ["r", "g", "hub"]  # GPUs nearest the output, the helper's RAM below them
+    assert plan.cpu_layers == 0  # the hub's RAM stays free for its owner while a helper has room
+
+
+def test_the_hubs_ram_goes_first_when_it_is_clearly_faster():
+    info = model(layers=12, layer_gb=1.0)
+    fast_hub = ram("hub", 6.0, gbps=60.0)
+    plan = plan_split("m", info, 1024, [], [ram("laptop", 20.0, node="a", gbps=15.0)], hub_ram=fast_hub)
+    assert plan.cpu_layers == 5 and plan.placements[0].device.node_id == "a"  # 6 GB less the embeddings
 
 
 def test_moe_models_are_predicted_much_faster_than_dense_ones_of_the_same_size():

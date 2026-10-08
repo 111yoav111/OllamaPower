@@ -615,3 +615,16 @@ async def test_hub_shutdown_stops_the_session_even_with_background_work_pending(
     run.cancel()
     await asyncio.gather(run, return_exceptions=True)
     assert session.state == "stopped" and engine.session is None  # llama-server and helpers released
+
+
+def test_a_helper_lending_its_cpu_is_planned_as_ram_at_its_own_speed():
+    from ollamapower.hub.engines.split import helper_device
+    from ollamapower.hub.nodes import Node, clean_capabilities
+
+    node = Node("n1", "laptop", capabilities=clean_capabilities({"ram_bandwidth": 30e9}))
+    node.net_tests.append({"rtt_ms": 4.0})  # Wi-Fi
+    cpu = helper_device(node, {"device": "CPU", "free_mib": 8192})
+    assert cpu.ram and cpu.bandwidth == 30e9 and cpu.rtt == 0.004 and cpu.free == 8 * 1024**3
+    gpu = helper_device(node, {"device": "Vulkan0", "free_mib": 4096})
+    assert not gpu.ram and gpu.bandwidth == 0.0  # a GPU: the planner's GPU default
+    assert clean_capabilities({"ram_bandwidth": 1e30})["ram_bandwidth"] == 0  # implausible: unknown

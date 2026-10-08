@@ -155,6 +155,9 @@ def clean_capabilities(value: Any) -> dict[str, Any]:
     if not isinstance(caps.get("backends"), list):
         caps["backends"] = []
     caps["backends"] = [b for b in caps["backends"] if isinstance(b, str)]
+    bandwidth = _opt_num(caps.get("ram_bandwidth"))
+    # Bytes/s of the helper's RAM (its own probe); anything outside a plausible range counts as unknown.
+    caps["ram_bandwidth"] = int(bandwidth) if bandwidth is not None and 1e8 <= bandwidth <= 2e12 else 0
     return caps
 
 
@@ -248,7 +251,7 @@ class Node:
         if self.incompatible:
             out.append(self.incompatible)
         if self.link["kind"] == "wifi":
-            out.append(f"{self.name} is on Wi-Fi: too slow for split mode; use a cable.")
+            out.append(f"{self.name} is on Wi-Fi: split mode works, but loading a model is slow; a cable is faster.")
         if self.tunnel_effective == "direct":
             out.append(f"{self.name} uses trusted-LAN direct mode: split-mode traffic is unencrypted.")
         elif self.tunnel_mode == "direct":

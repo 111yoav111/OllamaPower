@@ -35,6 +35,7 @@ GPU_BANDWIDTH = 250e9  # a dedicated GPU we know nothing more about (mid-range c
 RAM_BANDWIDTH = 25e9  # desktop dual-channel RAM, all cores
 DISK_BANDWIDTH = 1e9  # weights paged in from an SSD because they don't fit in RAM
 HOP_SECONDS = 0.0006  # llama.cpp's own cost of handing a token to another machine (measured, loopback)
+HUB_RAM_PREFERRED = 1.2  # the hub's RAM goes before helpers' only when this much faster
 UBATCH = 512  # llama-server's default -ub: the compute graph is reserved for this many tokens at once
 COMPUTE_SLACK = 16 * MIB
 
@@ -222,19 +223,28 @@ def plan_split(
     top_placed, rest = _fill(units, with_reserve([*gpus, *hub], info, ctx))
     cpu = rest
     if hub_ram is not None:
-        # The hub's RAM holds the bottom layers plus the token embeddings and small tensors.
+        # The hub's RAM holds the bottom layers plus the token embeddings and small tensors. Helpers
+        # lending RAM go first (a few ms per token, and the hub's RAM stays free for its owner),
+        # unless the hub's RAM is clearly faster.
         budget = max(0, hub_ram.budget - device_reserve(info, ctx) - info.input_bytes - info.other_bytes)
-        bottom, used = 0, 0
-        while bottom < rest and used + units[bottom] <= budget:
-            used += units[bottom]
-            bottom += 1
-        cpu = bottom
+        hub_first = bool(rams) and hub_ram.speed > HUB_RAM_PREFERRED * max(d.speed for d in rams)
+        bottom = 0
+        if hub_first or not rams:
+            used = 0
+            while bottom < rest and used + units[bottom] <= budget:
+                used += units[bottom]
+                bottom += 1
         middle_placed, left = _fill(units[bottom:rest], with_reserve(rams, info, ctx))
+        if not hub_first and rams:
+            # What the helpers couldn't take stays at the bottom, on the hub's RAM.
+            bottom = left
+            left = 0 if sum(units[:bottom]) <= budget else left
         if left:
-            short = sum(units[bottom : bottom + left])
+            short = sum(units[:bottom]) - budget if not hub_first else sum(units[bottom : bottom + left])
             raise PlanError(
-                f"{model} doesn't fit even with the helpers: about {short / GIB:.1f} GB more memory is needed"
+                f"{model} doesn't fit even with the helpers: about {max(short, 0) / GIB:.1f} GB more memory is needed"
             )
+        cpu = bottom
     else:
         middle_placed = []
     placed = [*[x for x in middle_placed if x[1]], *[x for x in top_placed if x[1]]]

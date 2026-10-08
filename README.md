@@ -38,7 +38,7 @@ all count.
 | Mixture-of-experts models (gpt-oss-120b, Qwen3-235B-A22B, ...) | **Yes, the best case.** Each token reads only a few experts, so the pooled RAM of ordinary PCs runs them at usable speed (estimates in [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)). *(v2)* |
 | Dense 70B on ordinary PCs | **It runs** (~1-2 tok/s estimated) where a single PC pages from disk. *(v2)* |
 | Ollama spills part of a model to the Hub's CPU and a helper has a GPU | **Often faster**: those layers run on the helper's GPU. *(v1, works now)* |
-| Helper on Wi-Fi | v1 refuses it. *(v2: allowed for split mode; only the first load is slow)* |
+| Helper on Wi-Fi | **Allowed.** A few round trips per token; only the first load of a big model is slow. |
 | Phones, tablets | Clients only, not helpers. |
 
 **Golden rule: OllamaPower must never make things slower.** A model that fits
@@ -174,8 +174,10 @@ OllamaPower there too, then:
    `--hub-fingerprint AB:CD:...`. The key is then pinned in `known_hub`; if
    the hub's key ever changes, the agent refuses to connect and says so.
 
-The helper appears on the hub's Nodes tab. Helpers on Wi-Fi get a warning:
-split mode needs a cable.
+The helper appears on the hub's Nodes tab. Helpers on Wi-Fi take part too:
+a split model costs only a few round trips per token, but the first load of
+a big model over Wi-Fi is slow (the helper's disk cache makes later loads
+fast), so the hub notes it.
 
 ### What a helper lends (its owner decides)
 
