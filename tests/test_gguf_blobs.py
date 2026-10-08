@@ -338,3 +338,14 @@ def test_declared_nextn_layers_are_llama_cpp_layout_and_allowed(tmp_path):
     )
     files = locate(show(model), "tiny")
     assert files.gguf.nextn_layers == 1 and not files.gguf.foreign
+
+
+def test_moe_experts_are_counted_and_only_the_used_ones_are_read(tmp_path):
+    info = read_gguf(write_tiny_llama(tmp_path / "m.gguf", n_layer=2, n_embd=64, n_ff=64, n_expert=8, n_expert_used=2))
+    assert info.is_moe and (info.expert_count, info.expert_used_count) == (8, 2)
+    experts = 4 * 3 * 64 * 64 * 8  # gate, up and down: F32, 8 experts
+    assert info.expert_bytes == [experts, experts]
+    shared = info.layer_bytes[0] - experts
+    assert info.active_layer_bytes() == [shared + experts // 4] * 2  # 2 of 8 experts per token
+    dense = read_gguf(write_tiny_llama(tmp_path / "d.gguf"))
+    assert not dense.is_moe and dense.active_layer_bytes() == dense.layer_bytes

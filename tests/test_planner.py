@@ -178,3 +178,74 @@ def test_summary_is_json_friendly():
     plan = plan_split("m", model(), 1024, [], [gpu("h", 5.0, node="a")])
     json.dumps(plan.summary())
     assert plan.tensor_split() == str(plan.placements[0].layers)
+
+
+# ----- v2: RAM pooling and the cost model ---------------------------------------------------
+
+
+def ram(label: str, gb: float, node: str | None = None, gbps: float = 25.0, rtt_ms: float = 0.3) -> Device:
+    """System RAM with ``gb`` usable for layers once the reserve for ``model()`` is set aside."""
+    reserve = device_reserve(model(), 1024)
+    return Device(
+        label,
+        int(gb * GIB) + reserve,
+        node_id=node,
+        device="CPU",
+        ram=True,
+        bandwidth=gbps * 1e9,
+        rtt=rtt_ms / 1000,
+    )
+
+
+def moe(layers: int = 10, layer_gb: float = 1.0, experts_share: float = 0.9) -> GGUFInfo:
+    info = model(layers=layers, layer_gb=layer_gb)
+    info.expert_bytes = [int(layer_gb * GIB * experts_share)] * layers
+    info.expert_count, info.expert_used_count = 32, 4
+    return info
+
+
+def test_a_hub_without_a_gpu_pools_the_helpers_ram():
+    info = model(layers=12, layer_gb=1.0)
+    hub_ram = ram("hub RAM", 4.1 + 0.5 + device_reserve(info, 1024) / GIB)  # 4 layers beside embeddings and reserve
+    helpers = [ram("laptop", 5.0, node="a"), ram("desktop", 5.0, node="b")]
+    plan = plan_split("m", info, 1024, [], helpers, hub_ram=hub_ram)
+    assert plan.cpu_layers == 4  # the hub's own RAM first: no network hop
+    assert sum(p.layers for p in plan.placements) == plan.units - 4
+    assert {p.device.node_id for p in plan.placements} == {"a", "b"}
+    split = [float(p.layers) for p in plan.placements]
+    assert llama_cpp_assignment(plan.units, plan.gpu_layers, split) == our_assignment(plan)
+    assert plan.summary()["predicted_tps"] > 0
+
+
+def test_a_model_that_fits_nowhere_says_how_much_is_missing():
+    with pytest.raises(PlanError, match=r"doesn't fit even with the helpers: about \d+\.\d GB more"):
+        plan_split("m", model(layers=12), 1024, [], [ram("laptop", 3.0, node="a")], hub_ram=ram("hub RAM", 2.0))
+
+
+def test_gpus_take_the_top_layers_before_any_ram():
+    info = model(layers=12, layer_gb=1.0)
+    plan = plan_split(
+        "m", info, 1024, [gpu("hub", 3.0)], [gpu("g", 4.0, node="g"), ram("r", 20.0, node="r")], hub_ram=ram("hub", 4.0)
+    )
+    labels = [p.device.label for p in plan.placements]
+    assert labels[-1] == "hub" and labels[-2] == "g"  # GPUs nearest the output
+    assert plan.cpu_layers > 0  # then the hub's RAM, before a helper's
+
+
+def test_moe_models_are_predicted_much_faster_than_dense_ones_of_the_same_size():
+    helpers = [ram("laptop", 10.0, node="a")]
+    dense = plan_split("m", model(layers=12), 1024, [], helpers, hub_ram=ram("hub", 5.0))
+    sparse = plan_split("m", moe(layers=12), 1024, [], helpers, hub_ram=ram("hub", 5.0))
+    assert sparse.seconds_per_token < dense.seconds_per_token / 3
+
+
+def test_paging_from_disk_is_what_makes_a_big_model_crawl_on_one_pc():
+    from ollamapower.hub.planner import predict_local
+
+    info = model(layers=12)
+    pooled = plan_split("m", info, 1024, [], [ram("laptop", 10.0, node="a")], hub_ram=ram("hub", 5.0))
+    alone = predict_local(info, 1024, [], ram("hub", 5.0))
+    assert alone > 5 * pooled.seconds_per_token
+    # A slow link costs per token, but far less than the disk.
+    wifi = plan_split("m", info, 1024, [], [ram("laptop", 10.0, node="a", rtt_ms=5)], hub_ram=ram("hub", 5.0))
+    assert pooled.seconds_per_token < wifi.seconds_per_token < alone

@@ -22,6 +22,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -179,6 +180,33 @@ def apple_static() -> list[dict[str, Any]]:
 # ----- CPU ---------------------------------------------------------------------------------
 
 
+RAM_PROBE_BYTES = 64 * 1024 * 1024  # larger than any CPU cache, so the copy really goes to RAM
+ALL_CORES_FACTOR = 1.5  # one core copying reaches roughly 2/3 of what all cores read (llama.cpp uses them all)
+
+
+@lru_cache(maxsize=1)
+def ram_bandwidth() -> int:
+    """Bytes per second this machine's RAM delivers, estimated once (~0.1 s).
+
+    Generation speed on a CPU is this number divided by the bytes a token reads, so the
+    planner needs it for every machine. Measured as one core copying a buffer larger than
+    any cache, scaled to all cores; real benchmarks refine it.
+    """
+    try:
+        src = bytearray(RAM_PROBE_BYTES)
+        dst = bytearray(RAM_PROBE_BYTES)
+        src[:] = b"\x01" * RAM_PROBE_BYTES  # touch every page first
+        dst[:] = src
+        best = float("inf")
+        for _ in range(3):
+            started = time.perf_counter()
+            dst[:] = src
+            best = min(best, time.perf_counter() - started)
+        return int(2 * RAM_PROBE_BYTES / max(best, 1e-6) * ALL_CORES_FACTOR)  # read + write
+    except MemoryError:
+        return 0
+
+
 @lru_cache(maxsize=1)
 def cpu_model() -> str:
     try:
@@ -297,6 +325,7 @@ class Telemetry:
                 "threads": psutil.cpu_count() or 0,
             },
             "ram_total": int(psutil.virtual_memory().total),
+            "ram_bandwidth": ram_bandwidth(),
             "gpus": gpus,
             "backends": backends,
         }

@@ -29,6 +29,12 @@ MIB = 1024 * 1024
 GIB = 1024 * MIB
 # Kept free on every GPU besides the compute buffer: the backend's own context, driver and allocator slack.
 DEVICE_OVERHEAD = 512 * MIB
+# Generation reads every weight a token uses once per token, so time = bytes / bandwidth.
+# Defaults until a machine's own measurement (or a benchmark) says otherwise:
+GPU_BANDWIDTH = 250e9  # a dedicated GPU we know nothing more about (mid-range cards do 250-450 GB/s)
+RAM_BANDWIDTH = 25e9  # desktop dual-channel RAM, all cores
+DISK_BANDWIDTH = 1e9  # weights paged in from an SSD because they don't fit in RAM
+HOP_SECONDS = 0.0006  # llama.cpp's own cost of handing a token to another machine (measured, loopback)
 UBATCH = 512  # llama-server's default -ub: the compute graph is reserved for this many tokens at once
 COMPUTE_SLACK = 16 * MIB
 
@@ -47,6 +53,13 @@ class Device:
     node_id: str | None = None  # None for the hub's own GPUs
     device: str = ""  # llama.cpp device name on its own machine ("Vulkan0", "CUDA1", "CPU")
     reserve: int = 0  # kept free for compute buffers and overhead (set by the planner for a model and context)
+    ram: bool = False  # system RAM (a CPU device), not a GPU's own memory
+    bandwidth: float = 0.0  # bytes/s; 0 = the default for its kind
+    rtt: float = 0.0  # seconds for a round trip between the hub and this device's machine
+
+    @property
+    def speed(self) -> float:
+        return self.bandwidth or (RAM_BANDWIDTH if self.ram else GPU_BANDWIDTH)
 
     @property
     def budget(self) -> int:
@@ -71,6 +84,7 @@ class SplitPlan:
     placements: list[Placement] = field(default_factory=list)  # llama.cpp device order
     weights_bytes: int = 0
     cpu_bytes: int = 0
+    seconds_per_token: float = 0.0  # predicted generation time (see ``predict``)
 
     @property
     def gpu_layers(self) -> int:
@@ -95,6 +109,7 @@ class SplitPlan:
             "cpu_layers": self.cpu_layers,
             "cpu_bytes": self.cpu_bytes,
             "weights_bytes": self.weights_bytes,
+            "predicted_tps": round(1 / self.seconds_per_token, 2) if self.seconds_per_token else None,
             "devices": [
                 {
                     "label": p.device.label,
@@ -179,26 +194,58 @@ def fits_on_hub(info: GGUFInfo, ctx: int, hub: list[Device], margin: float = 0.0
 
 
 def plan_split(
-    model: str, info: GGUFInfo, ctx: int, hub: list[Device], helpers: list[Device], margin: float = 0.0
+    model: str,
+    info: GGUFInfo,
+    ctx: int,
+    hub: list[Device],
+    helpers: list[Device],
+    margin: float = 0.0,
+    hub_ram: Device | None = None,
 ) -> SplitPlan:
-    """Place ``model``: the hub's GPUs first, then ``helpers`` in the given order of preference."""
+    """Place ``model`` on the hub's GPUs, the helpers' devices and the hub's RAM, fastest memory first.
+
+    llama.cpp gives each device one contiguous run of layers: the hub's CPU takes the first
+    layers, then the devices in ``--device`` order, the hub's GPUs last (with the output layer).
+    So: GPUs (the hub's, then the helpers', fastest first) fill from the top; the hub's RAM
+    takes the bottom layers (no network hop); helpers lending RAM take what is left in the
+    middle. Without ``hub_ram`` the hub's CPU takes whatever is left, however much (v1).
+    """
     if ctx <= 0:
         raise PlanError("the context size must be positive")
-    units = unit_sizes(info, ctx)
+    units = [int(u * (1 + margin)) for u in unit_sizes(info, ctx)]
     if fits_on_hub(info, ctx, hub, margin):
         raise PlanError(f"{model} fits on the hub's GPU alone; Ollama runs it faster without helpers")
-    order = with_reserve([*reversed(helpers), *hub], info, ctx)  # the best helper sits next to the hub's GPUs
-    placed, cpu = _fill(units, order)
+    # ``helpers`` come best first; _fill takes the last device first, so reverse, then order by speed
+    # (stable: equally fast helpers keep the caller's preference).
+    gpus = sorted((d for d in reversed(helpers) if not d.ram), key=lambda d: d.speed)
+    rams = sorted((d for d in reversed(helpers) if d.ram), key=lambda d: d.speed)
+    top_placed, rest = _fill(units, with_reserve([*gpus, *hub], info, ctx))
+    cpu = rest
+    if hub_ram is not None:
+        # The hub's RAM holds the bottom layers plus the token embeddings and small tensors.
+        budget = max(0, hub_ram.budget - device_reserve(info, ctx) - info.input_bytes - info.other_bytes)
+        bottom, used = 0, 0
+        while bottom < rest and used + units[bottom] <= budget:
+            used += units[bottom]
+            bottom += 1
+        cpu = bottom
+        middle_placed, left = _fill(units[bottom:rest], with_reserve(rams, info, ctx))
+        if left:
+            short = sum(units[bottom : bottom + left])
+            raise PlanError(
+                f"{model} doesn't fit even with the helpers: about {short / GIB:.1f} GB more memory is needed"
+            )
+    else:
+        middle_placed = []
+    placed = [*[x for x in middle_placed if x[1]], *[x for x in top_placed if x[1]]]
     caches = [*info.kv_bytes(ctx), 0]
     placements, first = [], cpu
     for d, n, b in placed:
-        if n > 0:
-            placements.append(Placement(d, n, b, sum(caches[first : first + n])))
+        placements.append(Placement(d, n, b, sum(caches[first : first + n])))
         first += n
     if not any(p.device.node_id for p in placements):
         raise PlanError(f"no helper has room for even one layer of {model} (each layer needs ~{max(units) // MIB} MB)")
-    # Whatever didn't fit (the first ``cpu`` layers) stays on the hub's CPU: -ngl is set below the layer count.
-    return SplitPlan(
+    plan = SplitPlan(
         model=model,
         ctx=ctx,
         units=len(units),
@@ -207,3 +254,53 @@ def plan_split(
         weights_bytes=info.weights_bytes,
         cpu_bytes=sum(units[:cpu]) + info.input_bytes + info.other_bytes,
     )
+    plan.seconds_per_token = predict(plan, info, hub_ram)
+    return plan
+
+
+def _active_units(info: GGUFInfo) -> list[int]:
+    """Bytes each layer slot reads per token: active weights of every block, then the output layer."""
+    return [*info.active_layer_bytes(), info.output_bytes]
+
+
+def predict(plan: SplitPlan, info: GGUFInfo, hub_ram: Device | None = None) -> float:
+    """Seconds per generated token: each device reads its layers' active weights, plus the network.
+
+    A token crosses to every helper and back (about two round trips per helper per token,
+    measured), plus llama.cpp's own handoff cost. An estimate to rank plans and skip hopeless
+    benchmarks; the benchmark is what decides.
+    """
+    active = _active_units(info)
+    ram_speed = hub_ram.speed if hub_ram is not None else RAM_BANDWIDTH
+    seconds = sum(active[: plan.cpu_layers]) / ram_speed
+    first = plan.cpu_layers
+    nodes: dict[str, float] = {}
+    for p in plan.placements:
+        seconds += sum(active[first : first + p.layers]) / p.device.speed
+        first += p.layers
+        if p.device.node_id:
+            nodes[p.device.node_id] = max(nodes.get(p.device.node_id, 0.0), p.device.rtt)
+    return seconds + sum(2 * rtt + HOP_SECONDS for rtt in nodes.values())
+
+
+def predict_local(info: GGUFInfo, ctx: int, hub: list[Device], hub_ram: Device | None) -> float:
+    """Seconds per token for plain Ollama on the hub alone: its GPUs from the top, its RAM, then the disk.
+
+    What doesn't fit in RAM is paged in from disk for every token, which is what makes a
+    too-big model crawl on one PC.
+    """
+    units = unit_sizes(info, ctx)
+    active = _active_units(info)
+    placed, rest = _fill(units, with_reserve(hub, info, ctx))
+    seconds, top = 0.0, len(units)
+    for d, n, _ in reversed(placed):
+        seconds += sum(active[top - n : top]) / d.speed
+        top -= n
+    ram_budget = hub_ram.budget - info.input_bytes - info.other_bytes if hub_ram is not None else None
+    used = 0
+    for i in range(rest):
+        in_ram = ram_budget is None or used + units[i] <= ram_budget
+        used += units[i] if in_ram else 0
+        speed = (hub_ram.speed if hub_ram is not None else RAM_BANDWIDTH) if in_ram else DISK_BANDWIDTH
+        seconds += active[i] / speed
+    return seconds

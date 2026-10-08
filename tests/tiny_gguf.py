@@ -64,6 +64,8 @@ def write_tiny_llama(
     extra_kv: dict[str, Any] | None = None,
     arch: str = "llama",
     extra_tensors: list[tuple[str, list[int]]] | None = None,
+    n_expert: int = 0,
+    n_expert_used: int = 2,
 ) -> Path:
     """A llama-shaped model; ``arch`` renames the architecture (and its keys), ``extra_tensors`` adds tensors."""
     tokens, scores, types = vocab()
@@ -89,6 +91,7 @@ def write_tiny_llama(
         "tokenizer.ggml.bos_token_id": 1,
         "tokenizer.ggml.eos_token_id": 2,
         "tokenizer.ggml.unknown_token_id": 0,
+        **({"llama.expert_count": n_expert, "llama.expert_used_count": n_expert_used} if n_expert else {}),
         **(extra_kv or {}),
     }
     tensors: list[tuple[str, list[int]]] = [("token_embd.weight", [n_embd, n_vocab])]
@@ -101,10 +104,20 @@ def write_tiny_llama(
             (p + "attn_v.weight", [n_embd, n_kv_embd]),
             (p + "attn_output.weight", [n_embd, n_embd]),
             (p + "ffn_norm.weight", [n_embd]),
-            (p + "ffn_gate.weight", [n_embd, n_ff]),
-            (p + "ffn_down.weight", [n_ff, n_embd]),
-            (p + "ffn_up.weight", [n_embd, n_ff]),
         ]
+        if n_expert:  # Mixtral-style MoE: a router and stacked experts
+            tensors += [
+                (p + "ffn_gate_inp.weight", [n_embd, n_expert]),
+                (p + "ffn_gate_exps.weight", [n_embd, n_ff, n_expert]),
+                (p + "ffn_down_exps.weight", [n_ff, n_embd, n_expert]),
+                (p + "ffn_up_exps.weight", [n_embd, n_ff, n_expert]),
+            ]
+        else:
+            tensors += [
+                (p + "ffn_gate.weight", [n_embd, n_ff]),
+                (p + "ffn_down.weight", [n_ff, n_embd]),
+                (p + "ffn_up.weight", [n_embd, n_ff]),
+            ]
     tensors.append(("output_norm.weight", [n_embd]))
     if not tied:
         tensors.append(("output.weight", [n_embd, n_vocab]))

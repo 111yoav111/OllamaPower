@@ -49,6 +49,7 @@ _SCALARS = {
 }
 _BLOCK = re.compile(r"^blk\.(\d+)\.")
 _NEXTN = re.compile(r"^blk\.(\d+)\.nextn\.")
+_EXPERTS = re.compile(r"\.ffn_[a-z_]*_exps\.")  # routed experts; shared experts are "_shexp"
 # Tensors of parts llama.cpp's text model doesn't load from the main GGUF. Ollama's own engine
 # keeps a vision/audio encoder or a multi-token-prediction head there; llama.cpp wants the
 # encoders in a separate projector file and its MTP layers as declared ``blk.N.nextn.*``.
@@ -102,6 +103,9 @@ class GGUFInfo:
     nextn_layers: int = 0  # trailing blocks that are llama.cpp MTP ("NextN") layers
     foreign: dict[str, int] = field(default_factory=dict)  # part ("vision", "audio", "MTP") -> tensor count
     layer_bytes: list[int] = field(default_factory=list)  # weights of blk.0 .. blk.N-1
+    expert_bytes: list[int] = field(default_factory=list)  # the routed-expert part of each block (MoE), else 0
+    expert_count: int = 0  # experts per MoE layer
+    expert_used_count: int = 0  # experts the router picks per token
     output_bytes: int = 0  # the output layer (llama.cpp's "layer N")
     input_bytes: int = 0  # token embeddings: always kept on the hub's CPU
     other_bytes: int = 0
@@ -111,6 +115,25 @@ class GGUFInfo:
     @property
     def weights_bytes(self) -> int:
         return sum(self.layer_bytes) + self.output_bytes + self.input_bytes + self.other_bytes
+
+    @property
+    def is_moe(self) -> bool:
+        return self.expert_count > 1 and self.expert_used_count > 0 and any(self.expert_bytes)
+
+    def active_layer_bytes(self) -> list[int]:
+        """Bytes of each block one token reads: everything but the experts the router doesn't pick.
+
+        Generation is memory-bound, so this (not the file size) is what sets a layer's time per
+        token. Dense models read every weight; an MoE layer reads its shared part plus
+        ``expert_used_count / expert_count`` of its expert tensors (on average, over many tokens).
+        """
+        if not self.is_moe:
+            return list(self.layer_bytes)
+        share = min(1.0, self.expert_used_count / self.expert_count)
+        return [
+            (total - experts) + int(experts * share)
+            for total, experts in zip(self.layer_bytes, self.expert_bytes, strict=True)
+        ]
 
     def _uniform_kv_per_token(self) -> int:
         heads_kv = self.head_count_kv or self.head_count
@@ -359,6 +382,8 @@ def read_gguf(path: Path) -> GGUFInfo:
         vocab_size=arch_key("vocab_size") or (embd_dims[1] if len(embd_dims) >= 2 else 0),
         split_count=max(1, _int(meta.get("split.count"))),
         nextn_layers=arch_key("nextn_predict_layers"),
+        expert_count=arch_key("expert_count"),
+        expert_used_count=arch_key("expert_used_count"),
         metadata={k: v for k, v in meta.items() if not isinstance(v, list) and not k.startswith("tokenizer.")},
     )
 
@@ -374,6 +399,8 @@ def read_gguf(path: Path) -> GGUFInfo:
         "value_length",
         "feed_forward_length",
         "vocab_size",
+        "expert_count",
+        "expert_used_count",
     ):
         if getattr(info, field_name) > MAX_DIMENSION:
             raise GGUFError(f"implausible {field_name} {getattr(info, field_name)}")
@@ -384,6 +411,7 @@ def read_gguf(path: Path) -> GGUFInfo:
 
     ordered = sorted(tensors, key=lambda t: t[1])
     layers = [0] * info.block_count
+    experts = [0] * info.block_count
     token_embd = output = 0
     for i, (name, offset) in enumerate(ordered):
         end = ordered[i + 1][1] if i + 1 < len(ordered) else data_size
@@ -399,6 +427,8 @@ def read_gguf(path: Path) -> GGUFInfo:
         block = _BLOCK.match(name)
         if block and int(block.group(1)) < info.block_count:
             layers[int(block.group(1))] += nbytes
+            if _EXPERTS.search(name):
+                experts[int(block.group(1))] += nbytes
         elif name.startswith("token_embd."):
             token_embd += nbytes
         elif name.startswith("output.") or name.startswith("output_norm."):
@@ -406,6 +436,7 @@ def read_gguf(path: Path) -> GGUFInfo:
         else:
             info.other_bytes += nbytes
     info.layer_bytes = layers
+    info.expert_bytes = experts
     info.input_bytes = token_embd
     # Tied embeddings: llama.cpp puts a copy of token_embd on the output layer's device.
     has_output_weight = any(n == "output.weight" for n, _ in tensors)
