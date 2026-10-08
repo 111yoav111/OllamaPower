@@ -678,7 +678,9 @@ def test_benchmark_report_for_the_docs(cluster):
     report = benchmark_markdown(c.admin("benchmarks.list"))
     assert "| Date | Model |" in report and "**Helper desk:** RTX 4090" in report
     rows = [line for line in report.splitlines() if line.startswith("| 20")]
-    assert len(rows) == 2 and any("| split | desk (secure) |" in r for r in rows)
+    assert any("| split | desk (secure) |" in r for r in rows) and any("| Ollama |" in r for r in rows)
+    # A dense model with every layer on a wired helper's GPU also gets the tensor-split variant measured.
+    assert any("| split (tensor) | desk (secure) |" in r for r in rows) and len(rows) == 3
 
 
 @pytestmark_e2e
@@ -695,3 +697,17 @@ def test_a_model_too_big_for_this_pc_goes_to_split_without_a_benchmark(cluster, 
     r = c.admin("models.benchmark", model="tiny")
     assert r["local"]["skipped"] and "too big for this PC alone" in r["local"]["error"]
     assert r["choice"] == "split", r
+
+
+@pytestmark_e2e
+def test_a_variant_that_fails_is_just_not_chosen(cluster, client):
+    c = cluster
+    split_speed(c, 30.0)
+    (c.hub_bin / "fail_variant").write_text("1")
+    r = c.admin("models.benchmark", model="tiny")
+    tensor = [s for s in r["splits"] if s.get("variant") == "tensor"]
+    assert tensor and not tensor[0]["ok"]
+    assert r["choice"] == "split"  # the plain split still won
+    rec = c.call(lambda: c.hub.plans.record("tiny"))
+    assert rec["degraded"] is None and rec["key"].get("variant", "") == ""
+    assert c.call(lambda: c.hub.plans.route("tiny")).variant == ""

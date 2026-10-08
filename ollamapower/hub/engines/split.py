@@ -203,6 +203,7 @@ class SplitSession:
                 for p in (plan.placements if plan else [])
             ],
             "cpu_layers": plan.cpu_layers if plan else 0,
+            "variant": self.spec.variant,
         }
 
     def alive(self) -> bool:
@@ -242,6 +243,7 @@ def _shared_ram(free: bool) -> int:
     return max(0, int(vm.available) - SHARED_RAM_KEEP) if free else int(vm.total * SHARED_RAM_SHARE)
 
 
+MTP_DRAFT_TOKENS = 3  # llama.cpp's default draft length
 HUB_RAM_KEEP = 3 * 1024 * MIB  # RAM the hub leaves to the system, the front door and the owner's programs
 
 
@@ -392,7 +394,8 @@ class SplitEngine:
                 # A timeout or an internal error may well not happen again: transient.
                 kind = exc.kind if isinstance(exc, SplitUnavailable) else TRANSIENT
                 self.last_failure[key] = (kind, time.monotonic())
-                if kind != AWAY:
+                if kind != AWAY and not spec.variant:
+                    # A variant (MTP, tensor split) that doesn't start is just not chosen; the plain plan stands.
                     self.hub.plans.fail(key, reason, tail, kind)
                 raise SplitUnavailable(reason, kind) from None
             session.active += 1
@@ -710,6 +713,15 @@ class SplitEngine:
         ]
         if plan.expert_override():
             args += ["-ot", plan.expert_override()]  # MoE: the hub's GPU layers keep their experts in RAM
+        if s.spec.variant == "mtp":
+            # The model's own MTP heads draft tokens; one pass through every machine checks several.
+            args += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(MTP_DRAFT_TOKENS)]
+        elif s.spec.variant == "tensor":
+            if plan.cpu_layers or plan.hub_expert_layers:
+                raise SplitUnavailable("tensor split needs every layer on a GPU or a helper", AWAY)
+            # Every device takes the same share of every layer as it took layers: same memory per device.
+            args[args.index("--tensor-split") + 1] = ",".join(str(max(1, p.bytes // MIB)) for p in plan.placements)
+            args += ["-sm", "tensor"]
         s.process = await spawn(
             *args,
             stdin=asyncio.subprocess.DEVNULL,

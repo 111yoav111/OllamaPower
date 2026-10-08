@@ -779,6 +779,12 @@ def models_benchmark(
     typer.echo(f"Result: {d.get('choice') or '-'} - {safe(d.get('reason', ''))}")
 
 
+def _engine_label(b: dict[str, Any]) -> str:
+    if b.get("engine") != "split":
+        return "Ollama"
+    return f"split ({b['variant']})" if b.get("variant") else "split"
+
+
 def benchmark_markdown(d: dict[str, Any]) -> str:
     """The benchmark history as a Markdown table for docs/BENCHMARKS.md (real numbers only)."""
     lines = [
@@ -800,7 +806,7 @@ def benchmark_markdown(d: dict[str, Any]) -> str:
             continue
         helpers = ", ".join(f"{h['name']} ({h['tunnel']})" for h in b.get("helpers") or []) or "-"
         lines.append(
-            f"| {ts(b['ts'])[:10]} | {b['model']} | {b['ctx']} | {'split' if b['engine'] == 'split' else 'Ollama'} | "
+            f"| {ts(b['ts'])[:10]} | {b['model']} | {b['ctx']} | {_engine_label(b)} | "
             f"{helpers} | {b.get('load_s', '-')} | {b.get('ttft_ms', '-')} | {_tps(b.get('prompt_tps'))} | "
             f"{_tps(b.get('gen_tps'))} |"
         )

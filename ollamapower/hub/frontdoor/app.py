@@ -47,7 +47,7 @@ from ...config import is_loopback_host
 from ...scheduling.request_queue import QueueFull, Ticket
 from ...scheduling.task_pool import TaskPriority
 from ...textsafe import safe_text
-from ..benchmark import BENCH_HEADER, CTX_HEADER, ENGINE_HEADER, HELPERS_HEADER
+from ..benchmark import BENCH_HEADER, CTX_HEADER, ENGINE_HEADER, HELPERS_HEADER, SPLIT_VARIANTS, VARIANT_HEADER
 from ..engines.split import ENGINE_SPLIT, SplitUnavailable
 from ..engines.translate import (
     OllamaStream,
@@ -160,7 +160,12 @@ def bench_spec(headers: Any) -> SplitSpec:
     except ValueError:
         ctx = 0
     helpers = tuple(h for h in headers.get(HELPERS_HEADER, "").split(",") if h)
-    return SplitSpec(ctx=ctx if 256 <= ctx <= 1 << 20 else 4096, helpers=helpers or None)
+    variant = headers.get(VARIANT_HEADER, "")
+    return SplitSpec(
+        ctx=ctx if 256 <= ctx <= 1 << 20 else 4096,
+        helpers=helpers or None,
+        variant=variant if variant in SPLIT_VARIANTS else "",
+    )
 
 
 def keep_alive_zero(value: Any) -> bool:

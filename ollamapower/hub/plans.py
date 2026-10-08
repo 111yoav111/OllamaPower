@@ -95,6 +95,7 @@ class SplitSpec:
     helpers: tuple[str, ...] | None = None
     exclude: tuple[str, ...] = ()
     layout: dict[str, Any] | None = field(default=None, hash=False)
+    variant: str = ""  # "" plain layer split, "mtp" (+ the model's MTP heads drafting), "tensor" (-sm tensor)
 
 
 def layout_problem(key: dict[str, Any], now: dict[str, Any]) -> str:
@@ -103,6 +104,8 @@ def layout_problem(key: dict[str, Any], now: dict[str, Any]) -> str:
     The helpers must lend the same device with about the same memory, and the layers must land
     on the same devices in about the same numbers; small free-memory jitter is tolerated.
     """
+    if key.get("variant", "") != now.get("variant", ""):
+        return f"the benchmark ran split mode as {key.get('variant') or 'layers'}, not {now.get('variant') or 'layers'}"
     want = {h.get("id"): h for h in key.get("helpers") or [] if isinstance(h, dict)}
     for h in now["helpers"]:
         old = want.get(h["id"])
@@ -304,7 +307,8 @@ class PlanBook:
             return SplitSpec(ctx=ctx, exclude=exclude)
         if rec["choice"] == "split" and not self.key_problem(model, rec):
             ids = tuple(h["id"] for h in rec["key"]["helpers"])
-            return SplitSpec(ctx=ctx, helpers=ids, exclude=exclude, layout=rec["key"])
+            variant = rec["key"].get("variant", "")
+            return SplitSpec(ctx=ctx, helpers=ids, exclude=exclude, layout=rec["key"], variant=variant)
         return None
 
     def stale(self, model: str, problem: str) -> None:

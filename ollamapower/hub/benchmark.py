@@ -33,6 +33,8 @@ if TYPE_CHECKING:
 BENCH_HEADER = "x-ollamapower-bench"
 ENGINE_HEADER = "x-ollamapower-engine"
 HELPERS_HEADER = "x-ollamapower-helpers"
+VARIANT_HEADER = "x-ollamapower-variant"
+SPLIT_VARIANTS = ("mtp", "tensor")  # tried after the plain split; kept only if faster (see variants())
 CTX_HEADER = "x-ollamapower-ctx"
 SEED = 42
 IDLE_WAIT = 120.0  # seconds a benchmark waits for a busy split session
@@ -54,18 +56,24 @@ def make_prompt(tokens: int) -> str:
     return f"Benchmark {secrets.token_hex(6)}.\n" + " ".join(words) + "\n\nSummarize the text above."
 
 
-def headers(hub: Hub, engine: str, ctx: int, helpers: tuple[str, ...] = ()) -> dict[str, str]:
+def headers(hub: Hub, engine: str, ctx: int, helpers: tuple[str, ...] = (), variant: str = "") -> dict[str, str]:
     out = {BENCH_HEADER: hub.bench_secret, ENGINE_HEADER: engine, CTX_HEADER: str(ctx)}
     if helpers:
         out[HELPERS_HEADER] = ",".join(helpers)
+    if variant:
+        out[VARIANT_HEADER] = variant
     return out
 
 
-async def run_workload(hub: Hub, model: str, ctx: int, engine: str, helpers: tuple[str, ...] = ()) -> dict[str, Any]:
+async def run_workload(
+    hub: Hub, model: str, ctx: int, engine: str, helpers: tuple[str, ...] = (), variant: str = ""
+) -> dict[str, Any]:
     """One measured run on ``engine`` ("local" or "split"). Never raises for engine failures."""
     cfg = hub.config
     result: dict[str, Any] = {"engine": engine, "ok": False, "error": ""}
-    h = headers(hub, engine, ctx, helpers)
+    if variant:
+        result["variant"] = variant
+    h = headers(hub, engine, ctx, helpers, variant)
     timeout = httpx.Timeout(connect=5.0, read=cfg.split.load_timeout, write=60.0, pool=cfg.hub.queue_timeout)
     async with httpx.AsyncClient(base_url=cfg.frontdoor_url, timeout=timeout, trust_env=False) as client:
         try:
@@ -134,6 +142,31 @@ def _error_text(raw: bytes, status: int) -> str:
     return safe_text(str(err or f"HTTP {status}"), 300)
 
 
+def variants(hub: Hub, model: str, best: dict[str, Any]) -> list[str]:
+    """Split variants worth measuring against ``best``, the fastest plain split run.
+
+    - "mtp": the model ships MTP heads (llama.cpp's NextN layers), which draft tokens that one
+      pass through every machine then checks: several tokens per trip through the network.
+    - "tensor": a dense model on wired helpers with every layer on a GPU or a helper (none on the
+      hub's CPU): every machine works on every token (llama.cpp ``-sm tensor``, experimental).
+    """
+    info = hub.plans.gguf_cache.get(hub.plans.digest_of(model) or model)
+    if info is None:
+        return []
+    out = []
+    if info.nextn_layers > 0:
+        out.append("mtp")
+    placement = best.get("placement") or {}
+    wired = all(
+        (n.link.get("kind") != "wifi")
+        for n in hub.registry.connected
+        if n.node_id in {h["id"] for h in best["helpers"]}
+    )
+    if not info.is_moe and wired and placement.get("cpu_layers") == 0:
+        out.append("tensor")
+    return out
+
+
 def candidate_sets(hub: Hub, model: str) -> list[tuple[str, ...]]:
     helpers = hub.plans.current_helpers(model)
     if not helpers:
@@ -183,10 +216,15 @@ async def benchmark_model(hub: Hub, model: str, ctx: int | None = None, automati
                 local = await run_workload(hub, model, ctx, "local")
             _store(hub, model, digest, ctx, local, None)
             splits = []
-            for i, ids in enumerate(sets, 1):
-                plans.benchmarking = {**plans.benchmarking, "stage": f"split {i}/{len(sets)}"}
+            runs: list[tuple[tuple[str, ...], str]] = [(ids, "") for ids in sets]
+            tried_variants = False
+            i = 0
+            while i < len(runs):
+                ids, variant = runs[i]
+                i += 1
+                plans.benchmarking = {**plans.benchmarking, "stage": f"split {i}/{len(runs)}"}
                 began = time.monotonic()
-                result = await run_workload(hub, model, ctx, "split", ids)
+                result = await run_workload(hub, model, ctx, "split", ids, variant)
                 if not result["ok"]:
                     # Why split mode didn't start (a helper stepping away is no failure); else: transient.
                     kind, at = hub.split.last_failure.get(model, (TRANSIENT, 0.0))
@@ -203,6 +241,13 @@ async def benchmark_model(hub: Hub, model: str, ctx: int | None = None, automati
                 _store(hub, model, digest, ctx, result, key)
                 splits.append(result)
                 await hub.split.stop(reason="benchmark")
+                if i == len(sets) and not tried_variants:
+                    # The plain runs are done: try what could beat the best of them on its helpers.
+                    tried_variants = True
+                    best = max((r for r in splits if r.get("ok")), key=lambda r: r["gen_tps"], default=None)
+                    if best is not None:
+                        best_ids = tuple(h["id"] for h in best["helpers"])
+                        runs += [(best_ids, v) for v in variants(hub, model, best)]
         finally:
             plans.benchmarking = None
         if any(s.get("ok") for s in splits):

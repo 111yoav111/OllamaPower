@@ -81,5 +81,11 @@ def test_real_benchmark_measures_split_and_decides(tmp_path, fake_ollama, make_c
         # The fake Ollama "generates" 20 tok/s; the real tiny model is far faster, so split wins.
         assert r["choice"] == "split" and split["gen_tps"] > 20
         assert c.call(lambda: c.hub.plans.route("tiny")) is not None
+        # A dense model with every layer on the (wired) helper: the tensor-split variant is measured too,
+        # on the real llama.cpp; whichever run was fastest is the plan.
+        tensor = [s for s in r["splits"] if s.get("variant") == "tensor"]
+        assert len(tensor) == 1 and tensor[0]["ok"], tensor
+        best = max((s for s in r["splits"] if s["ok"]), key=lambda s: s["gen_tps"])
+        assert c.call(lambda: c.hub.plans.route("tiny")).variant == best.get("variant", "")
     finally:
         close()
