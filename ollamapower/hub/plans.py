@@ -56,7 +56,7 @@ from ..llamacpp.install import Pins
 from ..ollama.blobs import ModelUnavailable, resolve
 from ..ollama.gguf import GGUFInfo
 from ..textsafe import safe_text
-from .planner import fits_on_hub, hub_need
+from .planner import fits_hub_memory, fits_on_hub, hub_need, predict_local
 
 if TYPE_CHECKING:
     from .runtime import Hub
@@ -148,6 +148,7 @@ class PlanBook:
         self.config = hub.config
         self.facts_cache: dict[str, dict[str, Any]] = {}  # digest -> facts
         self.gguf_cache: dict[str, GGUFInfo] = {}  # digest -> header (the KV cache depends on the context)
+        self.too_big: set[str] = set()  # models the hub can't hold in its VRAM and RAM: Ollama would page them
         self.last_request: dict[str, float] = {}  # model -> time.time() of its last client request
         self.last_activity = time.monotonic()
         self.bench_lock = asyncio.Lock()
@@ -274,6 +275,8 @@ class PlanBook:
 
     def route(self, model: str) -> SplitSpec | None:
         """The split session to use for ``model``'s next request, or None for plain Ollama."""
+        from .runtime import model_key
+
         if not model or self.hub.state is None:
             return None
         rec = self.record(model)
@@ -295,6 +298,9 @@ class PlanBook:
         if rec["pin"] == "split":
             if not self.current_helpers(model):
                 return None  # every helper is away (paused, yielding, outside its schedule): not a failure
+            return SplitSpec(ctx=ctx, exclude=exclude)
+        if rec["choice"] is None and model_key(model) in self.too_big and self.current_helpers(model):
+            # Not benchmarked yet, but plain Ollama would page it from disk: split is the only usable way.
             return SplitSpec(ctx=ctx, exclude=exclude)
         if rec["choice"] == "split" and not self.key_problem(model, rec):
             ids = tuple(h["id"] for h in rec["key"]["helpers"])
@@ -363,6 +369,10 @@ class PlanBook:
 
     # ----- facts ---------------------------------------------------------------------------
 
+    def unknown(self, model: str) -> bool:
+        """True until ``facts`` has looked at ``model`` (its current digest) once."""
+        return (self.digest_of(model) or model) not in self.facts_cache
+
     async def facts(self, model: str, refresh: bool = False) -> dict[str, Any]:
         """Size, layers and whether ``model`` fits the hub's VRAM (cached per model digest)."""
         digest = self.digest_of(model)
@@ -407,11 +417,19 @@ class PlanBook:
             out["kv"] = info.kv_bytes_total(ctx)
             out["needed"] = hub_need(info, ctx, margin)
             out["fits"] = fits_on_hub(info, ctx, hub, margin)  # the same check split mode starts with
+            ram = self.hub.split.hub_ram(free=False)
+            out["fits_hub_memory"] = fits_hub_memory(info, ctx, hub, ram, margin)
+            out["predicted_local_tps"] = round(1 / max(predict_local(info, ctx, hub, ram), 1e-9), 2)
+            if out["fits_hub_memory"]:
+                self.too_big.discard(model_key(model))
+            else:
+                self.too_big.add(model_key(model))
         else:
             out["fits"] = None
         loaded = next((m for m in self.hub.ollama.models if model_key(m.name) == model_key(model)), None)
         out["spilled"] = bool(loaded and loaded.spilled)
         out["worth_splitting"] = bool(base.get("splittable")) and (out["fits"] is False or out["spilled"])
+        out["too_big"] = out.get("fits_hub_memory") is False
         return out
 
     # ----- decision ------------------------------------------------------------------------

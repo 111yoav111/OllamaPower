@@ -664,7 +664,7 @@ def test_manual_benchmark_runs_after_automatic_ones_gave_up(cluster):
     c.call(give_up)
     assert c.call(lambda: c.hub.plans.describe("tiny")["auto_benchmark_stopped"])
     r = c.admin("models.benchmark", model="tiny")
-    assert r["choice"] == "split"
+    assert r["choice"] == "split", r
     assert c.call(lambda: c.hub.plans.record("tiny")["auto_bench"]) is None
 
 
@@ -679,3 +679,19 @@ def test_benchmark_report_for_the_docs(cluster):
     assert "| Date | Model |" in report and "**Helper desk:** RTX 4090" in report
     rows = [line for line in report.splitlines() if line.startswith("| 20")]
     assert len(rows) == 2 and any("| split | desk (secure) |" in r for r in rows)
+
+
+@pytestmark_e2e
+def test_a_model_too_big_for_this_pc_goes_to_split_without_a_benchmark(cluster, client, monkeypatch):
+    from ollamapower.hub.planner import Device
+
+    c = cluster
+    # A hub with almost no RAM: the tiny model doesn't fit, so Ollama would page it from disk.
+    monkeypatch.setattr(c.hub.split, "hub_ram", lambda free: Device("hub RAM", 1024, device="CPU", ram=True))
+    assert chat(client, c).status_code == 200  # the first request learns the model's size...
+    assert c.call(lambda: c.hub.split.session) is not None  # ...and is already served in split mode
+    facts = c.run(c.hub.plans.facts("tiny"))
+    assert facts["too_big"] and facts["predicted_local_tps"] > 0
+    r = c.admin("models.benchmark", model="tiny")
+    assert r["local"]["skipped"] and "too big for this PC alone" in r["local"]["error"]
+    assert r["choice"] == "split", r

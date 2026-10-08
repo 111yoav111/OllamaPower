@@ -293,6 +293,13 @@ def predict(plan: SplitPlan, info: GGUFInfo, hub_ram: Device | None = None) -> f
     return seconds + sum(2 * rtt + HOP_SECONDS for rtt in nodes.values())
 
 
+def fits_hub_memory(info: GGUFInfo, ctx: int, hub: list[Device], hub_ram: Device, margin: float = 0.0) -> bool:
+    """Can the hub hold ``info`` in its GPUs and RAM together (so Ollama runs it without paging from disk)?"""
+    units = [int(u * (1 + margin)) for u in unit_sizes(info, ctx)]
+    _, rest = _fill(units, with_reserve(hub, info, ctx))
+    return sum(units[:rest]) + info.input_bytes + info.other_bytes <= hub_ram.budget
+
+
 def predict_local(info: GGUFInfo, ctx: int, hub: list[Device], hub_ram: Device | None) -> float:
     """Seconds per token for plain Ollama on the hub alone: its GPUs from the top, its RAM, then the disk.
 

@@ -169,7 +169,18 @@ async def benchmark_model(hub: Hub, model: str, ctx: int | None = None, automati
                 except TimeoutError:
                     raise BenchmarkError("split mode is busy serving requests; try again later") from None
             await hub.split.stop(reason="benchmark")
-            local = await run_workload(hub, model, ctx, "local")
+            if facts.get("too_big"):
+                # Plain Ollama would page the model from disk for every token: minutes per answer,
+                # nothing worth measuring. Recorded as Ollama not running it, so split decides alone.
+                local = {
+                    "engine": "local",
+                    "ok": False,
+                    "skipped": True,
+                    "error": "too big for this PC alone (Ollama would read it from disk, about "
+                    f"{facts.get('predicted_local_tps', 0)} tok/s)",
+                }
+            else:
+                local = await run_workload(hub, model, ctx, "local")
             _store(hub, model, digest, ctx, local, None)
             splits = []
             for i, ids in enumerate(sets, 1):

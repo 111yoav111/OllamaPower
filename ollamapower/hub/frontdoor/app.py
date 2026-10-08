@@ -493,6 +493,12 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     if forced == "split":
                         spec = bench_spec(request.headers)
                     elif forced != "local":
+                        if hub.plans.unknown(stream.model) and hub.registry.connected:
+                            # First request for this model with helpers around: learn its size once
+                            # (Ollama's /api/show and the GGUF header, a few ms), so a model too big
+                            # for this PC goes to split mode instead of crawling from disk.
+                            with contextlib.suppress(Exception):
+                                await wait_for(hub.plans.facts(stream.model), 5.0)
                         spec = hub.plans.route(stream.model)
                 if spec is not None:
                     origin = request.headers.get("origin")
