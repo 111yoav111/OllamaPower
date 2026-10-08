@@ -300,3 +300,17 @@ async def test_rpc_stop_right_after_a_tunnel_test_start_stops_it(agent):
     await agent.client._on_message(agent.channel, {"type": "rpc_stop", "session_id": "b1"})
     await wait_for(asyncio.gather(*agent.client._background), 5)
     assert agent.rpc.benches == {}  # was left running until its two-minute expiry
+
+
+def test_rpc_server_uses_the_cores_and_stays_on_loopback(monkeypatch):
+    import psutil
+
+    from ollamapower.agent import rpc_manager
+
+    monkeypatch.setattr(psutil, "cpu_count", lambda logical=True: 8)
+    args = rpc_manager.server_args("rpc-server", "CPU", cache=True)
+    assert args[args.index("-H") + 1] == "127.0.0.1"
+    assert args[args.index("-t") + 1] == "7"  # not rpc-server's default of 2; one core left for the owner
+    assert "-c" in args
+    monkeypatch.setattr(psutil, "cpu_count", lambda logical=True: 2)
+    assert rpc_manager.rpc_threads() == 2

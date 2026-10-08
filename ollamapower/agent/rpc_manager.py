@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import socket
 import time
 from collections import deque
@@ -125,6 +126,30 @@ def device_cap_mib(device: Device, index: int | None, rules: LendingRules) -> in
     if rules.max_vram_percent > 0:
         cap = min(cap, device.total_mib * rules.max_vram_percent // 100)
     return max(0, cap)
+
+
+def rpc_threads() -> int:
+    """CPU threads for rpc-server: the physical cores, one left for the owner on a machine with more than two.
+
+    rpc-server's own default is 2, which leaves a CPU-lending helper several times slower than it can be
+    (generation on a CPU is limited by memory bandwidth, which one or two cores can't saturate).
+    """
+    try:
+        import psutil
+
+        cores = psutil.cpu_count(logical=False) or 0
+    except Exception:  # noqa: BLE001 - psutil missing or failing
+        cores = 0
+    cores = cores or os.cpu_count() or 2
+    return max(1, cores - 1) if cores > 2 else cores
+
+
+def server_args(exe: str, device: str, cache: bool) -> list[str]:
+    """rpc-server's command line: always on loopback (the relay is the only way in)."""
+    args = [exe, "-H", "127.0.0.1", "-d", device, "-t", str(rpc_threads())]
+    if cache:
+        args.append("-c")
+    return args
 
 
 def cpu_cap_mib(rules: LendingRules) -> int:
@@ -314,10 +339,9 @@ class RpcManager:
     async def _launch(self, session: RpcSession, cache: bool) -> None:
         assert self.binaries is not None and self.binaries.rpc_server is not None
         exe = self.binaries.rpc_server
-        args = [str(exe), "-H", "127.0.0.1", "-d", session.device]
+        args = server_args(str(exe), session.device, cache)
         if cache:
             self.cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            args.append("-c")
         env = {**llamacpp_env(), "LLAMA_CACHE": str(self.cache_dir)}
         last_error = ""
         for _ in range(3):  # another program may grab the port between choosing and binding it
