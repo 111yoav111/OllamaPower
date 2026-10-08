@@ -81,6 +81,7 @@ class RpcSession:
     cap_mib: int
     hub_ip: str
     model: str = ""
+    ram_mib: int = 0  # RAM lent beside a GPU (a second device on the same rpc-server), 0 = none
     started: float = field(default_factory=time.time)
     process: asyncio.subprocess.Process | None = None
     port: int = 0
@@ -241,6 +242,11 @@ class RpcManager:
             log.warning("re-probing devices failed: %s", type(exc).__name__)
         return self.binaries.devices
 
+    def _integrated(self, name: str) -> bool:
+        """Is ``name`` an integrated GPU (whose "VRAM" is the RAM it would also be lending)?"""
+        devices = self.binaries.devices if self.binaries is not None else []
+        return any(d.name == name and d.integrated for d in devices)
+
     async def _choose(self, wanted: str, rules: LendingRules) -> tuple[str, int, int]:
         """(device name, MiB lent, MiB total) for the requested device, or the best one allowed."""
         devices = await self._fresh_devices()
@@ -298,12 +304,17 @@ class RpcManager:
             device, cap_mib, total_mib = await self._choose(message.get("device", ""), rules)
             if message.get("vram_cap_mb", 0) > 0:
                 cap_mib = min(cap_mib, int(message["vram_cap_mb"]))
+            ram_mib = 0
+            if message.get("ram") is True and device != "CPU" and rules.allow_cpu and not self._integrated(device):
+                # A hub that can use both asks for them: the GPU's layers, then the RAM's, one rpc-server.
+                ram_mib = await asyncio.to_thread(cpu_cap_mib, rules)
             session = RpcSession(
                 session_id=message["session_id"],
                 device=device,
                 cap_mib=cap_mib,
                 hub_ip=hub_ip,
                 model=safe_text(str(message.get("model", "")), 120),
+                ram_mib=ram_mib,
             )
             cache = bool(message.get("cache")) and rules.disk_cache
             try:
@@ -322,8 +333,9 @@ class RpcManager:
                 await self._stop(session, "failed to start")
                 raise
             self.session = session
+            lent = f"{device} ({cap_mib} MiB)" + (f" and RAM ({ram_mib} MiB)" if ram_mib else "")
             self.note(
-                f"lending {device} ({cap_mib} MiB) to the hub for {session.model or 'a model'} "
+                f"lending {lent} to the hub for {session.model or 'a model'} "
                 f"({tunnel.mode} tunnel{', disk cache' if cache else ''})"
             )
             return {
@@ -332,6 +344,11 @@ class RpcManager:
                 "device": device,
                 "free_mib": cap_mib,
                 "total_mib": total_mib,
+                **(
+                    {"devices": [{"device": device, "free_mib": cap_mib}, {"device": "CPU", "free_mib": ram_mib}]}
+                    if ram_mib
+                    else {}
+                ),
                 "build": self.binaries.build,
                 "cache": cache,
             }
@@ -339,7 +356,7 @@ class RpcManager:
     async def _launch(self, session: RpcSession, cache: bool) -> None:
         assert self.binaries is not None and self.binaries.rpc_server is not None
         exe = self.binaries.rpc_server
-        args = server_args(str(exe), session.device, cache)
+        args = server_args(str(exe), session.device + (",CPU" if session.ram_mib else ""), cache)
         if cache:
             self.cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         env = {**llamacpp_env(), "LLAMA_CACHE": str(self.cache_dir)}

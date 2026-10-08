@@ -29,6 +29,7 @@ from ollamapower.core.encrypt_layer import generate_rsa_keypair
 from ollamapower.eventlog import EventLog
 from ollamapower.hub.frontdoor.app import create_app
 from ollamapower.hub.frontdoor.server import build_server
+from ollamapower.hub.planner import Device
 from ollamapower.hub.runtime import Hub
 from ollamapower.llamacpp.install import Pins
 from ollamapower.state import StateStore
@@ -628,3 +629,32 @@ def test_a_helper_lending_its_cpu_is_planned_as_ram_at_its_own_speed():
     gpu = helper_device(node, {"device": "Vulkan0", "free_mib": 4096})
     assert not gpu.ram and gpu.bandwidth == 0.0  # a GPU: the planner's GPU default
     assert clean_capabilities({"ram_bandwidth": 1e30})["ram_bandwidth"] == 0  # implausible: unknown
+
+
+def test_a_helper_lends_its_gpu_and_its_ram_in_one_session(tmp_path, fake_ollama, make_config, client, monkeypatch):
+    from ollamapower.agent import rpc_manager
+
+    monkeypatch.setattr(rpc_manager, "cpu_cap_mib", lambda rules: 4096)
+    c, close = make_cluster(tmp_path, fake_ollama, make_config, hub_devices=[], allow_cpu=True)
+    try:
+        # A GPU too small for the model: its RAM must take the rest (the hub's RAM is kept out of it).
+        monkeypatch.setattr(c.agent.rpc, "_choose", _small_gpu(c.agent.rpc._choose))
+        monkeypatch.setattr(c.hub.split, "hub_ram", lambda free: Device("hub RAM", 0, device="CPU", ram=True))
+        c.admin("models.plan", model="tiny", ctx=512)
+        assert chat(client, c).status_code == 200
+        args = json.loads((c.hub_bin / "args.json").read_text())
+        # The helper's rpc-server exposes its GPU (RPC0) and its RAM (RPC1); the GPU is too small for
+        # even one layer here, so the layers go to the helper's RAM.
+        assert args[args.index("--device") + 1] == "RPC1"
+        lent = c.call(lambda: c.agent.rpc.session)
+        assert lent.ram_mib == 4096
+    finally:
+        close()
+
+
+def _small_gpu(choose):
+    async def small(wanted, rules):
+        name, _, total = await choose(wanted, rules)
+        return name, 1, total  # 1 MiB of VRAM: less than llama.cpp's own reserve
+
+    return small

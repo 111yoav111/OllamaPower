@@ -120,6 +120,7 @@ SCHEMAS: dict[str, tuple[Direction, dict[str, Field]]] = {
             "tunnel": (DICT, True),
             "model": (STR, False),
             "purpose": (STR, False),  # "rpc" (default) or "bench" (a tunnel test; added in 1.1)
+            "ram": (BOOL, False),  # lend RAM beside the GPU when the owner allows it (added in 2.1)
         },
     ),
     "rpc_ready": (Direction.TO_HUB, {"session_id": (STR, True), "endpoint": (DICT, False)}),

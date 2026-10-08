@@ -192,6 +192,9 @@ class SplitSession:
                     "tunnel": x.mode,
                     "device": x.endpoint.get("device", ""),
                     "lent_gib": round(int(x.endpoint.get("free_mib", 0)) / 1024),
+                    "ram_gib": round(
+                        sum(int(d["free_mib"]) for d in x.endpoint.get("devices") or [] if d["device"] == "CPU") / 1024
+                    ),
                 }
                 for x in self.leases
             ],
@@ -240,6 +243,24 @@ def _shared_ram(free: bool) -> int:
 
 
 HUB_RAM_KEEP = 3 * 1024 * MIB  # RAM the hub leaves to the system, the front door and the owner's programs
+
+
+def _endpoint_devices(endpoint: dict[str, Any]) -> list[dict[str, Any]]:
+    """The devices one helper's rpc-server exposes, in its own order (a GPU, then its RAM); [] = just ``device``."""
+    raw = endpoint.get("devices")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for d in raw[:4]:
+        if isinstance(d, dict) and _count(d.get("free_mib")) and isinstance(d.get("device"), str):
+            out.append({"device": safe_text(d["device"], 40), "free_mib": min(d["free_mib"], 1 << 24)})
+    return out
+
+
+def helper_devices(node: Node, endpoint: dict[str, Any]) -> list[Device]:
+    """Every device a helper lent for one session, in its rpc-server's order."""
+    entries = endpoint.get("devices") or [endpoint]
+    return [helper_device(node, e) for e in entries]
 
 
 def helper_device(node: Node, endpoint: dict[str, Any]) -> Device:
@@ -429,7 +450,7 @@ class SplitEngine:
         await asyncio.to_thread(binaries.probe)
         hub_devices = [_hub_device(d, free=True) for d in preferred(binaries.devices)]
         by_node = {x.node.node_id: x for x in s.leases}
-        devices = [helper_device(x.node, x.endpoint) for x in s.leases]
+        devices = [d for x in s.leases for d in helper_devices(x.node, x.endpoint)]
         try:
             s.plan = plan_split(
                 s.model,
@@ -443,7 +464,12 @@ class SplitEngine:
         except PlanError as exc:
             raise SplitUnavailable(str(exc)) from None
         # Helpers that got no layers are released now; the rest in llama.cpp's device order (= --rpc order).
-        used = [by_node[p.device.node_id] for p in s.plan.helpers if p.device.node_id]
+        # One lease per helper, even when its GPU and its RAM both got layers.
+        used: list[HelperLease] = []
+        for p in s.plan.helpers:
+            lease = by_node[p.device.node_id] if p.device.node_id else None
+            if lease is not None and all(lease is not u for u in used):
+                used.append(lease)
         for lease in s.leases:
             if lease not in used:
                 await self._send_stop(lease)
@@ -593,6 +619,7 @@ class SplitEngine:
                         device="",
                         vram_cap_mb=0,
                         cache=True,
+                        ram=True,  # a helper whose owner allows it lends its RAM beside its GPU
                         tunnel={"mode": lease.mode, **({"cert": lease.identity.cert_pem} if lease.identity else {})},
                         model=s.model,
                     )
@@ -613,6 +640,7 @@ class SplitEngine:
                             "port": port,
                             "free_mib": min(free, 1 << 24),
                             "device": safe_text(str(endpoint.get("device", "")), 40),
+                            "devices": _endpoint_devices(endpoint),
                         }
                         try:
                             if lease.identity is not None:
@@ -641,8 +669,15 @@ class SplitEngine:
     async def _launch(self, s: SplitSession, binaries: LlamaCpp) -> None:
         assert s.plan is not None and s.files is not None and binaries.llama_server is not None
         plan = s.plan
-        rpc_names = {x.node.node_id: f"RPC{i}" for i, x in enumerate(s.leases)}
-        device_names = [rpc_names[p.device.node_id] if p.device.node_id else p.device.device for p in plan.placements]
+        # llama.cpp numbers RPC devices across servers in --rpc order, each server's devices in its own order.
+        rpc_names: dict[tuple[str, str], str] = {}
+        for lease in s.leases:
+            for d in helper_devices(lease.node, lease.endpoint):
+                rpc_names[(lease.node.node_id, d.device)] = f"RPC{len(rpc_names)}"
+        device_names = [
+            rpc_names[(p.device.node_id, p.device.device)] if p.device.node_id else p.device.device
+            for p in plan.placements
+        ]
         s.port = _free_port()
         args = [
             str(binaries.llama_server),
