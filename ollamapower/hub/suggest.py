@@ -98,6 +98,10 @@ def _pool(nodes: list[Node]) -> tuple[list[Device], list[str]]:
         gpu = _helper_gpu(node)
         if gpu is not None:
             devices.append(helper_device(node, {"device": gpu[0], "free_mib": gpu[1] // MIB}))
+            unified = any(g.get("unified") for g in node.gpus())  # its "VRAM" is the RAM itself
+            ram = _helper_ram(node) if node.lending.get("allow_cpu") and not unified else 0
+            if ram:  # a helper lends its RAM beside its GPU when its owner allows CPU lending
+                devices.append(helper_device(node, {"device": "CPU", "free_mib": ram // MIB}))
         elif node.lending.get("allow_cpu"):
             ram = _helper_ram(node)
             if ram:

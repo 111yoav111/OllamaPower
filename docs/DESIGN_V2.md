@@ -65,7 +65,7 @@ Raspberry Pi 5 at ~13 tok/s with tensor parallelism.
 
 | Setup | Model | Alone | Pooled (estimate) |
 |---|---|---|---|
-| 2 PCs, 32 GB RAM each, no GPU | gpt-oss-120b (65 GB, MoE) | doesn't fit | ~8-10 tok/s |
+| 3 PCs, 32 GB RAM each, no GPU | gpt-oss-120b (65 GB, MoE) | doesn't fit | ~8-10 tok/s |
 | hub with 8 GB GPU + 3 PCs, 48 GB RAM each | Qwen3-235B-A22B Q4 (~140 GB, MoE) | doesn't fit | ~2.5-3.5 tok/s |
 | 2 PCs, 32 GB RAM each, wired | dense 70B Q4 (40 GB) | doesn't fit (disk paging, <0.2 tok/s) | ~0.9 tok/s; ~1.5 with tensor split or speculation |
 
