@@ -256,3 +256,22 @@ def test_paging_from_disk_is_what_makes_a_big_model_crawl_on_one_pc():
     # A slow link costs per token, but far less than the disk.
     wifi = plan_split("m", info, 1024, [], [ram("laptop", 10.0, node="a", rtt_ms=5)], hub_ram=ram("hub", 5.0))
     assert pooled.seconds_per_token < wifi.seconds_per_token < alone
+
+
+def test_moe_on_the_hub_keeps_hot_parts_on_its_gpu_and_experts_in_its_ram():
+    info = moe(layers=12, layer_gb=1.0, experts_share=0.9)  # 0.1 GB hot + 0.9 GB experts per layer
+    hub, helpers = [gpu("hub", 2.0)], [ram("laptop", 20.0, node="a")]
+    dense = plan_split("m", model(layers=12), 1024, hub, helpers, hub_ram=ram("hub RAM", 6.0))
+    sparse = plan_split("m", info, 1024, hub, helpers, hub_ram=ram("hub RAM", 6.0))
+    on_gpu = next(p for p in sparse.placements if p.device.label == "hub")
+    assert on_gpu.layers > 2 * next(p for p in dense.placements if p.device.label == "hub").layers
+    assert sparse.hub_expert_layers == list(range(sparse.units - on_gpu.layers, sparse.units - 1))
+    assert sparse.seconds_per_token < dense.seconds_per_token
+    assert sparse.expert_override().startswith(r"blk\.(") and sparse.expert_override().endswith(r"_exps\.=CPU")
+    assert not dense.hub_expert_layers and dense.expert_override() == ""
+
+
+def test_hub_experts_only_go_where_the_hubs_ram_can_hold_them():
+    info = moe(layers=12, layer_gb=1.0, experts_share=0.9)
+    plan = plan_split("m", info, 1024, [gpu("hub", 2.0)], [ram("laptop", 20.0, node="a")], hub_ram=ram("hub RAM", 3.5))
+    assert len(plan.hub_expert_layers) == 3  # 3 x 0.9 GB fit in the hub's RAM (beside the embeddings)

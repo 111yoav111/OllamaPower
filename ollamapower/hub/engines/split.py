@@ -708,6 +708,8 @@ class SplitEngine:
             "-ngl",
             str(plan.gpu_layers),
         ]
+        if plan.expert_override():
+            args += ["-ot", plan.expert_override()]  # MoE: the hub's GPU layers keep their experts in RAM
         s.process = await spawn(
             *args,
             stdin=asyncio.subprocess.DEVNULL,

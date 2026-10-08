@@ -86,6 +86,14 @@ class SplitPlan:
     weights_bytes: int = 0
     cpu_bytes: int = 0
     seconds_per_token: float = 0.0  # predicted generation time (see ``predict``)
+    hub_expert_layers: list[int] = field(default_factory=list)  # blocks on the hub's GPUs whose experts stay in RAM
+
+    def expert_override(self) -> str:
+        """llama.cpp's ``-ot`` rule keeping those experts in the hub's RAM ("" if none)."""
+        if not self.hub_expert_layers:
+            return ""
+        layers = "|".join(str(i) for i in self.hub_expert_layers)
+        return rf"blk\.({layers})\.ffn_[a-z_]*_exps\.=CPU"
 
     @property
     def gpu_layers(self) -> int:
@@ -220,13 +228,36 @@ def plan_split(
     # (stable: equally fast helpers keep the caller's preference).
     gpus = sorted((d for d in reversed(helpers) if not d.ram), key=lambda d: d.speed)
     rams = sorted((d for d in reversed(helpers) if d.ram), key=lambda d: d.speed)
-    top_placed, rest = _fill(units, with_reserve([*gpus, *hub], info, ctx))
+    ram_budget = 0
+    if hub_ram is not None:
+        ram_budget = max(0, hub_ram.budget - device_reserve(info, ctx) - info.input_bytes - info.other_bytes)
+    # MoE on the hub: its GPUs hold the hot part of their layers and its RAM their experts
+    # (llama.cpp's --n-cpu-moe; GPU and RAM are on the same machine, so no network per layer).
+    offload = hub_ram is not None and bool(hub) and info.is_moe
+    experts = [int(e * (1 + margin)) for e in info.expert_bytes] + [0] if offload else [0] * len(units)
+    hub_units = [u - e for u, e in zip(units, experts, strict=True)]
+    hub_placed, below_hub = _fill(hub_units, with_reserve(hub, info, ctx))
+    on_hub = range(below_hub, len(units) - 1)
+    if sum(experts[i] for i in on_hub) > ram_budget:
+        # Not all those experts fit in the hub's RAM: keep the top layers whose experts do.
+        keep, used = 0, 0
+        for i in reversed(on_hub):
+            if used + experts[i] > ram_budget:
+                break
+            used, keep = used + experts[i], keep + 1
+        start = len(units) - 1 - keep
+        hub_placed, left = _fill(hub_units[start:], with_reserve(hub, info, ctx))
+        below_hub = start + left
+        on_hub = range(below_hub, len(units) - 1)
+    hub_experts = sum(experts[i] for i in on_hub)
+    gpu_placed, rest = _fill(units[:below_hub], with_reserve(gpus, info, ctx))
+    top_placed = [*gpu_placed, *hub_placed]
     cpu = rest
     if hub_ram is not None:
         # The hub's RAM holds the bottom layers plus the token embeddings and small tensors. Helpers
         # lending RAM go first (a few ms per token, and the hub's RAM stays free for its owner),
         # unless the hub's RAM is clearly faster.
-        budget = max(0, hub_ram.budget - device_reserve(info, ctx) - info.input_bytes - info.other_bytes)
+        budget = max(0, ram_budget - hub_experts)
         hub_first = bool(rams) and hub_ram.speed > HUB_RAM_PREFERRED * max(d.speed for d in rams)
         bottom = 0
         if hub_first or not rams:
@@ -262,7 +293,8 @@ def plan_split(
         cpu_layers=cpu,
         placements=placements,
         weights_bytes=info.weights_bytes,
-        cpu_bytes=sum(units[:cpu]) + info.input_bytes + info.other_bytes,
+        cpu_bytes=sum(units[:cpu]) + info.input_bytes + info.other_bytes + hub_experts,
+        hub_expert_layers=list(on_hub) if offload else [],
     )
     plan.seconds_per_token = predict(plan, info, hub_ram)
     return plan
@@ -283,6 +315,12 @@ def predict(plan: SplitPlan, info: GGUFInfo, hub_ram: Device | None = None) -> f
     active = _active_units(info)
     ram_speed = hub_ram.speed if hub_ram is not None else RAM_BANDWIDTH
     seconds = sum(active[: plan.cpu_layers]) / ram_speed
+    if plan.hub_expert_layers:
+        share = min(1.0, info.expert_used_count / max(info.expert_count, 1))
+        for i in plan.hub_expert_layers:  # read from the hub's RAM, not its GPU
+            moved = info.expert_bytes[i] * share
+            active[i] -= moved
+            seconds += moved / ram_speed
     first = plan.cpu_layers
     nodes: dict[str, float] = {}
     for p in plan.placements:
