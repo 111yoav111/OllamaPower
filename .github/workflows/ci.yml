@@ -52,6 +52,9 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install --require-hashes -r requirements-dev.lock
       - run: python -m pip install --no-deps -e .
+      - name: macOS split-mode diagnostics (temporary)
+        if: runner.os == 'macOS'
+        run: python -m pytest -q -x -o log_cli=true --log-cli-level=DEBUG "tests/test_split.py::test_planned_model_runs_split_with_the_helper" || true
       - run: python -m pytest -q --maxfail=3  # stop early: failures show in full and minutes are saved
 
   checks:
