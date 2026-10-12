@@ -4,16 +4,14 @@ name: CI
 # - runs on pushes to main/dev and on pull requests, not on every branch push
 # - skips docs-only changes
 # - Linux on Python 3.11-3.13 plus one Windows job (helpers are mostly Windows
-#   gaming PCs); one macOS job on pushes to main; the full Linux/Windows/macOS
-#   x 3.11-3.13 grid nightly and via "Run workflow" (full_matrix)
+#   gaming PCs); the full Linux/Windows/macOS x 3.11-3.13 grid only via
+#   "Run workflow" (full_matrix): no scheduled runs, so no emails on quiet days
 on:
   push:
     branches: [main, dev]
     paths-ignore: ["**.md"]
   pull_request:
     paths-ignore: ["**.md"]
-  schedule:
-    - cron: "17 3 * * *"  # nightly full grid
   workflow_dispatch:
     inputs:
       full_matrix:
@@ -33,15 +31,12 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        os: ${{ fromJSON((inputs.full_matrix || github.event_name == 'schedule') && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest"]') }}
+        os: ${{ fromJSON(inputs.full_matrix && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest"]') }}
         python: ["3.11", "3.12", "3.13"]
         include:
           # Always test on Windows once, on the oldest supported Python (merged
           # into the grid when full_matrix already has it).
           - os: windows-latest
-            python: "3.11"
-          # macOS once on pushes to main (elsewhere this resolves to an existing Linux job).
-          - os: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'macos-latest' || 'ubuntu-latest' }}
             python: "3.11"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
@@ -52,9 +47,6 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install --require-hashes -r requirements-dev.lock
       - run: python -m pip install --no-deps -e .
-      - name: macOS split-mode diagnostics (temporary)
-        if: runner.os == 'macOS'
-        run: python -m pytest -q -x -o log_cli=true --log-cli-level=DEBUG "tests/test_split.py::test_planned_model_runs_split_with_the_helper" || true
       - run: python -m pytest -q --maxfail=3  # stop early: failures show in full and minutes are saved
 
   checks:
