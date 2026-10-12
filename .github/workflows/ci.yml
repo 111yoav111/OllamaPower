@@ -1,17 +1,11 @@
 name: CI
 
-# Kept cheap on purpose (private repo: Windows minutes count 2x, macOS 10x):
-# - runs on pushes to main/dev and on pull requests, not on every branch push
-# - skips docs-only changes
-# - Linux on Python 3.11-3.13 plus one Windows job (helpers are mostly Windows
-#   gaming PCs); the full Linux/Windows/macOS x 3.11-3.13 grid only via
-#   "Run workflow" (full_matrix): no scheduled runs, so no emails on quiet days
+# Manual only: the owner's GitHub Actions minutes are used up, and runs that
+# can't start (or fail) email the owner. Tests run locally before every push
+# (`ruff check . && ruff format --check . && python -m pytest -q`).
+# "Run workflow" on GitHub runs Linux 3.11-3.13 plus one Windows job, or the
+# full Linux/Windows/macOS grid with full_matrix.
 on:
-  push:
-    branches: [main, dev]
-    paths-ignore: ["**.md"]
-  pull_request:
-    paths-ignore: ["**.md"]
   workflow_dispatch:
     inputs:
       full_matrix:
