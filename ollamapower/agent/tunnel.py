@@ -74,10 +74,18 @@ class HelperRelay:
     def mode(self) -> str:
         return "secure" if self.tls is not None else "direct"
 
-    async def start(self, bind_ip: str) -> int:
+    async def start(self, bind_ip: str, port: int = 0) -> int:
         # Our own accept loop instead of asyncio.start_server: the peer's address is
         # checked on the raw socket, and TLS starts on a socket nobody has read from yet.
-        listener = listen_socket(bind_ip, 0, backlog=MAX_CONNECTIONS)  # exclusive on Windows
+        try:
+            listener = listen_socket(bind_ip, port, backlog=MAX_CONNECTIONS)  # exclusive on Windows
+        except OSError:
+            if not port:
+                raise
+            # Taken (a tunnel test while a session runs, another program): any port, which the
+            # owner's firewall may block - the hub then says so.
+            log.warning("relay port %d is in use; using a random port", port)
+            listener = listen_socket(bind_ip, 0, backlog=MAX_CONNECTIONS)
         listener.setblocking(False)
         self.listener = listener
         self.port = listener.getsockname()[1]

@@ -249,6 +249,7 @@ def test_llama_cpp_runs_with_pci_device_order(tmp_path, monkeypatch):
     (tmp_path / "rpc-server").write_text("")
     LlamaCpp.find(tmp_path).probe()
     assert seen["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"  # CUDA numbers GPUs like NVML and the owner's views
+    assert seen["GGML_NO_BACKTRACE"] == "1"  # an abort says why in its last lines, not a gdb backtrace
 
 
 def test_backend_choice():

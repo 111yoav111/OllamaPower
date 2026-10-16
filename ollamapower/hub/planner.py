@@ -192,6 +192,30 @@ def hub_need(info: GGUFInfo, ctx: int, margin: float = 0.0) -> int:
     return int(sum(unit_sizes(info, ctx)) * (1 + margin)) + device_reserve(info, ctx)
 
 
+def _place_hub(
+    hub_units: list[int], experts: list[int], devices: list[Device], start: int
+) -> tuple[list[tuple[Device, int, int]], int, list[int]]:
+    """The hub's GPUs take ``hub_units[start:]`` from the top (an MoE layer without its experts), then
+    each GPU fills the room it has left with the experts of its own top layers, like llama.cpp's
+    --n-cpu-moe. Returns the placements, the first layer on the hub's GPUs, and the layers whose
+    experts stay in the hub's RAM."""
+    placed, left = _fill(hub_units[start:], devices)
+    first = below = start + left
+    out, in_ram = [], []
+    for device, count, used in placed:
+        room = device.budget - used
+        for i in reversed(range(first, first + count)):
+            if not experts[i]:
+                continue
+            if experts[i] <= room:
+                room, used = room - experts[i], used + experts[i]
+            else:
+                in_ram.append(i)
+        out.append((device, count, used))
+        first += count
+    return out, below, sorted(in_ram)
+
+
 def fits_on_hub(info: GGUFInfo, ctx: int, hub: list[Device], margin: float = 0.0) -> bool:
     """THE check "does the model fit on the hub's GPUs alone?" - the facts, the split start and the
     planner all use it, so they never disagree (a model one says fits and another says doesn't would be
@@ -236,19 +260,13 @@ def plan_split(
     offload = hub_ram is not None and bool(hub) and info.is_moe
     experts = [int(e * (1 + margin)) for e in info.expert_bytes] + [0] if offload else [0] * len(units)
     hub_units = [u - e for u, e in zip(units, experts, strict=True)]
-    hub_placed, below_hub = _fill(hub_units, with_reserve(hub, info, ctx))
-    on_hub = range(below_hub, len(units) - 1)
-    if sum(experts[i] for i in on_hub) > ram_budget:
-        # Not all those experts fit in the hub's RAM: keep the top layers whose experts do.
-        keep, used = 0, 0
-        for i in reversed(on_hub):
-            if used + experts[i] > ram_budget:
-                break
-            used, keep = used + experts[i], keep + 1
-        start = len(units) - 1 - keep
-        hub_placed, left = _fill(hub_units[start:], with_reserve(hub, info, ctx))
-        below_hub = start + left
-        on_hub = range(below_hub, len(units) - 1)
+    hub_devices = with_reserve(hub, info, ctx)
+    hub_placed, below_hub, on_hub = _place_hub(hub_units, experts, hub_devices, 0)
+    start = below_hub
+    while sum(experts[i] for i in on_hub) > ram_budget and start < len(units) - 1:
+        # The experts left in the hub's RAM don't fit: give up the hub's bottom layer, one at a time.
+        start += 1
+        hub_placed, below_hub, on_hub = _place_hub(hub_units, experts, hub_devices, start)
     hub_experts = sum(experts[i] for i in on_hub)
     gpu_placed, rest = _fill(units[:below_hub], with_reserve(gpus, info, ctx))
     top_placed = [*gpu_placed, *hub_placed]
@@ -284,6 +302,8 @@ def plan_split(
     for d, n, b in placed:
         placements.append(Placement(d, n, b, sum(caches[first : first + n])))
         first += n
+    if not any(p.device.node_id for p in placements) and below_hub == 0:
+        raise PlanError(f"{model} fits in the hub's GPU and RAM together; helpers would only add network hops")
     if not any(p.device.node_id for p in placements):
         raise PlanError(f"no helper has room for even one layer of {model} (each layer needs ~{max(units) // MIB} MB)")
     plan = SplitPlan(
@@ -294,7 +314,7 @@ def plan_split(
         placements=placements,
         weights_bytes=info.weights_bytes,
         cpu_bytes=sum(units[:cpu]) + info.input_bytes + info.other_bytes + hub_experts,
-        hub_expert_layers=list(on_hub) if offload else [],
+        hub_expert_layers=on_hub,
     )
     plan.seconds_per_token = predict(plan, info, hub_ram)
     return plan

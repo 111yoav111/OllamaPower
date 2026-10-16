@@ -14,7 +14,7 @@ from ollamapower.config import Config
 from ollamapower.hub.nodes import Node, clean_capabilities, clean_lending, clean_telemetry
 from ollamapower.hub.planner import GIB, Device
 from ollamapower.hub.runtime import Hub
-from ollamapower.hub.suggest import catalog_info, load_catalog, pool_devices, suggest
+from ollamapower.hub.suggest import catalog_info, load_catalog, pool_devices, suggest, verdict
 from ollamapower.llamacpp.install import Pins
 from ollamapower.ollama.client import InstalledModel
 from ollamapower.state import StateStore
@@ -190,3 +190,8 @@ def test_catalog_entries_are_sane():
         else:
             assert 0 < e["active_params_b"] < e["params_b"] and info.is_moe, e
             assert active == pytest.approx(size * e["active_params_b"] / e["params_b"], rel=0.05), e
+
+
+def test_a_model_spilling_into_the_hubs_ram_is_not_called_fine():
+    row = {"fits_hub": True, "fits_hub_gpu": False, "alone_tps": 2.4, "pooled_tps": None, "installed": True}
+    assert verdict(row, 0.1) == "runs on the hub, partly from RAM: ~2.4 tok/s"

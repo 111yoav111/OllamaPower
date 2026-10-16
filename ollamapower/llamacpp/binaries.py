@@ -35,7 +35,9 @@ DEVICE_RE = re.compile(r"^\s+(\S+): (.*) \((\d+) MiB, (\d+) MiB free\)\s*$")
 TIMEOUT = 30.0
 MIB = 1024 * 1024
 # Environment for every llama.cpp program: CUDA numbers devices like NVML (and the owner's views) do.
-ENV = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+# GGML_NO_BACKTRACE: on an abort, ggml attaches gdb and prints a backtrace after the line that says
+# why, which then is no longer among the last lines the hub keeps (and gdb may ask questions).
+ENV = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "GGML_NO_BACKTRACE": "1"}
 # Shared-memory GPUs, from the device description llama.cpp prints (Vulkan, SYCL, CUDA on Tegra/GB10, Metal).
 _INTEGRATED = re.compile(
     r"^Apple\b"

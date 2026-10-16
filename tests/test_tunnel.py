@@ -376,3 +376,16 @@ async def test_closing_a_relay_never_breaks_another_socket_in_the_process():
         finally:
             other.close()
         await asyncio.sleep(0)
+
+
+async def test_relay_listens_on_the_owners_port_and_falls_back_when_it_is_taken(ids):
+    with socket.socket() as probe:  # a port that is free right now
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    first, second = secure_relay(ids), secure_relay(ids)
+    try:
+        assert await first.start("127.0.0.1", port) == port  # the one the owner's firewall allows
+        assert await second.start("127.0.0.1", port) not in (port, 0)  # taken: any free port
+    finally:
+        first.close()
+        second.close()

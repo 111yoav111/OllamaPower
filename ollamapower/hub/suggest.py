@@ -229,7 +229,7 @@ def verdict(row: dict[str, Any], min_gain: float) -> str:
     elif pooled is not None and (not row["fits_hub"] or pooled > alone * (1 + min_gain)):
         text = f"pooled: {pooled_text} tok/s (vs {alone_text} alone)"
     elif row["fits_hub"]:
-        text = "runs fine on the hub"
+        text = f"runs on the hub, partly from RAM: {alone_text} tok/s"
     elif row["missing_bytes"] is not None:
         text = f"doesn't fit even pooled: {row['missing_bytes'] / GIB:.1f} GB missing"
     else:

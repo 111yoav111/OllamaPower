@@ -58,8 +58,8 @@ Two roles, one program:
 | The PC where you already use Ollama | **Hub** (exactly one) | Python 3.11+, Ollama |
 | Every other PC that should help | **Helper** (any number) | Python 3.11+ (no Ollama needed) |
 
-All PCs must be on the same LAN, and the helpers must reach the hub on TCP
-port **9000**.
+All PCs must be on the same LAN. Two firewall ports: helpers reach the hub on
+TCP **9000**, and the hub reaches each helper on TCP **9001** for split mode.
 
 ### 1. Install (on every PC)
 
@@ -160,6 +160,12 @@ one in the hub's Overview tab (or `ollamapower status` on the hub) and
 confirm. The helper appears on the hub's Nodes tab. It downloads its
 llama.cpp build once (about 30 MB) and then waits to be used.
 
+Allow incoming TCP port **9001** in the helper's firewall: the hub connects
+there to run a model split across the PCs (Linux with ufw:
+`sudo ufw allow from 192.168.1.0/24 to any port 9001 proto tcp`; Windows asks
+on the first split run: allow it for **private** networks). Another port:
+`relay_port` in `agent.toml`.
+
 A helper with **no GPU** lends only after its owner allows it:
 
 ```bash
@@ -198,6 +204,8 @@ arguments are passed on:
 | Helper says the token is missing or wrong | Run `ollamapower token show` on the hub again and copy the whole line into the helper's `.env`. |
 | Helper can't reach the hub | Is `ollamapower hub` running? Is port 9000 open in the hub's firewall? Are both PCs on the same network? Try `ping <hub address>` from the helper. |
 | Helper refuses: the hub's key changed | Only if you re-created the hub's key yourself: `ollamapower agent forget-hub` on the helper, then connect again. |
+| A model you pulled doesn't show up | It went to another Ollama: don't run `ollama serve` yourself (it ignores the service's settings, e.g. `OLLAMA_MODELS`). With the hub running, a plain `ollama pull <model>` reaches the right Ollama. |
+| Split mode fails with "couldn't reach <helper> ... is its firewall blocking it?" | Allow incoming TCP 9001 (`relay_port`) in that helper's firewall. |
 | Hub says port 11434 is in use | Ollama still listens there: do step 2's "Move Ollama" again and restart Ollama. |
 | Anything else | `ollamapower doctor` on the hub, `ollamapower logs` for the event log. |
 

@@ -321,7 +321,7 @@ class RpcManager:
                 await self._launch(session, cache)
                 _check_lending(not_lending)
                 session.relay = tunnel.relay(session.port, hub_ip)
-                await session.relay.start(bind_ip)
+                await session.relay.start(bind_ip, self.config.agent.relay_port)
                 # No await between these checks and publishing the session below, so a
                 # pause either finds ``self.session`` set or makes this check fail, and
                 # an rpc-server that died meanwhile is never handed to the hub.
@@ -446,7 +446,7 @@ class RpcManager:
         await target.start()
         relay = tunnel.relay(target.port, hub_ip)
         try:
-            await relay.start(bind_ip)
+            await relay.start(bind_ip, self.config.agent.relay_port)
         except BaseException:
             target.close()
             raise

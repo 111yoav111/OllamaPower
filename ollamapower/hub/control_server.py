@@ -61,6 +61,17 @@ NET_TEST_TIMEOUT = 30.0
 REJECT_TIMEOUT = 2.0  # a peer that doesn't read our reject doesn't get to hold the connection
 
 
+def plain_ip(ip: str) -> str:
+    """An IPv4 helper reaching the dual-stack listener shows up as ``::ffff:a.b.c.d``: use ``a.b.c.d``."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return str(addr.ipv4_mapped)
+    return ip
+
+
 class NetTestError(Exception):
     pass
 
@@ -175,7 +186,7 @@ class ControlServer:
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
-        ip = str(peer[0]) if isinstance(peer, tuple) else "?"
+        ip = plain_ip(str(peer[0])) if isinstance(peer, tuple) else "?"
         if not self.allowed(ip) or self.bans.banned(ip) or self._pending >= self.config.max_nodes:
             writer.close()
             return

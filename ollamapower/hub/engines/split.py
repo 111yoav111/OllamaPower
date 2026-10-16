@@ -744,6 +744,15 @@ class SplitEngine:
             if s.process.returncode is not None:
                 with contextlib.suppress(TimeoutError):  # its last words tell why (and whether to try again)
                     await wait_for(asyncio.shield(drained), 2.0)
+                unreachable = [
+                    x for x in s.leases if x.relay is not None and x.relay.failures and not x.relay.bytes_out
+                ]
+                if unreachable:  # llama-server gives up on an RPC device it can't reach: that is the reason
+                    x = unreachable[0]
+                    raise SplitUnavailable(
+                        f"couldn't reach {x.node.name} on port {x.endpoint.get('port')} "
+                        f"({x.relay.last_error}): is its firewall blocking it? (agent.relay_port)"
+                    )
                 last = s.output[-1] if s.output else ""
                 raise SplitUnavailable(
                     f"llama-server exited with code {s.process.returncode}: {last}",

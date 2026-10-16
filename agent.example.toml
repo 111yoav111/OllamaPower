@@ -15,6 +15,9 @@ fingerprint = ""
 [agent]
 # How this helper appears on the hub (default: the computer's name).
 name = ""
+# The port the hub connects to for split mode: allow it through this PC's firewall
+# (e.g. `sudo ufw allow from 192.168.1.0/24 to any port 9001 proto tcp`). 0 = any free port.
+relay_port = 9001
 
 [lending]
 # You decide what the hub may use; the hub can't change any of this.

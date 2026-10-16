@@ -282,3 +282,25 @@ def test_hub_experts_only_go_where_the_hubs_ram_can_hold_them():
     info = moe(layers=12, layer_gb=1.0, experts_share=0.9)
     plan = plan_split("m", info, 1024, [gpu("hub", 2.0)], [ram("laptop", 20.0, node="a")], hub_ram=ram("hub RAM", 3.5))
     assert len(plan.hub_expert_layers) == 3  # 3 x 0.9 GB fit in the hub's RAM (beside the embeddings)
+
+
+def test_moe_experts_fill_the_hubs_spare_vram_before_its_ram():
+    # 10 layers of 1 GB (0.9 GB experts): the GPU holds the hot parts and as many experts as fit,
+    # only the rest goes to the 3 GB of RAM, and the bottom layers to the helper.
+    info = moe(layers=10)
+    plan = plan_split("m", info, 1024, [gpu("hub", 6.0)], [ram("laptop", 5.0, node="a")], hub_ram=ram("hub", 3.0))
+    (hub,) = plan.hub_devices
+    (laptop,) = plan.helpers
+    assert hub.bytes > 4 * GIB  # not just the hot parts (~0.1 GB a layer)
+    on_hub = range(laptop.layers, plan.units - 1)
+    in_ram = plan.hub_expert_layers
+    assert in_ram and set(in_ram) < set(on_hub)  # some of the hub's layers keep their experts on the GPU
+    assert in_ram == list(range(laptop.layers, laptop.layers + len(in_ram)))  # the bottom ones go to RAM
+    assert sum(info.expert_bytes[i] for i in in_ram) <= 3 * GIB
+
+
+def test_an_moe_the_hub_holds_alone_says_so():
+    with pytest.raises(PlanError, match="fits in the hub's GPU and RAM together"):
+        plan_split(
+            "m", moe(layers=10), 1024, [gpu("hub", 6.0)], [ram("laptop", 5.0, node="a")], hub_ram=ram("hub", 9.0)
+        )

@@ -38,6 +38,8 @@ class HubAddress:
 class AgentSettings:
     # How this helper appears on the hub (default: the computer's name).
     name: str = ""
+    # The port the hub connects to for split mode: allow it through this PC's firewall (0 = any free port).
+    relay_port: int = 9001
 
 
 @dataclass
@@ -124,6 +126,8 @@ class AgentConfig:
     def validate(self) -> None:
         if not (1 <= self.hub.port <= 65535):
             raise ConfigError(f"hub.port out of range: {self.hub.port}")
+        if not (0 <= self.agent.relay_port <= 65535):
+            raise ConfigError(f"agent.relay_port out of range: {self.agent.relay_port}")
         if len(self.agent.name) > 64:
             raise ConfigError("agent.name is too long (64 characters at most)")
         self.lending.validate()
