@@ -271,7 +271,7 @@ def plan_split(
             bottom = left
             left = 0 if sum(units[:bottom]) <= budget else left
         if left:
-            short = sum(units[:bottom]) - budget if not hub_first else sum(units[bottom : bottom + left])
+            short = sum(units[:bottom]) - budget if rams and not hub_first else sum(units[bottom : bottom + left])
             raise PlanError(
                 f"{model} doesn't fit even with the helpers: about {max(short, 0) / GIB:.1f} GB more memory is needed"
             )

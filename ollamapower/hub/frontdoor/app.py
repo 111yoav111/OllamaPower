@@ -295,10 +295,12 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
             except UnsupportedRequest as exc:
                 finish("rejected", 400)
                 return error(path, 400, str(exc), cors(origin))
+            began = time.monotonic_ns()
             try:
                 session = await race_kill(hub.split.acquire(stream.model, spec), stream, request.receive)
             except SplitUnavailable as exc:
                 return unavailable(str(exc))
+            load_ns = time.monotonic_ns() - began  # ~0 when the session was already running
             stream.engine = ENGINE_SPLIT
             if translated is not None and session.files is not None:
                 # Ollama applies the Modelfile's SYSTEM/PARAMETER/MESSAGE; llama-server knows nothing of them.
@@ -444,6 +446,8 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     parsed.get("stream", True) is not False,
                     upstream.status_code,
                     (stream.queued_ms or 0) * 1_000_000,
+                    began=began,
+                    load_ns=load_ns,
                     top_logprobs=parsed.get("top_logprobs") or 0,
                     context=answer_context if path == "/api/generate" else None,
                 )

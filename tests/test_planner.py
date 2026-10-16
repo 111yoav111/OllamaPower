@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import re
 
 import pytest
 
@@ -220,6 +221,12 @@ def test_a_hub_without_a_gpu_pools_the_helpers_ram():
 def test_a_model_that_fits_nowhere_says_how_much_is_missing():
     with pytest.raises(PlanError, match=r"doesn't fit even with the helpers: about \d+\.\d GB more"):
         plan_split("m", model(layers=12), 1024, [], [ram("laptop", 3.0, node="a")], hub_ram=ram("hub RAM", 2.0))
+
+
+def test_missing_memory_is_counted_when_no_helper_lends_ram():
+    with pytest.raises(PlanError, match=r"about (\d+\.\d) GB more") as exc:
+        plan_split("m", model(layers=12), 1024, [], [gpu("g", 3.0, node="g")], hub_ram=ram("hub RAM", 2.0))
+    assert float(re.search(r"about (\d+\.\d) GB", str(exc.value)).group(1)) >= 5  # not "about 0.0 GB"
 
 
 def test_gpus_take_the_top_layers_then_helpers_ram_then_the_hubs():

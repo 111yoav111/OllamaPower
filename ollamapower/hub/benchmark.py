@@ -186,6 +186,8 @@ async def benchmark_model(hub: Hub, model: str, ctx: int | None = None, automati
         facts = await plans.facts(model, refresh=True)
         if not facts.get("splittable"):
             raise BenchmarkError(facts.get("reason") or f"{model} can't run in split mode")
+        if facts.get("fits"):  # split mode would refuse it anyway (the same check), after a long Ollama run
+            raise BenchmarkError(f"{model} fits on the hub's GPU alone: Ollama serves it, split mode isn't used")
         sets = candidate_sets(hub, model)
         if not sets:
             raise BenchmarkError("no helper can take part right now")

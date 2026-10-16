@@ -766,9 +766,8 @@ def models_benchmark(
         typer.echo(json.dumps(d, indent=2))
         return
     for r in [d["local"], *d["splits"]]:
-        name = (
-            "Ollama" if r["engine"] == "local" else "split (" + ", ".join(h["name"] for h in r.get("helpers", [])) + ")"
-        )
+        helpers = ", ".join(h["name"] for h in r.get("helpers", []))
+        name = "Ollama" if r["engine"] == "local" else f"split ({helpers})" if helpers else "split"
         if r["ok"]:
             typer.echo(
                 f"  {safe(name):40} {r['gen_tps']:7.1f} tok/s · prompt {_tps(r.get('prompt_tps'))} tok/s · "

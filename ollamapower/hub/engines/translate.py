@@ -379,13 +379,17 @@ class OllamaStream:
         queued_ns: int = 0,
         top_logprobs: int = MAX_TOP_LOGPROBS,
         context: Callable[[str], Awaitable[list[int] | None]] | None = None,
+        began: int | None = None,
+        load_ns: int = 0,
     ) -> None:
         self.model = model
         self.key = "message" if path == "/api/chat" else "response"
         self.stream = stream
         self.status = status
-        self.started = time.monotonic_ns()
+        # Like Ollama: total_duration counts the load and the prompt, not just the streaming.
+        self.started = time.monotonic_ns() if began is None else began
         self.queued_ns = queued_ns
+        self.load_ns = load_ns
         self._pending = bytearray()
         self._content: list[str] = []
         self._thinking: list[str] = []
@@ -521,7 +525,7 @@ class OllamaStream:
             "done_reason": self._finish,
             **context,
             "total_duration": time.monotonic_ns() - self.started + self.queued_ns,
-            "load_duration": 0,
+            "load_duration": self.load_ns,
             "prompt_eval_count": int(prompt_n or 0),
             "prompt_eval_duration": int(float(t.get("prompt_ms", 0) or 0) * 1e6),
             "eval_count": int(gen_n or 0),

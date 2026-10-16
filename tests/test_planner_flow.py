@@ -711,3 +711,19 @@ def test_a_variant_that_fails_is_just_not_chosen(cluster, client):
     rec = c.call(lambda: c.hub.plans.record("tiny"))
     assert rec["degraded"] is None and rec["key"].get("variant", "") == ""
     assert c.call(lambda: c.hub.plans.route("tiny")).variant == ""
+
+
+@pytestmark_e2e
+def test_benchmark_refuses_a_model_that_fits_before_running_ollama(tmp_path, fake_ollama, make_config):
+    from ollamapower.admin.ipc import AdminError
+
+    c, close = make_cluster(
+        tmp_path, fake_ollama, make_config, hub_devices=["Vulkan0: Big GPU (24576 MiB, 24000 MiB free)"]
+    )
+    try:
+        c.run(c.hub.split._ensure_llamacpp())  # the hub knows its GPU from llama.cpp's device list
+        with pytest.raises(AdminError, match="fits on the hub's GPU alone"):
+            c.admin("models.benchmark", model="tiny")
+        assert "/api/generate" not in c.rec.paths()  # no Ollama run was wasted
+    finally:
+        close()

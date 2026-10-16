@@ -64,6 +64,7 @@ class LendingGuard:
         self._calm_since: float | None = None
         self.yielding = False
         self.busy_gpu: dict[str, Any] | None = None
+        self.gpu_indexes: set[int] | None = None  # from the last telemetry sample; None = not seen yet
 
     def _lent_utils(self, rules: LendingRules, sample: dict[str, Any]) -> list[tuple[int, int]]:
         out = []
@@ -77,6 +78,7 @@ class LendingGuard:
 
     def update_yield(self, rules: LendingRules, sample: dict[str, Any], tunnel_quiet: bool, now: float) -> bool:
         """Feed one telemetry sample (``now`` = monotonic seconds); returns whether to yield."""
+        self.gpu_indexes = {g["index"] for g in sample.get("gpus") or [] if isinstance(g, dict) and "index" in g}
         if not rules.auto_yield:
             self.yielding, self._busy_since, self._calm_since = False, None, None
             return False
@@ -103,6 +105,11 @@ class LendingGuard:
             return Decision("paused", "paused by the helper's owner")
         if not in_schedule(rules.schedule, now or datetime.datetime.now()):
             return Decision("paused", f"outside the lending schedule ({', '.join(rules.schedule)})")
+        if rules.gpus and not rules.allow_cpu and self.gpu_indexes is not None:
+            if not set(rules.gpus) & self.gpu_indexes:
+                have = ", ".join(map(str, sorted(self.gpu_indexes))) or "none"
+                lent = ", ".join(map(str, rules.gpus))
+                return Decision("paused", f"lending.gpus lists GPU {lent}, but this PC's GPUs are: {have}")
         if self.yielding:
             gpu = self.busy_gpu or {}
             return Decision(

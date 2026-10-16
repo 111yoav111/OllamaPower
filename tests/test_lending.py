@@ -80,6 +80,16 @@ def test_only_lent_gpus_count_and_unknown_util_never_yields():
         assert not guard.update_yield(rules, sample(None, index=1), True, now=t)  # no utilisation reported
 
 
+def test_lent_gpus_missing_on_this_pc_is_not_lending():
+    rules, guard = LendingRules(gpus=[5], auto_yield=False), LendingGuard()
+    assert guard.evaluate(rules, paused=False).state == "lending"  # no telemetry yet: can't tell
+    guard.update_yield(rules, sample(0, index=0), True, now=0)
+    d = guard.evaluate(rules, paused=False)
+    assert d.state == "paused" and "GPU 5" in d.reason and "GPUs are: 0" in d.reason
+    assert guard.evaluate(LendingRules(gpus=[5], allow_cpu=True), paused=False).state == "lending"  # RAM still lent
+    assert guard.evaluate(LendingRules(gpus=[0, 5]), paused=False).state == "lending"
+
+
 def test_auto_yield_off():
     rules, guard = LendingRules(auto_yield=False, yield_seconds=2), LendingGuard()
     for t in range(10):

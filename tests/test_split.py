@@ -191,6 +191,10 @@ def test_planned_model_runs_split_with_the_helper(cluster, client):
     assert final["done"] is True and final["done_reason"] == "stop"
     assert final["eval_count"] == 3 and final["eval_duration"] == 150_000_000
     assert final["prompt_eval_count"] == 7 and final["total_duration"] > 0
+    # Like Ollama: the first request pays for starting split mode, and the total includes it.
+    assert 0 < final["load_duration"] <= final["total_duration"]
+    again = json.loads(chat(client, c).text.splitlines()[-1])
+    assert again["load_duration"] < final["load_duration"]  # the session was already running
 
     # llama-server got exactly the plan: everything on the helper (the hub has no GPU).
     args = c.server_args()
