@@ -56,7 +56,9 @@ bottleneck; measure with `tunnel-test` first. If it is, the options are a
 small compiled relay or direct mode inside WireGuard/Tailscale - a decision
 for the owner, never switched silently.
 
-**LAN numbers:** not measured yet (no multi-machine setup in development).
+**LAN numbers:** over Wi-Fi (~94 Mbit/s), the secure tunnel carried 90.8
+Mbit/s at 4.8 ms RTT: the link, not the encryption, is the limit (see the
+two-PC run below).
 
 ## Split mode vs plain Ollama (the planner's own benchmarks)
 
@@ -66,10 +68,38 @@ benchmark <model>`, or automatically when idle) and keeps the results in
 to first token, prompt and generation tokens/s, which helpers and tunnel
 modes). Split mode is used only when it wins by `planner.min_gain`.
 
-**Real model numbers:** not measured yet. The development container has no
-GPU and no second machine, so its only split runs use a tiny generated test
-model, which says nothing about real speed-ups. Numbers from the owner's
-hub and helpers go here.
+### First real two-PC run (2026-10-17)
+
+**Hub:** RTX 3060 12 GB, i7-11700F, 15.3 GB RAM, wired. **Helper:** a laptop
+with an i3-1115G4 (2 cores), 7.4 GB RAM, no GPU, on **Wi-Fi**, lending ~2 GB of
+RAM. llama.cpp b11347 (Vulkan on the hub, CPU on the helper), secure tunnel.
+
+| Model | Engine | Load s | TTFT ms | Prompt tok/s | Gen tok/s |
+|---|---|---|---|---|---|
+| qwen3:14b | Ollama (hub alone) | 15.1 | 713 | 801 | 31.8 |
+| qwen3:14b | split, hub GPU + laptop RAM | 131.6 (first load), 16.9 (from the laptop's disk cache) | 11 606 | 41.9 | 4.3 |
+| huihui_ai/qwen3-abliterated:30b-a3b (MoE, 18.6 GB) | Ollama (hub GPU + RAM) | 62.0 | 19 866 | 23.8 | 21.4 |
+
+`qwen3:14b` fits this hub's GPU, so the run forced it over with
+`planner.memory_margin = 0.4` (13.3 GB "needed") to put layers on the laptop.
+Wi-Fi link: 3.3 ms RTT, ~94 Mbit/s both ways; secure tunnel 4.8 ms RTT,
+90.8 Mbit/s (the encryption costs nothing measurable at Wi-Fi speeds).
+
+Reading it:
+
+- **Everything worked across two real PCs**: joining, key pinning, the
+  secure tunnel over Wi-Fi, weights sent to the helper and cached on its disk
+  (8x faster second load), and the fallback: cutting the helper off
+  mid-answer ended the stream with an `{"error": ...}`, the next request was
+  answered by Ollama 5 s later, and the model was marked degraded.
+- **Never slower held**: split lost (4.3 vs 31.8 tok/s), so the hub kept
+  Ollama. A 2-core laptop CPU on Wi-Fi can't speed up a hub with a 12 GB GPU;
+  a helper earns its place with a GPU, or with RAM for a model the hub can't
+  hold at all.
+- **The planner's estimate was 2x optimistic** for this helper (8.7 predicted
+  vs 4.3 measured tok/s): the benchmark, not the estimate, decides.
+- **The 30B MoE fits this hub alone** (GPU + RAM), and Ollama runs it at 21
+  tok/s; the planner now says so instead of splitting it.
 
 ### Adding your numbers
 

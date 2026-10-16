@@ -191,7 +191,9 @@ class AgentTUI(App[None]):
         if s["connection"] == "stopped":
             alerts.append(s["error"])
         if s["network"].get("kind") == "wifi":
-            alerts.append("This PC reaches the hub over Wi-Fi: too slow for split mode. Use a cable.")
+            alerts.append(
+                "This PC reaches the hub over Wi-Fi: split mode works, but loading a model is slow; a cable is faster."
+            )
         if s["lending"]["allow_direct"]:
             alerts.append("Direct mode allowed: if the hub owner turns it on, split traffic is unencrypted.")
         banner.update(Text("\n".join("⚠ " + safe(a) for a in alerts), style="bold red") if alerts else "")

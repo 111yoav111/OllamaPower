@@ -18,7 +18,8 @@ never makes anything slower.
 > split mode on its first request, `models suggest` tells what your PCs can
 > run and how fast, and the benchmark also tries MTP speculation and tensor
 > split, keeping whatever is fastest. Never slower than plain Ollama, which
-> stays the fallback. Not yet measured on real multi-machine hardware: see
+> stays the fallback. Tested on two real PCs (a GPU hub and a laptop helper on
+> Wi-Fi); no speed-up measured yet with a helper that has a GPU: see
 > [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) and
 > [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md).
 

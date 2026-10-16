@@ -577,7 +577,10 @@ def nodes_net_test(
         f"Hub -> helper {r['down_mbps']} Mbps, helper -> hub {r['up_mbps']} Mbps (over the encrypted control channel)"
     )
     if r.get("link") == "wifi":
-        typer.secho("The helper is on Wi-Fi: too slow for split mode. Use a cable.", fg=typer.colors.YELLOW)
+        typer.secho(
+            "The helper is on Wi-Fi: split mode works, but loading a model is slow; a cable is faster.",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @nodes_cli.command("tunnel")
