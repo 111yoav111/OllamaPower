@@ -49,23 +49,159 @@ benchmark showed split generating at least 10 % (`planner.min_gain`) faster
 than plain Ollama, and only while nothing that benchmark depended on has
 changed. If split mode fails, Ollama serves the request.
 
-## Requirements
+## Quick start
 
-- Python 3.11+
-- Ollama on the same PC
+Two roles, one program:
 
-## Install
+| PC | Role | Needs |
+|---|---|---|
+| The PC where you already use Ollama | **Hub** (exactly one) | Python 3.11+, Ollama |
+| Every other PC that should help | **Helper** (any number) | Python 3.11+ (no Ollama needed) |
+
+All PCs must be on the same LAN, and the helpers must reach the hub on TCP
+port **9000**.
+
+### 1. Install (on every PC)
+
+OllamaPower is installed with [pipx](https://pipx.pypa.io), which keeps it in
+its own environment and puts `ollamapower` on your PATH.
+
+**Linux**
 
 ```bash
-pipx install git+https://github.com/111yoav111/OllamaPower    # or, for development: see below
+sudo apt install pipx          # Fedora: sudo dnf install pipx · Arch: sudo pacman -S python-pipx
+pipx ensurepath                # then open a new terminal
+pipx install git+https://github.com/111yoav111/OllamaPower
 ```
 
-From a source checkout, `scripts/start_hub.sh` / `scripts/start_agent.sh`
-(`.bat` on Windows) start the hub or a helper with the checkout's `.venv` if
-there is one, else the installed `ollamapower`; extra arguments are passed on
-(`scripts/start_agent.sh --hub 192.168.1.10`).
+**macOS** (with [Homebrew](https://brew.sh))
 
-## Set up the Hub
+```bash
+brew install pipx git
+pipx ensurepath                # then open a new terminal
+pipx install git+https://github.com/111yoav111/OllamaPower
+```
+
+**Windows** (PowerShell; install [Python](https://www.python.org/downloads/)
+with "Add python.exe to PATH" ticked, and [Git](https://git-scm.com/download/win))
+
+```powershell
+py -m pip install --user pipx
+py -m pipx ensurepath          # then open a new terminal
+pipx install git+https://github.com/111yoav111/OllamaPower
+```
+
+Check it worked with `ollamapower version`. To update later:
+`pipx upgrade ollamapower`.
+
+### 2. The Hub (the PC with Ollama)
+
+```bash
+ollamapower init       # creates the config dir, a cluster token, config.toml
+ollamapower doctor     # tells you exactly what to fix, step by step
+```
+
+`doctor` will ask you to move Ollama from port 11434 to **11435**, so
+OllamaPower can take 11434 and your apps keep working unchanged:
+
+| OS | Move Ollama to 11435 |
+|---|---|
+| Linux (systemd) | `sudo systemctl edit ollama`, add `[Service]` and `Environment="OLLAMA_HOST=127.0.0.1:11435"`, then `sudo systemctl restart ollama` |
+| macOS | `launchctl setenv OLLAMA_HOST 127.0.0.1:11435`, then quit and reopen the Ollama app (lost at reboot; `doctor` shows how to keep it) |
+| Windows | `setx OLLAMA_HOST 127.0.0.1:11435`, then quit Ollama from the tray icon and start it again |
+
+Run `ollamapower doctor` again until it shows no `[ERROR]`, then start the hub:
+
+```bash
+ollamapower hub        # terminal UI; --no-tui for plain logs (servers, services)
+```
+
+Allow incoming TCP port **9000** in the hub's firewall so helpers can connect
+(Windows asks on the first run: allow it for **private** networks;
+Linux with ufw: `sudo ufw allow 9000/tcp`). Find the hub's LAN address with
+`ip -4 addr` (Linux), `ipconfig getifaddr en0` (macOS) or `ipconfig`
+(Windows), e.g. `192.168.1.10`.
+
+Finally, print the cluster token for the helpers:
+
+```bash
+ollamapower token show     # prints OLLAMAPOWER_TOKEN="..." - treat it like a password
+```
+
+### 3. Each Helper
+
+Give the helper the token, either in a `.env` file in its config dir (create
+the folder if needed and paste the whole line `token show` printed):
+
+| OS | Token file |
+|---|---|
+| Linux | `~/.config/ollamapower/.env` |
+| macOS | `~/Library/Application Support/ollamapower/.env` |
+| Windows | `%APPDATA%\ollamapower\.env` |
+
+or as an environment variable for the current terminal:
+
+```bash
+export OLLAMAPOWER_TOKEN="..."             # Linux / macOS
+```
+
+```powershell
+$env:OLLAMAPOWER_TOKEN = "..."             # Windows PowerShell
+```
+
+Then start it, with the hub's LAN address:
+
+```bash
+ollamapower agent --hub 192.168.1.10
+```
+
+On first connect it shows the hub's **key fingerprint**: check it matches the
+one in the hub's Overview tab (or `ollamapower status` on the hub) and
+confirm. The helper appears on the hub's Nodes tab. It downloads its
+llama.cpp build once (about 30 MB) and then waits to be used.
+
+A helper with **no GPU** lends only after its owner allows it:
+
+```bash
+ollamapower agent rules --allow-cpu
+```
+
+### 4. Use it
+
+Nothing changes for your apps: Open WebUI, scripts and the `ollama` CLI keep
+using `http://127.0.0.1:11434`. To see what your PCs can now run together:
+
+```bash
+ollamapower models suggest
+```
+
+A model too big for the hub alone is split across the PCs on its first
+request. `ollamapower status` on the hub shows what is happening.
+
+### Starting it from a source checkout
+
+Instead of pipx you can clone the repository and use the start scripts,
+which use the checkout's `.venv` if there is one (see
+[Development](#development)), else the installed `ollamapower`. Extra
+arguments are passed on:
+
+| | Linux / macOS | Windows |
+|---|---|---|
+| Hub | `scripts/start_hub.sh` | `scripts\start_hub.bat` |
+| Helper | `scripts/start_agent.sh --hub 192.168.1.10` | `scripts\start_agent.bat --hub 192.168.1.10` |
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `ollamapower: command not found` | Open a new terminal after `pipx ensurepath`. |
+| Helper says the token is missing or wrong | Run `ollamapower token show` on the hub again and copy the whole line into the helper's `.env`. |
+| Helper can't reach the hub | Is `ollamapower hub` running? Is port 9000 open in the hub's firewall? Are both PCs on the same network? Try `ping <hub address>` from the helper. |
+| Helper refuses: the hub's key changed | Only if you re-created the hub's key yourself: `ollamapower agent forget-hub` on the helper, then connect again. |
+| Hub says port 11434 is in use | Ollama still listens there: do step 2's "Move Ollama" again and restart Ollama. |
+| Anything else | `ollamapower doctor` on the hub, `ollamapower logs` for the event log. |
+
+## Set up the Hub (details)
 
 ```bash
 ollamapower init      # config dir, a cluster token in .env, config.toml, state.json
