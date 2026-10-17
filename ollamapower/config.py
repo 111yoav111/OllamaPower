@@ -118,8 +118,8 @@ class SplitConfig:
     # Context size when the plan doesn't set one.
     default_ctx: int = 4096
     # Seconds to wait for llama-server to load the model (first loads copy the
-    # weights to the helpers over the network).
-    load_timeout: float = 900.0
+    # weights to the helpers over the network: 13 GB over Wi-Fi took 16 minutes).
+    load_timeout: float = 3600.0
     # No token for this long counts as a failure.
     stall_timeout: float = 120.0
 

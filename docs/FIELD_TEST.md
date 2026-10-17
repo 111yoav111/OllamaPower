@@ -24,9 +24,32 @@ qwen3:14b.
 | Automatic idle benchmark | Starts after `planner.idle_seconds`; gives way the moment a client request arrives (that request waited 12.7 s for the GPU to be handed back and Ollama to load its model). |
 | Disk cache on the helper | First load over Wi-Fi 132-238 s, later loads 17-70 s. |
 
-Not testable on this hardware: a helper with a GPU, direct tunnel mode (the
-helper's owner must allow it), auto-yield (the laptop has no GPU load to
-watch), schedules, the MTP and tensor-split variants (wrong model types).
+Not testable on this hardware: direct tunnel mode (the helper's owner must
+allow it), auto-yield (the laptop has no GPU load to watch), schedules, the MTP
+and tensor-split variants (wrong model types).
+
+## Roles swapped: the laptop as the hub, the desktop as a GPU helper
+
+The case OllamaPower is built for: a model too big for the hub. The laptop
+(7.4 GB RAM, no GPU) became the hub, the desktop (RTX 3060 + RAM) a helper,
+still over the laptop's Wi-Fi.
+
+| Model | Laptop alone (Ollama) | Laptop + desktop (split) |
+|---|---|---|
+| huihui_ai/gpt-oss-abliterated:20b (MoE, 13.8 GB) | ~0.33 tok/s (estimated: read from disk) | **5.7 tok/s** measured, prompt 45 tok/s, first token 12.6 s |
+
+The hub saw the model was too big for it, skipped the hopeless Ollama run, and
+chose split mode by itself: about **17x faster** than the laptop alone. The
+first load sent 13.3 GB over Wi-Fi in 16 minutes (960 s); later loads come
+from the desktop's disk cache. The planner predicted 3.5 tok/s: pessimistic
+this time, where it was 2-2.6x optimistic for the CPU helper.
+
+Two things got in the way, both fixed:
+- The desktop lent only its GPU (CPU lending is off by default) and the model
+  was 0.5 GB short. `models suggest` now says when a GPU helper could lend its
+  RAM too, and how.
+- The first load took longer than the 15-minute default `split.load_timeout`.
+  The default is now an hour.
 
 ## Bugs found and fixed (each with a regression test)
 
@@ -71,9 +94,10 @@ no new split features until split wins somewhere. Not done on purpose:
 
 Open questions for the owner:
 
-- **Where does split beat Ollama?** Not on this hardware: the 30B fits the
-  hub's GPU plus RAM. The claimed case (a model too big for any one PC, a
-  helper with a GPU or a wired link) is still untested.
+- **Where does split beat Ollama?** With the desktop as the hub, nowhere: its
+  GPU plus RAM hold the 30B alone. With the laptop as the hub and the desktop's
+  GPU as the helper, by 17x: the case OllamaPower is built for. Untested still:
+  a wired link, more than one helper, a dense model.
 - **Where does a split token's time go** (helper compute, Wi-Fi round trips,
   llama-server)? A profile would show whether better predictions are possible
   or the Wi-Fi link sets a hard limit.

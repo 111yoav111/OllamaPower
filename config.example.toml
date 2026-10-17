@@ -69,8 +69,9 @@ path = ""
 keep_alive = 300.0
 # Context size when a plan doesn't set one.
 default_ctx = 4096
-# Seconds allowed for loading (the first load copies weights to the helpers).
-load_timeout = 900.0
+# Seconds allowed for loading (the first load copies weights to the helpers:
+# 13 GB over ~90 Mbit/s Wi-Fi took 16 minutes; later loads come from their disk cache).
+load_timeout = 3600.0
 # No new token for this long counts as a failure.
 stall_timeout = 120.0
 

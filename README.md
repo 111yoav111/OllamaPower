@@ -1,27 +1,55 @@
 # OllamaPower
 
-Run models bigger than any PC you own, by pooling the PCs you already have.
-Every machine counts: the PC you use Ollama on (the **Hub**) can be an old
-desktop or a laptop without a GPU, and so can every machine that helps it
-(**Helpers**). Together their RAM, CPUs and any GPUs hold a model none of them
-could load alone, and the big mixture-of-experts models (gpt-oss-120b,
-Qwen3-235B, ...) run at a usable speed. Clients keep talking to the Hub exactly
-as they talk to Ollama today, and plain Ollama stays the fallback: OllamaPower
-never makes anything slower.
+**Run models bigger than any PC you own, by pooling the PCs you already have.**
 
-> **Status: v2 built (phases A-D).** A front door for your Ollama with a
-> queue and a terminal UI; helpers that join over encrypted tunnels and lend
-> on their owners' terms (caps, schedule, pause, auto-yield). Any PC counts:
-> the hub's and helpers' RAM are pooled (a GPU-less hub or helper is fine), a
-> helper lends its GPU and its RAM together, MoE models keep their experts in
-> RAM and their hot parts on the GPUs, a model too big for the hub goes to
-> split mode on its first request, `models suggest` tells what your PCs can
-> run and how fast, and the benchmark also tries MTP speculation and tensor
-> split, keeping whatever is fastest. Never slower than plain Ollama, which
-> stays the fallback. Tested on two real PCs (a GPU hub and a laptop helper on
-> Wi-Fi); no speed-up measured yet with a helper that has a GPU: see
-> [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) and
-> [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md).
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
+![Ollama compatible](https://img.shields.io/badge/Ollama-drop--in-black.svg)
+![Linux · macOS · Windows](https://img.shields.io/badge/os-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-lightgrey.svg)
+
+Your laptop can't hold a 14 GB model. Your desktop's GPU can. OllamaPower puts
+them together: the model's layers are spread over the PCs on your network, and
+your apps keep talking to Ollama as if nothing changed.
+
+| Real run: gpt-oss 20B (a 13.8 GB build) on a laptop with 7.4 GB of RAM | Speed |
+|---|---|
+| The laptop alone (Ollama would read the model from disk) | ~0.3 tok/s (estimated) |
+| **The laptop + a desktop's RTX 3060, over Wi-Fi** | **5.7 tok/s: ~17x faster** |
+
+Measured on real hardware; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) and
+[`docs/FIELD_TEST.md`](docs/FIELD_TEST.md).
+
+```text
+Open WebUI, scripts, the ollama CLI
+        │
+        ▼
+Hub (127.0.0.1:11434, looks exactly like Ollama)
+  ├─ the model fits this PC?  ──► Ollama, as before
+  └─ too big?                 ──► split mode: llama-server on the hub
+                                    ├══ TLS 1.3 ══► Helper 1: GPU and/or RAM, some layers
+                                    └══ TLS 1.3 ══► Helper 2: GPU and/or RAM, more layers
+```
+
+## Why it's nice
+
+- **Drop-in.** The hub takes Ollama's address (`127.0.0.1:11434`); Open WebUI,
+  scripts and the `ollama` CLI keep working unchanged. Ollama's and OpenAI's
+  APIs work through split mode too: streaming, tool calls, JSON schemas,
+  thinking (images not yet).
+- **Never slower.** The hub benchmarks Ollama against split mode and uses split
+  only when it measured at least 10 % faster, or when Ollama can't run the model
+  at all. If split mode fails before an answer starts, Ollama answers instead.
+- **Tells you what you can run.** `ollamapower models suggest` lists the models
+  your PCs can run together and how fast, before you download anything.
+- **Any PC counts.** GPUs, RAM, old desktops, laptops without a GPU, Wi-Fi.
+  Mixture-of-experts models keep their experts in RAM and their hot parts on the
+  GPUs.
+- **Encrypted and pinned.** Helpers join with a cluster token, pin the hub's key,
+  and split-mode traffic runs over mutually authenticated TLS 1.3.
+- **The helper's owner decides.** Lending caps, a schedule, pause, and stepping
+  back automatically when the owner starts a game or a render.
+- **A terminal UI** for the hub and for every helper, a priority queue, and a
+  full CLI.
 
 ## What it can and can't do
 
@@ -37,12 +65,12 @@ all count.
 | Situation | Does pooling help? |
 |---|---|
 | The model fits in the Hub's own memory, at full speed | **No.** OllamaPower leaves it on plain Ollama. |
-| The model doesn't fit in the Hub's RAM/VRAM (Ollama pages it from disk, or refuses) | **Yes, the main case** (designed for; not yet measured on real PCs). Spread over the Hub's and helpers' RAM (and any GPUs), it runs instead of crawling; the hub sends it to split mode on the first request. Helpers without a GPU lend RAM once their owner allows it (`ollamapower agent rules --allow-cpu`). |
+| The model doesn't fit in the Hub's RAM/VRAM (Ollama pages it from disk, or refuses) | **Yes, the main case** (measured: ~17x faster for a 13.8 GB model on a 7.4 GB laptop with a GPU helper). Spread over the Hub's and helpers' RAM (and any GPUs), it runs instead of crawling; the hub sends it to split mode on the first request. Helpers without a GPU lend RAM once their owner allows it (`ollamapower agent rules --allow-cpu`). |
 | Mixture-of-experts models (gpt-oss-120b, Qwen3-235B-A22B, ...) too big for the Hub | **Yes, the best case** (estimated). Each token reads only a few experts, so the pooled RAM of ordinary PCs runs them at usable speed (estimates in [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)). *(v2)* |
 | The model fits in the Hub's GPU **plus** its RAM, and the only helper is a CPU on Wi-Fi | **No** (measured): a 30B MoE ran at 21-26 tok/s on Ollama alone and 8-10 tok/s split with a 2-core laptop helper. The hub measured this and kept Ollama ([`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)). |
 | Dense 70B on ordinary PCs | **It runs** (~1-2 tok/s estimated) where a single PC pages from disk. *(v2)* |
 | Ollama spills part of a model to the Hub's CPU and a helper has a GPU | **Often faster**: those layers run on the helper's GPU. *(v1, works now)* |
-| Helper on Wi-Fi | **Allowed.** A few round trips per token, and the first load of a big model is slow (4 min for 2.3 GB of layers here; later loads come from the helper's disk cache). |
+| Helper on Wi-Fi | **Allowed.** A few round trips per token, and the first load of a big model is slow (16 min for 13 GB over ~90 Mbit/s Wi-Fi; later loads come from the helper's disk cache). A cable is much faster. |
 | Phones, tablets | Clients only, not helpers. |
 
 **Golden rule: OllamaPower must never make things slower.** A model that fits

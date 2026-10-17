@@ -107,6 +107,19 @@ Reading it:
   so compare generation speeds over several runs.
 - What was tried and what broke: [`FIELD_TEST.md`](FIELD_TEST.md).
 
+### Roles swapped: a model too big for the hub (2026-10-17)
+
+**Hub:** the laptop above (7.4 GB RAM, no GPU, Wi-Fi). **Helper:** the desktop
+above (RTX 3060 12 GB + RAM), lending its GPU.
+
+| Model | Engine | Load s | TTFT ms | Prompt tok/s | Gen tok/s |
+|---|---|---|---|---|---|
+| huihui_ai/gpt-oss-abliterated:20b (MoE, 13.8 GB) | Ollama (laptop alone) | - | - | - | ~0.33 (estimated; too big, read from disk) |
+| same | split, laptop + desktop GPU | 960.6 (first load, 13.3 GB over Wi-Fi) | 12 572 | 45.0 | **5.7** (predicted 3.5) |
+
+The model the laptop can't run on its own runs at a usable 5.7 tok/s, about
+17x faster than it could alone.
+
 ### Adding your numbers
 
 1. On the hub, with the helpers connected: `ollamapower models benchmark <model>`
