@@ -607,11 +607,25 @@ def test_web_pages_ollama_would_refuse_cannot_use_split_mode(cluster, client):
 
 def test_any_inference_for_a_split_model_hands_the_gpu_back_first(cluster, client):
     c = cluster
+    c.rec.show_extra["tiny:latest"] = {"capabilities": ["completion", "embedding"]}
     c.admin("models.plan", model="tiny", ctx=512)
     assert chat(client, c).status_code == 200 and c.call(lambda: c.hub.split.holds("tiny"))
     r = client.post(c.url + "/api/embed", json={"model": "tiny", "input": "x"})
     assert r.status_code == 200 and c.rec.last["path"] == "/api/embed"
     assert not c.call(lambda: c.hub.split.holds("tiny"))  # Ollama didn't load it next to llama-server
+
+
+def test_embeddings_from_a_chat_model_split_mode_serves_are_refused_without_stopping_it(cluster, client):
+    # Ollama would load the whole model only to answer 501 (it embeds with embedding models only);
+    # a client asking every minute would otherwise reload split mode every minute.
+    c = cluster
+    c.admin("models.plan", model="tiny", ctx=512)
+    assert chat(client, c).status_code == 200 and c.call(lambda: c.hub.split.holds("tiny"))
+    for path in ("/api/embed", "/v1/embeddings"):
+        r = client.post(c.url + path, json={"model": "tiny", "input": "x"})
+        assert r.status_code == 501 and "does not support embeddings" in r.text
+    assert c.call(lambda: c.hub.split.holds("tiny"))  # still running
+    assert "/api/embed" not in c.rec.paths()  # Ollama never asked
 
 
 async def test_hub_shutdown_stops_the_session_even_with_background_work_pending():

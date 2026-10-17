@@ -195,3 +195,12 @@ def test_catalog_entries_are_sane():
 def test_a_model_spilling_into_the_hubs_ram_is_not_called_fine():
     row = {"fits_hub": True, "fits_hub_gpu": False, "alone_tps": 2.4, "pooled_tps": None, "installed": True}
     assert verdict(row, 0.1) == "runs on the hub, partly from RAM: ~2.4 tok/s"
+
+
+def test_a_cpu_helper_shows_the_ram_it_lends_not_an_empty_gpu():
+    from ollamapower.__main__ import render_nodes
+
+    lending, off = helper("laptop", allow_cpu=True), helper("desk")  # 32 GB, 8 used, 3 kept for the owner
+    assert lending.summary()["ram_lendable"] == 21 * GIB and off.summary()["ram_lendable"] == 0
+    row = render_nodes([lending.summary()])[1][0]
+    assert "24.0/21.0 GB RAM" in row and "0.0/0.0 GB" not in row

@@ -98,6 +98,7 @@ INFERENCE_ENDPOINTS = frozenset(
 TIMED_ENDPOINTS = frozenset({"/api/chat", "/api/generate"})
 # What split mode serves; embeddings always go to Ollama.
 SPLIT_ENDPOINTS = frozenset({"/api/chat", "/api/generate", "/v1/chat/completions", "/v1/completions"})
+EMBED_ENDPOINTS = frozenset({"/api/embed", "/api/embeddings", "/v1/embeddings"})
 PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 MAX_PS_BYTES = 4 * 1024 * 1024
 MAX_ERROR_BYTES = 1024 * 1024  # a llama-server error answer read whole (to see if the prompt was too long)
@@ -517,6 +518,13 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                         handed_off = isinstance(served, ProxyStreamResponse)
                         return served
                 if hub.split.holds(stream.model):
+                    files = hub.split.session.files if hub.split.session is not None else None
+                    if path in EMBED_ENDPOINTS and files is not None and files.capabilities:
+                        if "embedding" not in files.capabilities:
+                            # Ollama would load the whole model only to refuse: refuse like it does,
+                            # and keep split mode running (a client asking every minute would thrash it).
+                            finish("rejected", 501)
+                            return error(path, 501, f"{stream.model} does not support embeddings")
                     # Ollama serves this model now (or an endpoint split mode doesn't handle, like
                     # embeddings): llama-server must give the GPU back first.
                     await hub.split.stop(stream.model, "Ollama serves this model now", drain=True)

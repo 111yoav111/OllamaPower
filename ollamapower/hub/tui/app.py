@@ -276,7 +276,8 @@ class HubTUI(App[None]):
             (
                 "Helpers",
                 f"{len(lending)} lending · {sum(1 for n in nodes if n['connected'])} connected · {len(nodes)} known · "
-                f"{gib(sum(n['vram_lendable'] for n in lending))} GB VRAM lendable",
+                f"{gib(sum(n['vram_lendable'] for n in lending))} GB VRAM + "
+                f"{gib(sum(n.get('ram_lendable', 0) for n in lending))} GB RAM lendable",
             ),
             ("Control plane", control_text(c)),
         ]
@@ -362,7 +363,11 @@ class HubTUI(App[None]):
                 t(n["ip"]),
                 t(n["status"], "bold red" if n["status"] == "incompatible" else ""),
                 t(_gpu_names(n["gpus"])),
-                t(f"{gib(n['vram_total'])}/{gib(n['vram_free'])}/{gib(n['vram_lendable'])}"),
+                t(
+                    f"{gib(n['vram_total'])}/{gib(n['vram_free'])}/{gib(n['vram_lendable'])}"
+                    if n["gpus"]
+                    else f"RAM {gib(n.get('ram_lendable', 0))} lendable"
+                ),
                 t(f"{max(utils)}%" if utils else "-"),
                 t(f"{cpu:.0f}% · {ram}" if cpu is not None else "-"),
                 _link(n["link"]),
@@ -414,7 +419,7 @@ class HubTUI(App[None]):
             ("Link", _link(d["link"]).plain),
             ("Tunnel", f"{d['tunnel_effective']} (requested {d['tunnel_mode']})"),
             ("Lending rules", _rules_text(lending)),
-            ("Lendable now", f"{gib(d['vram_lendable'])} GB VRAM"),
+            ("Lendable now", f"{gib(d['vram_lendable'])} GB VRAM, {gib(d.get('ram_lendable', 0))} GB RAM"),
             ("Connected", ago(d["connected_at"]) if d["connected"] else f"offline, last seen {ago(d['last_seen'])}"),
         ]
         for label, value in rows:

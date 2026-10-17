@@ -356,7 +356,7 @@ def render_nodes(nodes: list[dict[str, Any]]) -> Lines:
     if not nodes:
         return [("No helpers yet. Run `ollamapower agent --hub <this PC's IP>` on a helper.", None)]
     lines: Lines = [
-        (f"   {'ID':9} {'NAME':18} {'IP':16} {'STATUS':13} {'GPU':22} {'VRAM FREE/LEND':15} {'LINK':24} TUNNEL", None)
+        (f"   {'ID':9} {'NAME':18} {'IP':16} {'STATUS':13} {'GPU':22} {'MEM FREE/LEND':15} {'LINK':24} TUNNEL", None)
     ]
     for n in nodes:
         gpus = n["gpus"]
@@ -364,11 +364,16 @@ def render_nodes(nodes: list[dict[str, Any]]) -> Lines:
             "CPU only" if not gpus else (gpus[0].get("name") or "GPU") + (f" +{len(gpus) - 1}" if len(gpus) > 1 else "")
         )
         color = typer.colors.YELLOW if n["warnings"] else None
+        if gpus:
+            mem = f"{gb(n['vram_free'])}/{gb(n['vram_lendable'])} GB"
+        else:  # a CPU helper lends RAM (if its owner allows it): show that, not an empty GPU
+            ram_free = (n["ram_total"] or 0) - (n["ram_used"] or 0)
+            mem = f"{gb(ram_free)}/{gb(n.get('ram_lendable', 0))} GB RAM"
         lines.append(
             (
                 f"{STATUS_ICON.get(n['status'], '? ')} {n['id'][:8]:9} {safe(n['name'])[:18]:18} "
                 f"{safe(n['ip'])[:16]:16} "
-                f"{n['status']:13} {safe(gpu)[:22]:22} {gb(n['vram_free']) + '/' + gb(n['vram_lendable']) + ' GB':15} "
+                f"{n['status']:13} {safe(gpu)[:22]:22} {mem:15} "
                 f"{safe(_link(n['link']))[:24]:24} {n['tunnel_effective']}",
                 color,
             )
@@ -394,7 +399,8 @@ def render_status(s: dict[str, Any]) -> Lines:
         (
             "Helpers",
             f"{len(lending)} lending, {len(nodes)} known, "
-            f"{gb(sum(n['vram_lendable'] for n in lending))} GB VRAM lendable",
+            f"{gb(sum(n['vram_lendable'] for n in lending))} GB VRAM + "
+            f"{gb(sum(n.get('ram_lendable', 0) for n in lending))} GB RAM lendable",
         ),
         ("Control", control_text(c)),
         ("Hub key", format_fingerprint(c["fingerprint"]) if c["fingerprint"] else "-"),
@@ -479,6 +485,10 @@ def render_node(d: dict[str, Any]) -> Lines:
         ("CPU", f"{cpu.get('model', '?')}, {cpu.get('cores', '?')} cores"),
         ("RAM", f"{gb(d['ram_used'])} / {gb(d['ram_total'])} GB"),
         ("VRAM", f"{gb(d['vram_free'])} free of {gb(d['vram_total'])} GB, {gb(d['vram_lendable'])} GB lendable"),
+        (
+            "RAM lendable",
+            f"{gb(d.get('ram_lendable', 0))} GB" if d["lending"].get("allow_cpu") else "no (CPU lending off)",
+        ),
         ("Link", _link(d["link"])),
         ("Tunnel", f"{d['tunnel_effective']} (requested {d['tunnel_mode']})"),
         ("Lending", json.dumps(d["lending"])),
@@ -736,6 +746,13 @@ def render_suggest(d: dict[str, Any]) -> Lines:
     lines.append((f"Pool now: {pool or 'no helper lending'} · hub RAM {_human(d['hub']['ram'])}", None))
     lines += [(f"Not counted: {safe(reason)}", typer.colors.YELLOW) for reason in d["not_counted"]]
     lines.append(("ALONE/POOLED: generation tok/s; ~ = predicted, plain = measured by `models benchmark`.", None))
+    lines.append(
+        (
+            "Pooled predictions can be optimistic: with a CPU helper on Wi-Fi, split measured 2-2.6x slower than"
+            " predicted. Only a benchmark decides.",
+            None,
+        )
+    )
     return lines
 
 
@@ -775,6 +792,11 @@ def models_benchmark(
             typer.echo(
                 f"  {safe(name):40} {r['gen_tps']:7.1f} tok/s · prompt {_tps(r.get('prompt_tps'))} tok/s · "
                 f"first token {r['ttft_ms']} ms · load {r['load_s']} s"
+                + (
+                    f" · predicted ~{predicted:.1f}"
+                    if (predicted := (r.get("placement") or {}).get("predicted_tps"))
+                    else ""
+                )
             )
         else:
             typer.secho(f"  {safe(name):40} failed: {safe(r['error'])}", fg=typer.colors.YELLOW)

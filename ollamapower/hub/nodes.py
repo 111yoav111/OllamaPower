@@ -223,6 +223,12 @@ class Node:
             out.append(merged)
         return out
 
+    def lendable_ram(self) -> int:
+        """RAM bytes this helper would lend now (its owner allows CPU lending), the planner's estimate."""
+        from .suggest import _helper_ram
+
+        return (_helper_ram(self) or 0) if self.lending.get("allow_cpu") else 0
+
     def lendable_vram(self) -> int:
         """Bytes of VRAM the helper's owner allows us to use right now."""
         if self.status != "lending":
@@ -280,6 +286,7 @@ class Node:
             "vram_total": sum(int(_num(g.get("vram_total"))) for g in gpus),
             "vram_free": sum(g["vram_free"] for g in gpus),
             "vram_lendable": self.lendable_vram(),
+            "ram_lendable": self.lendable_ram(),
             "cpu_percent": tel.get("cpu_percent"),
             "ram_total": tel.get("ram_total") or self.capabilities.get("ram_total"),
             "ram_used": tel.get("ram_used"),

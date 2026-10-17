@@ -78,7 +78,10 @@ RAM. llama.cpp b11347 (Vulkan on the hub, CPU on the helper), secure tunnel.
 |---|---|---|---|---|---|
 | qwen3:14b | Ollama (hub alone) | 15.1 | 713 | 801 | 31.8 |
 | qwen3:14b | split, hub GPU + laptop RAM | 131.6 (first load), 16.9 (from the laptop's disk cache) | 11 606 | 41.9 | 4.3 |
-| huihui_ai/qwen3-abliterated:30b-a3b (MoE, 18.6 GB) | Ollama (hub GPU + RAM) | 62.0 | 19 866 | 23.8 | 21.4 |
+| huihui_ai/qwen3-abliterated:30b-a3b (MoE, 18.6 GB) | Ollama (hub GPU + RAM) | 58-62 | 10 538-31 418 | 15.0-45.0 | 21.4-26.4 (3 runs) |
+| same, 4K context | split: hub GPU 44 layers + hub RAM 8.0 GB of experts + laptop 5 layers (2.3 GB) | 238 (first), 63-70 (cached) | 17 495-18 052 | 26.7-27.4 | 8.4-10.4 (2 runs; predicted 27.1) |
+| same, 16K context | Ollama | 58.2 | 16 086 | 29.3 | 20.4 |
+| same, 16K context | split | - | - | - | doesn't fit (0.4 GB short) |
 
 `qwen3:14b` fits this hub's GPU, so the run forced it over with
 `planner.memory_margin = 0.4` (13.3 GB "needed") to put layers on the laptop.
@@ -98,8 +101,11 @@ Reading it:
   hold at all.
 - **The planner's estimate was 2x optimistic** for this helper (8.7 predicted
   vs 4.3 measured tok/s): the benchmark, not the estimate, decides.
-- **The 30B MoE fits this hub alone** (GPU + RAM), and Ollama runs it at 21
-  tok/s; the planner now says so instead of splitting it.
+- **The 30B MoE fits this hub alone** (GPU + RAM), and Ollama runs it at
+  21-26 tok/s; split with the laptop ran at 8-10 tok/s and the hub kept
+  Ollama. Ollama's own prompt speed varies a lot between runs (15-45 tok/s),
+  so compare generation speeds over several runs.
+- What was tried and what broke: [`FIELD_TEST.md`](FIELD_TEST.md).
 
 ### Adding your numbers
 

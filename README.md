@@ -37,11 +37,12 @@ all count.
 | Situation | Does pooling help? |
 |---|---|
 | The model fits in the Hub's own memory, at full speed | **No.** OllamaPower leaves it on plain Ollama. |
-| The model doesn't fit in the Hub's RAM/VRAM (Ollama pages it from disk, or refuses) | **Yes, the main case.** Spread over the Hub's and helpers' RAM (and any GPUs), it runs instead of crawling; the hub sends it to split mode on the first request. Helpers without a GPU lend RAM once their owner allows it (`ollamapower agent rules --allow-cpu`). |
-| Mixture-of-experts models (gpt-oss-120b, Qwen3-235B-A22B, ...) | **Yes, the best case.** Each token reads only a few experts, so the pooled RAM of ordinary PCs runs them at usable speed (estimates in [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)). *(v2)* |
+| The model doesn't fit in the Hub's RAM/VRAM (Ollama pages it from disk, or refuses) | **Yes, the main case** (designed for; not yet measured on real PCs). Spread over the Hub's and helpers' RAM (and any GPUs), it runs instead of crawling; the hub sends it to split mode on the first request. Helpers without a GPU lend RAM once their owner allows it (`ollamapower agent rules --allow-cpu`). |
+| Mixture-of-experts models (gpt-oss-120b, Qwen3-235B-A22B, ...) too big for the Hub | **Yes, the best case** (estimated). Each token reads only a few experts, so the pooled RAM of ordinary PCs runs them at usable speed (estimates in [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)). *(v2)* |
+| The model fits in the Hub's GPU **plus** its RAM, and the only helper is a CPU on Wi-Fi | **No** (measured): a 30B MoE ran at 21-26 tok/s on Ollama alone and 8-10 tok/s split with a 2-core laptop helper. The hub measured this and kept Ollama ([`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)). |
 | Dense 70B on ordinary PCs | **It runs** (~1-2 tok/s estimated) where a single PC pages from disk. *(v2)* |
 | Ollama spills part of a model to the Hub's CPU and a helper has a GPU | **Often faster**: those layers run on the helper's GPU. *(v1, works now)* |
-| Helper on Wi-Fi | **Allowed.** A few round trips per token; only the first load of a big model is slow. |
+| Helper on Wi-Fi | **Allowed.** A few round trips per token, and the first load of a big model is slow (4 min for 2.3 GB of layers here; later loads come from the helper's disk cache). |
 | Phones, tablets | Clients only, not helpers. |
 
 **Golden rule: OllamaPower must never make things slower.** A model that fits
@@ -644,7 +645,7 @@ OLLAMAPOWER_TEST_LLAMACPP=/path/to/llama-b11347 .venv/bin/python -m pytest -q te
 Lock files are generated with
 `uv pip compile pyproject.toml [--extra dev] --universal --generate-hashes --python-version 3.11`.
 
-Project docs: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) (real measurements), [`docs/STYLE_NOTES.md`](docs/STYLE_NOTES.md) (conventions shared
+Project docs: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) (real measurements), [`docs/FIELD_TEST.md`](docs/FIELD_TEST.md) (the first two-PC run: what broke, what is open), [`docs/STYLE_NOTES.md`](docs/STYLE_NOTES.md) (conventions shared
 with OllamaGate), [`docs/DCP_REUSE.md`](docs/DCP_REUSE.md) (what came from DCP
 and why), [`SECURITY.md`](SECURITY.md).
 
