@@ -255,13 +255,15 @@ async def benchmark_model(hub: Hub, model: str, ctx: int | None = None, automati
         if any(s.get("ok") for s in splits):
             plans.bench_succeeded(model)  # automatic benchmarks may run again (after a manual one, too)
         out: dict[str, Any] = {"model": model, "ctx": ctx, "local": local, "splits": splits, "decided": False}
-        if ctx != plans.ctx_for(model):
-            plans._update(model, ctx=ctx)  # measured at this context: that's the context the plan runs at
-        if plans.record(model)["pin"] is None:
-            rec = plans.decide(model, local, splits)
+        if ctx != plans.ctx_for(model) and any(s.get("ok") for s in splits):
+            # Measured at this context: that's the context the plan runs at - unless split mode didn't
+            # run at it, which would leave a pinned model with a plan that can't start.
+            plans._update(model, ctx=ctx)
+        rec = plans.decide(model, local, splits)  # recorded even under a pin: unpinning then uses this result
+        if rec["pin"] is None:
             out.update(decided=True, choice=rec["choice"], reason=rec["reason"])
         else:
-            out["reason"] = f"pinned to {plans.record(model)['pin']}: the result is kept, the pin still decides"
+            out["reason"] = f"pinned to {rec['pin']}: the result is kept, the pin still decides"
         hub.event("benchmark_done", model=model, seconds=round(time.time() - started, 1), choice=out.get("choice"))
         return out
 

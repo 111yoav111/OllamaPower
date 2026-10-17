@@ -528,6 +528,9 @@ def test_pinned_model_keeps_its_pin_after_a_benchmark(cluster):
     r = c.admin("models.benchmark", model="tiny")
     assert r["decided"] is False and "pinned to local" in r["reason"]
     assert c.call(lambda: c.hub.plans.route("tiny")) is None
+    c.admin("models.unpin", model="tiny")  # automatic again: the benchmark run under the pin decides
+    assert c.call(lambda: c.hub.plans.record("tiny")["choice"]) == "split"
+    assert c.call(lambda: c.hub.plans.route("tiny")) is not None
 
 
 @pytestmark_e2e
@@ -727,3 +730,22 @@ def test_benchmark_refuses_a_model_that_fits_before_running_ollama(tmp_path, fak
         assert "/api/generate" not in c.rec.paths()  # no Ollama run was wasted
     finally:
         close()
+
+
+@pytestmark_e2e
+def test_a_context_split_mode_cant_run_at_does_not_replace_the_plans(cluster, monkeypatch):
+    from ollamapower.hub import benchmark
+
+    c = cluster
+    c.admin("models.pin", model="tiny", engine="split")
+    before = c.call(lambda: c.hub.plans.ctx_for("tiny"))
+    real = benchmark.run_workload
+
+    async def split_fails(hub, model, ctx, engine, *args, **kwargs):
+        if engine == "split":
+            return {"engine": "split", "ok": False, "error": "doesn't fit even with the helpers"}
+        return await real(hub, model, ctx, engine, *args, **kwargs)
+
+    monkeypatch.setattr(benchmark, "run_workload", split_fails)
+    c.admin("models.benchmark", model="tiny", ctx=before * 4)
+    assert c.call(lambda: c.hub.plans.ctx_for("tiny")) == before  # the pinned plan still runs

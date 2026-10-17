@@ -193,6 +193,31 @@ def test_hub_pause_drains_too(cluster):
 
 
 @e2e
+def test_an_answer_longer_than_the_drain_ends_saying_why(cluster, monkeypatch):
+    monkeypatch.setattr("ollamapower.hub.engines.split.DRAIN_TIMEOUT", 1.0)
+    c = cluster
+    c.admin("models.pin", model="tiny", engine="split")
+    with httpx.Client(timeout=60, trust_env=False) as cl:
+        assert chat(cl, c).status_code == 200
+        result = {}
+
+        def slow_answer() -> None:  # ~6 s of streaming, longer than the drain
+            r = cl.post(
+                c.url + "/v1/chat/completions",
+                json={"model": "tiny", "messages": [{"role": "user", "content": "x"}], "stream": True, "fake_delay": 2},
+            )
+            result["text"] = r.text
+
+        worker = threading.Thread(target=slow_answer)
+        worker.start()
+        assert wait_for(lambda: c.call(lambda: c.hub.split.session.active) == 1, 5)
+        c.admin("nodes.pause", ref="desk")
+        worker.join(30)
+    assert "split mode stopped: desk is paused" in result["text"]  # not a bare "upstream error"
+    assert c.call(lambda: c.hub.plans.record("tiny")["degraded"]) is None  # still planned, not a failure
+
+
+@e2e
 def test_agent_status_shows_why_it_is_not_lending(cluster):
     from ollamapower.agent.service import agent_snapshot
 

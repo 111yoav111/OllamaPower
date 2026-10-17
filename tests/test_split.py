@@ -688,3 +688,30 @@ def test_the_hubs_gpus_are_what_its_llama_cpp_can_drive(tmp_path, fake_ollama, m
         assert c.hub.split.hub_devices() == []
     finally:
         close()
+
+
+async def test_requests_waiting_for_the_split_slot_go_by_priority():
+    # The front door lets hub.max_concurrency requests through; llama-server has one slot, so
+    # the order is decided here: a critical request that arrives last still goes next.
+    from ollamapower.hub.engines.split import SplitSession
+    from ollamapower.scheduling.request_queue import Ticket
+    from ollamapower.scheduling.task_pool import TaskPriority
+
+    slot = SplitSession(model="m", ctx=512).slot
+    running = Ticket(TaskPriority.NORMAL)
+    await slot.acquire(running)
+    order: list[str] = []
+
+    async def wait(name: str, priority: TaskPriority) -> None:
+        ticket = Ticket(priority)
+        await slot.acquire(ticket)
+        order.append(name)
+        slot.release(ticket)
+
+    waiters = [asyncio.ensure_future(wait("low", TaskPriority.LOW))]
+    await asyncio.sleep(0)
+    waiters.append(asyncio.ensure_future(wait("critical", TaskPriority.CRITICAL)))
+    await asyncio.sleep(0)
+    slot.release(running)
+    await asyncio.gather(*waiters)
+    assert order == ["critical", "low"]

@@ -53,6 +53,7 @@ from ...llamacpp.install import Pins
 from ...llamacpp.manager import LlamaCppUnavailable, ensure
 from ...ollama.blobs import ModelFiles, ModelUnavailable, resolve
 from ...ollama.client import PROBE_HEADERS, human_bytes, parse_ps
+from ...scheduling.request_queue import RequestGate
 from ...textsafe import safe_text
 from ..planner import MIB, Device, PlanError, SplitPlan, fits_on_hub, plan_split
 from ..plans import AWAY, PERMANENT, TRANSIENT, SplitSpec, layout_problem
@@ -169,9 +170,10 @@ class SplitSession:
     error: str = ""
     draining: bool = False  # a helper stopped lending: finish the current answers, then stop
     proven: bool = False  # an answer came through: the plan book's failure count went back to zero
-    # llama-server runs with one slot (-np 1): requests queue here, in the hub, so time spent
-    # waiting for the slot never counts as llama-server stalling.
-    slot: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
+    # llama-server runs with one slot (-np 1): requests queue here, in the hub, by priority (the
+    # front door lets hub.max_concurrency through), so time spent waiting for the slot never counts
+    # as llama-server stalling.
+    slot: RequestGate = field(default_factory=lambda: RequestGate(1, SLOT_QUEUE))
 
     def transfer(self) -> dict[str, Any] | None:
         """Model weights sent to the helpers so far (secure mode counts them), for a progress bar."""
@@ -243,6 +245,7 @@ def _shared_ram(free: bool) -> int:
     return max(0, int(vm.available) - SHARED_RAM_KEEP) if free else int(vm.total * SHARED_RAM_SHARE)
 
 
+SLOT_QUEUE = 1 << 20  # never the limit: only requests the front door let through wait here
 MTP_DRAFT_TOKENS = 3  # llama.cpp's default draft length
 HUB_RAM_KEEP = 3 * 1024 * MIB  # RAM the hub leaves to the system, the front door and the owner's programs
 
@@ -739,6 +742,10 @@ class SplitEngine:
             timeout=httpx.Timeout(connect=5.0, read=self.config.split.stall_timeout, write=60.0, pool=30.0),
             trust_env=False,
             follow_redirects=False,
+            # llama-server closes a connection idle for 5 s; reusing one it just closed fails the request
+            # before the first byte, which would count as split mode failing. A new loopback connection
+            # per request costs ~0.1 ms.
+            limits=httpx.Limits(max_keepalive_connections=0),
         )
         while True:
             if s.process.returncode is not None:
@@ -899,13 +906,13 @@ class SplitEngine:
     async def _stop_now(self, s: SplitSession, reason: str, failed: bool) -> None:
         was_ready = s.state == "ready"
         s.state = "stopping"
-        if failed:
-            # Requests still streaming from a broken session end now (with an error), not at the stall timeout.
-            from ..runtime import model_key
+        # Requests still streaming end now, saying why: a broken session (not at the stall timeout),
+        # or a planned stop whose drain ran out of time (a helper paused) - not a bare "upstream error".
+        from ..runtime import model_key
 
-            for stream in list(self.hub.streams.values()):
-                if stream.engine == ENGINE_SPLIT and stream.model and model_key(stream.model) == s.model:
-                    stream.kill(f"split mode stopped: {reason}")
+        for stream in list(self.hub.streams.values()):
+            if stream.engine == ENGINE_SPLIT and stream.model and model_key(stream.model) == s.model:
+                stream.kill(f"split mode stopped: {reason}")
         try:
             proc = s.process
             if proc is not None and proc.returncode is None:

@@ -306,13 +306,11 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                 # Ollama applies the Modelfile's SYSTEM/PARAMETER/MESSAGE; llama-server knows nothing of them.
                 apply_model_defaults(translated, parsed, path == "/api/chat", session.files.defaults)
             released = False
-            has_slot = False
+            slot_ticket = Ticket(priority)
 
             def release() -> None:
-                nonlocal released, has_slot
-                if has_slot:
-                    has_slot = False
-                    session.slot.release()
+                nonlocal released
+                session.slot.release(slot_ticket)  # no-op unless the slot was granted
                 if not released:
                     released = True
                     hub.split.release(session)
@@ -381,9 +379,8 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
             # Send the request and wait for the first bytes of the answer. Until then nothing has
             # reached the client, so if split mode breaks now, Ollama answers instead - transparently.
             try:
-                # One request at a time per llama-server slot; waiting here isn't llama-server's time.
-                await race_kill(session.slot.acquire(), stream, request.receive)
-                has_slot = True
+                # One request at a time per llama-server slot, by priority; waiting here isn't llama-server's time.
+                await race_kill(session.slot.acquire(slot_ticket), stream, request.receive)
                 assert session.client is not None
                 if native:
                     # Progress chunks while the prompt is processed: a long prompt is alive, not stalled.
