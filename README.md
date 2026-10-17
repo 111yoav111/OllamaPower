@@ -128,29 +128,42 @@ Check it worked with `ollamapower version`. To update later:
 
 ```bash
 ollamapower init       # creates the config dir, a cluster token, config.toml
-ollamapower doctor     # tells you exactly what to fix, step by step
+ollamapower setup      # moves Ollama to port 11435 and opens port 9000 to your LAN
+ollamapower doctor     # checks everything
+ollamapower hub        # start it (terminal UI; --no-tui for plain logs)
 ```
 
-`doctor` will ask you to move Ollama from port 11434 to **11435**, so
-OllamaPower can take 11434 and your apps keep working unchanged:
+OllamaPower takes Ollama's usual port (11434), so your apps keep working
+unchanged, and Ollama moves next door to 11435. `setup` explains what it will
+do, shows each command and asks first; `--print` only shows them.
+
+**Is `sudo` safe here?** OllamaPower itself never runs as root (it refuses to).
+`setup` and `uninstall` call `sudo` only for a few fixed commands, never through a
+shell, and the only values in them are checked port numbers, `127.0.0.1` and your
+local network's address. It writes one file of its own
+(`/etc/systemd/system/ollama.service.d/ollamapower.conf`) and never edits yours.
+The firewall opens port 9000 only to your local network (never wider than a /16,
+never Docker or VM bridges), and that port only lets in helpers that hold your
+cluster token; Ollama's own API stays private to this PC. Setup restarts Ollama
+once, which stops anything it is generating at that moment.
+
+**Changed your mind?** `ollamapower uninstall` puts back exactly what `setup`
+changed: Ollama on 11434, and only the firewall rules setup added (a rule you had
+before stays). Remember that while the
+hub isn't running, apps using port 11434 find no Ollama there.
+
+`setup` handles Linux with Ollama as a systemd service (and ufw or firewalld).
+On macOS and Windows, move Ollama by hand:
 
 | OS | Move Ollama to 11435 |
 |---|---|
-| Linux (systemd) | `sudo systemctl edit ollama`, add `[Service]` and `Environment="OLLAMA_HOST=127.0.0.1:11435"`, then `sudo systemctl restart ollama` |
 | macOS | `launchctl setenv OLLAMA_HOST 127.0.0.1:11435`, then quit and reopen the Ollama app (lost at reboot; `doctor` shows how to keep it) |
 | Windows | `setx OLLAMA_HOST 127.0.0.1:11435`, then quit Ollama from the tray icon and start it again |
 
-Run `ollamapower doctor` again until it shows no `[ERROR]`, then start the hub:
-
-```bash
-ollamapower hub        # terminal UI; --no-tui for plain logs (servers, services)
-```
-
-Allow incoming TCP port **9000** in the hub's firewall so helpers can connect
-(Windows asks on the first run: allow it for **private** networks;
-Linux with ufw: `sudo ufw allow 9000/tcp`). Find the hub's LAN address with
-`ip -4 addr` (Linux), `ipconfig getifaddr en0` (macOS) or `ipconfig`
-(Windows), e.g. `192.168.1.10`.
+and allow incoming TCP port **9000** when the firewall asks on the first run
+(for **private** networks only). Find the hub's LAN address with `ip -4 addr`
+(Linux), `ipconfig getifaddr en0` (macOS) or `ipconfig` (Windows), e.g.
+`192.168.1.10`.
 
 Finally, print the cluster token for the helpers:
 
@@ -190,10 +203,10 @@ one in the hub's Overview tab (or `ollamapower status` on the hub) and
 confirm. The helper appears on the hub's Nodes tab. It downloads its
 llama.cpp build once (about 30 MB) and then waits to be used.
 
-Allow incoming TCP port **9001** in the helper's firewall: the hub connects
-there to run a model split across the PCs (Linux with ufw:
-`sudo ufw allow from 192.168.1.0/24 to any port 9001 proto tcp`; Windows asks
-on the first split run: allow it for **private** networks). Another port:
+The hub connects to the helper on TCP port **9001** to run a model split across
+the PCs. On Linux, `ollamapower agent setup` opens it to your local network
+(asking first; `ollamapower agent uninstall` closes it again). Windows and macOS
+ask on the first split run: allow it for **private** networks. Another port:
 `relay_port` in `agent.toml`.
 
 A helper with **no GPU** lends only after its owner allows it:
@@ -232,30 +245,29 @@ arguments are passed on:
 |---|---|
 | `ollamapower: command not found` | Open a new terminal after `pipx ensurepath`. |
 | Helper says the token is missing or wrong | Run `ollamapower token show` on the hub again and copy the whole line into the helper's `.env`. |
-| Helper can't reach the hub | Is `ollamapower hub` running? Is port 9000 open in the hub's firewall? Are both PCs on the same network? Try `ping <hub address>` from the helper. |
+| Helper can't reach the hub | Is `ollamapower hub` running? Is port 9000 open in the hub's firewall (`ollamapower setup`)? Are both PCs on the same network? Try `ping <hub address>` from the helper. |
 | Helper refuses: the hub's key changed | Only if you re-created the hub's key yourself: `ollamapower agent forget-hub` on the helper, then connect again. |
 | A model you pulled doesn't show up | It went to another Ollama: don't run `ollama serve` yourself (it ignores the service's settings, e.g. `OLLAMA_MODELS`). With the hub running, a plain `ollama pull <model>` reaches the right Ollama. |
 | Split mode fails with "couldn't reach <helper> ... is its firewall blocking it?" | Allow incoming TCP 9001 (`relay_port`) in that helper's firewall. |
-| Hub says port 11434 is in use | Ollama still listens there: do step 2's "Move Ollama" again and restart Ollama. |
+| Hub says port 11434 is in use | Ollama still listens there: run `ollamapower setup` (or move it by hand, step 2). |
+| Apps find no Ollama / no models | The hub isn't running (Ollama is on 11435): start `ollamapower hub`, or `ollamapower uninstall` to put Ollama back on 11434. Don't start `ollama serve` yourself: it's a second, empty Ollama. |
 | Anything else | `ollamapower doctor` on the hub, `ollamapower logs` for the event log. |
 
 ## Set up the Hub (details)
 
 ```bash
 ollamapower init      # config dir, a cluster token in .env, config.toml, state.json
-ollamapower doctor    # checks everything and shows how to move Ollama to port 11435
+ollamapower setup     # Linux: moves Ollama to port 11435, opens 9000 to your LAN (asks for sudo)
+ollamapower doctor    # checks everything (and shows the manual steps elsewhere)
 ollamapower hub       # run it with the terminal UI (--no-tui: headless, plain logs)
 ```
 
 OllamaPower takes Ollama's usual address, `127.0.0.1:11434`, so your clients
 (Open WebUI, scripts, the `ollama` CLI) keep working without any change. The
-real Ollama moves to `127.0.0.1:11435`. `ollamapower doctor` detects where
-Ollama listens and prints the exact steps for your OS, e.g. on Linux:
-
-```bash
-sudo systemctl edit ollama        # add: [Service]  Environment="OLLAMA_HOST=127.0.0.1:11435"
-sudo systemctl restart ollama
-```
+real Ollama moves to `127.0.0.1:11435`: `ollamapower setup` does it on Linux
+(a drop-in file of its own, `/etc/systemd/system/ollama.service.d/ollamapower.conf`,
+which `ollamapower uninstall` deletes again), and `ollamapower doctor` prints the
+steps for other systems.
 
 `doctor` also checks that neither Ollama's port nor the front door's (11434)
 answers on a network address, that `OLLAMA_HOST` is a valid loopback address,

@@ -127,7 +127,8 @@ def migration_steps(ollama_url: str, platform: str = sys.platform) -> str:
         ]
     else:
         steps = [
-            "If Ollama runs as a systemd service (the default Linux install):",
+            "Run `ollamapower setup`: it does this for you, asking for your password, and",
+            "`ollamapower uninstall` undoes it. Or by hand, if Ollama is a systemd service:",
             "  sudo systemctl edit ollama",
             "  add these two lines, save and close:",
             "    [Service]",
@@ -170,7 +171,13 @@ def check_ports(config: Config) -> list[Finding]:
     if at_front == "ollamapower":
         findings.append(Finding("ok", f"OllamaPower answers at {front}"))
     elif at_front == "nothing":
-        findings.append(Finding("warn", f"Nothing listens on {front} yet", "Start it with `ollamapower hub`."))
+        findings.append(
+            Finding(
+                "warn",
+                f"Nothing listens on {front}: apps using it find no Ollama",
+                "Start the hub with `ollamapower hub`, or give the port back to Ollama with `ollamapower uninstall`.",
+            )
+        )
     elif at_front == "other":
         findings.append(
             Finding("error", f"Something other than Ollama or OllamaPower uses {front}", "Stop it or change hub.port.")

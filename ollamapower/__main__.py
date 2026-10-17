@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import deque
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -125,6 +127,92 @@ def init(
         + format_fingerprint(public_key_fingerprint(key.public_key()))
     )
     typer.echo("\nNext: `ollamapower doctor` checks Ollama and walks you through moving it to port 11435.")
+
+
+YesOption = typer.Option(False, "--yes", "-y", help="Don't ask before running the commands")
+PrintOption = typer.Option(False, "--print", help="Only show the commands (to run them yourself)")
+
+
+@cli.command()
+def setup(yes: bool = YesOption, print_only: bool = PrintOption, config_path: Path | None = ConfigOption) -> None:
+    """Move Ollama to ollama.url and open the control port to your LAN (Linux, asks for sudo)."""
+    from . import setup as s
+    from .cli_common import apply_setup_plan
+    from .config import is_loopback_host
+    from .doctor import migration_steps, ollama_version
+
+    config = load(config_path)
+    if not s.has_systemd_ollama():
+        typer.echo("Automatic setup needs Linux with Ollama as a systemd service. To do it by hand:")
+        typer.echo(migration_steps(config.ollama.url))
+        raise typer.Exit(1)
+    try:
+        plan = s.plan_hub_setup(
+            config.ollama.url,
+            config.hub.port,
+            config.control.port,
+            config.control.enabled and not is_loopback_host(config.control.host),
+        )
+    except s.SetupError as exc:
+        typer.secho(f"Can't set up: {exc}.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from None
+    try:
+        ran = apply_setup_plan(
+            plan, yes=yes, print_only=print_only, adding=True, record_dir=config.config_dir, record_name=s.RECORD
+        )
+    except s.SetupError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        typer.echo("`ollamapower uninstall` undoes what was done so far.")
+        raise typer.Exit(1) from None
+    if not ran:
+        return
+    if not _wait_for(lambda: ollama_version(config.ollama.url) is not None, 30):
+        typer.secho(f"Ollama doesn't answer at {config.ollama.url} yet: check `systemctl status ollama`.", fg="yellow")
+        raise typer.Exit(1)
+    typer.secho(f"Done: Ollama listens on {config.ollama.url}.", fg=typer.colors.GREEN)
+    typer.echo(
+        "Start the hub with `ollamapower hub`: while it isn't running, apps using port "
+        f"{config.hub.port} find nothing there. `ollamapower uninstall` puts everything back."
+    )
+
+
+@cli.command()
+def uninstall(yes: bool = YesOption, print_only: bool = PrintOption, config_path: Path | None = ConfigOption) -> None:
+    """Undo `ollamapower setup`: Ollama back on its usual port, the firewall rules it added removed."""
+    from . import setup as s
+    from .cli_common import apply_setup_plan
+    from .doctor import ollama_version
+
+    config = load(config_path)
+    try:
+        plan = s.plan_uninstall(s.read_record(config.config_dir, s.RECORD), hub=True, port=config.control.port)
+        ran = apply_setup_plan(
+            plan, yes=yes, print_only=print_only, adding=False, record_dir=config.config_dir, record_name=s.RECORD
+        )
+    except s.SetupError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        typer.echo("What was undone so far is recorded: run `ollamapower uninstall` again to finish.")
+        raise typer.Exit(1) from None
+    if not ran:
+        return
+    restored = any(step.argv[:1] == ("rm",) for step in plan.steps)
+    usual = f"http://127.0.0.1:{s.DEFAULT_OLLAMA_PORT}"
+    if restored and not _wait_for(lambda: ollama_version(usual) is not None, 30):
+        typer.secho(f"Ollama doesn't answer at {usual} yet: check `systemctl status ollama`.", fg="yellow")
+        raise typer.Exit(1)
+    typer.secho("Done: everything `ollamapower setup` changed is back as it was.", fg=typer.colors.GREEN)
+    others = s.ollama_host_set_elsewhere() if restored else []
+    if others:
+        typer.secho(f"Note: OLLAMA_HOST is still set in {', '.join(others)} (not by OllamaPower).", fg="yellow")
+
+
+def _wait_for(check: Callable[[], bool], seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.5)
+    return check()
 
 
 def _warn_env_token(env_path: Path) -> None:

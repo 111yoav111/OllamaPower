@@ -360,6 +360,57 @@ def agent_rules(
         typer.echo(f"{key:18} {safe(value)}")
 
 
+@agent_cli.command("setup")
+def agent_setup(
+    config_dir: Path | None = ConfigDirOption,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask before running the commands"),
+    print_only: bool = typer.Option(False, "--print", help="Only show the commands (to run them yourself)"),
+) -> None:
+    """Let the hub reach this helper's split-mode port through the firewall (Linux, asks for sudo)."""
+    from .. import setup as s
+    from ..cli_common import apply_setup_plan
+
+    d = _config_dir(config_dir)
+    cfg = _load_agent(d)
+    try:
+        plan = s.plan_helper_setup(cfg.agent.relay_port)
+        ran = apply_setup_plan(
+            plan, yes=yes, print_only=print_only, adding=True, record_dir=d, record_name=s.AGENT_RECORD
+        )
+    except s.SetupError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        typer.echo("`ollamapower agent uninstall` undoes what was done so far.")
+        raise typer.Exit(1) from None
+    if ran:
+        typer.secho(
+            f"Done: the hub can reach port {cfg.agent.relay_port}. `ollamapower agent uninstall` undoes it.", fg="green"
+        )
+
+
+@agent_cli.command("uninstall")
+def agent_uninstall(
+    config_dir: Path | None = ConfigDirOption,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask before running the commands"),
+    print_only: bool = typer.Option(False, "--print", help="Only show the commands (to run them yourself)"),
+) -> None:
+    """Undo `ollamapower agent setup`: remove the firewall rules it added."""
+    from .. import setup as s
+    from ..cli_common import apply_setup_plan
+
+    d = _config_dir(config_dir)
+    cfg = _load_agent(d)
+    try:
+        plan = s.plan_uninstall(s.read_record(d, s.AGENT_RECORD), hub=False, port=cfg.agent.relay_port)
+        ran = apply_setup_plan(
+            plan, yes=yes, print_only=print_only, adding=False, record_dir=d, record_name=s.AGENT_RECORD
+        )
+    except s.SetupError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from None
+    if ran:
+        typer.secho("Done: the firewall rules `agent setup` added are gone.", fg="green")
+
+
 @agent_cli.command("example-config")
 def agent_example_config() -> None:
     """Print an agent.toml listing every setting (save it with `> agent.toml` in the config dir)."""

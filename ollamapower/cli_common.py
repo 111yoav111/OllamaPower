@@ -214,3 +214,60 @@ def tunnel_test_lines(r: dict[str, Any]) -> list[str]:
     if r.get("overhead_pct") is not None:
         lines.append(f"Encryption costs {r['overhead_pct']}% throughput and {r['rtt_overhead_ms']} ms per round trip.")
     return lines
+
+
+def apply_setup_plan(
+    plan: Any, *, yes: bool, print_only: bool, adding: bool, record_dir: Path, record_name: str
+) -> bool:
+    """Show ``plan``, ask, run it with sudo and record what changed (see ``ollamapower.setup``).
+
+    Returns False if there was nothing to do or the user said no.
+    """
+    from . import setup as s
+
+    if running_as_admin():
+        typer.secho(
+            "Run this as your normal user, not with sudo: it asks for your password itself, only for the "
+            "steps that need it.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(2)
+    for note in plan.notes:
+        typer.echo(note)
+    if not plan.steps:
+        typer.echo("Nothing to change.")
+        return False
+    if plan.summary:
+        typer.echo(plan.summary + "\n")
+    typer.echo("These commands will run (with sudo; the read-only checks change nothing):\n")
+    for step in plan.steps:
+        typer.echo(f"  # {step.why}")
+        typer.echo("  " + step.shown().replace("\n", "\n  "))
+    typer.echo()
+    if print_only:
+        typer.echo("(--print: nothing was run)")
+        return False
+    if not yes and not typer.confirm("Run them now?", default=False):
+        return False
+    changed: list[tuple[str, int]] = []
+    restored = False
+    hub = record_name == s.RECORD
+    try:
+        restored = s.execute(plan, s.sudo_runner, adding, changed)
+    finally:
+        record = s.read_record(record_dir, record_name)
+        rules = {tuple(r) for r in record.get("rules", []) or []}  # type: ignore[union-attr]
+        rules = rules | set(changed) if adding else rules - set(changed)
+        record["rules"] = sorted(rules)
+        if changed and adding:
+            record["firewall"] = plan.firewall
+        if hub:
+            # Ollama's port counts as given back only once Ollama restarted without the drop-in: if a step
+            # failed half-way, the record still says so and `uninstall` tries again.
+            record["dropin"] = Path(s.DROPIN).exists() or (not adding and bool(record.get("dropin")) and not restored)
+        try:
+            s.write_record(record_dir, record, record_name)
+        except OSError as exc:  # never hide the error that brought us here
+            typer.secho(f"Couldn't save {record_dir / record_name}: {exc}", fg=typer.colors.RED, err=True)
+    return True
