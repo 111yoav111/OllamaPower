@@ -86,12 +86,16 @@ def test_download_and_install(tmp_path):
     if sys.platform != "win32":
         assert os.readlink(target / "libggml.so") == "libggml.so.0"
         assert os.access(target / "llama-server", os.X_OK)
+        assert (tmp_path / "llamacpp").stat().st_mode & 0o077 == 0  # owner-only: doctor checks it
     assert seen[-1] == len(rel.archives["a.tar.gz"])
     assert not (tmp_path / "llamacpp" / "downloads" / "a.tar.gz").exists()  # archive removed after unpacking
-    # Installed: nothing is fetched again.
+    # Installed: nothing is fetched again (and an older install's open folder is made owner-only).
     count = len(rel.requests)
+    (tmp_path / "llamacpp").chmod(0o755)
     inst.install(Variant("cpu", ("a.tar.gz",)), tmp_path, pins, client=rel.client())
     assert len(rel.requests) == count
+    if sys.platform != "win32":
+        assert (tmp_path / "llamacpp").stat().st_mode & 0o077 == 0
 
 
 def test_hash_mismatch_is_deleted_and_never_unpacked(tmp_path):

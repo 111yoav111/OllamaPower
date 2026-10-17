@@ -203,6 +203,7 @@ def install(
     variant: Variant, base: Path, pins: Pins, progress: Progress | None = None, client: httpx.Client | None = None
 ) -> Path:
     """Make sure ``variant`` of the pinned release is installed; return its directory."""
+    private_dir(base / "llamacpp")  # holds programs that run: owner-only, like the rest (doctor checks it)
     target = install_dir(base, pins.tag, variant.backend)
     if is_installed(target, variant, pins):
         return target
