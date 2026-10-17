@@ -204,7 +204,7 @@ def test_apply_refuses_root(tmp_path, monkeypatch):
         apply_setup_plan(plan, yes=True, print_only=False, adding=True, record_dir=tmp_path, record_name=s.AGENT_RECORD)
 
 
-def test_apply_records_exactly_and_print_runs_nothing(tmp_path, monkeypatch, user):
+def test_apply_records_exactly_and_print_runs_nothing(tmp_path, monkeypatch, user, capsys):
     plan = s.Plan(steps=s.firewall_steps("ufw", [(LAN, 9001)]), firewall="ufw", rules=[(LAN, 9001)])
     sudo = FakeSudo()
     monkeypatch.setattr(s, "sudo_runner", sudo)
@@ -212,6 +212,13 @@ def test_apply_records_exactly_and_print_runs_nothing(tmp_path, monkeypatch, use
         plan, yes=True, print_only=True, adding=True, record_dir=tmp_path, record_name=s.AGENT_RECORD
     )
     assert sudo.ran == []
+    sudo.existing = f"ufw allow from {LAN} to any port 9001 proto tcp"  # the owner opened it already
+    assert apply_setup_plan(
+        plan, yes=True, print_only=False, adding=True, record_dir=tmp_path, record_name=s.AGENT_RECORD
+    )
+    assert "was open already" in capsys.readouterr().out
+    assert not (tmp_path / s.AGENT_RECORD).exists()  # nothing of ours to undo
+    sudo.existing = ""
     assert apply_setup_plan(
         plan, yes=True, print_only=False, adding=True, record_dir=tmp_path, record_name=s.AGENT_RECORD
     )

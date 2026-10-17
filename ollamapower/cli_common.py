@@ -270,4 +270,7 @@ def apply_setup_plan(
             s.write_record(record_dir, record, record_name)
         except OSError as exc:  # never hide the error that brought us here
             typer.secho(f"Couldn't save {record_dir / record_name}: {exc}", fg=typer.colors.RED, err=True)
+    for net, port in plan.rules if adding else []:
+        if (net, port) not in changed:
+            typer.echo(f"TCP {port} for {net} was open already: left as it is, and uninstall won't touch it.")
     return True
