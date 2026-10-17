@@ -749,3 +749,27 @@ def test_a_context_split_mode_cant_run_at_does_not_replace_the_plans(cluster, mo
     monkeypatch.setattr(benchmark, "run_workload", split_fails)
     c.admin("models.benchmark", model="tiny", ctx=before * 4)
     assert c.call(lambda: c.hub.plans.ctx_for("tiny")) == before  # the pinned plan still runs
+
+
+@pytestmark_e2e
+def test_a_model_too_big_for_this_pc_never_goes_to_ollama_unless_pinned(cluster, client, monkeypatch):
+    # Ollama loading a model this PC can't hold crawls from disk or dies out of memory - for everyone
+    # using it. With no way to split it right now, the client hears why instead.
+    from ollamapower.hub.planner import Device
+
+    c = cluster
+    monkeypatch.setattr(c.hub.split, "hub_ram", lambda free: Device("hub RAM", 1024, device="CPU", ram=True))
+    assert chat(client, c).status_code == 200  # learns it is too big; split mode serves it
+    c.run(c.hub.split.stop("tiny", "test"))
+    c.admin("nodes.pause", ref="desk")
+    r = chat(client, c)
+    assert r.status_code == 503 and "too big for this PC alone" in r.text and "no helper" in r.text
+    assert "/api/chat" not in c.rec.paths()  # Ollama was never asked
+    c.admin("models.pin", model="tiny", engine="local")  # the owner says: try Ollama anyway
+    assert chat(client, c).status_code == 200 and c.rec.last["path"] == "/api/chat"
+    # An earlier "split didn't work, use Ollama" doesn't keep a too-big model away from split mode.
+    c.admin("models.unpin", model="tiny")
+    c.call(lambda: c.hub.plans._update("tiny", choice="local", reason="split mode didn't work"))
+    c.admin("nodes.resume", ref="desk")
+    assert chat(client, c).status_code == 200
+    assert c.call(lambda: c.hub.split.is_running("tiny"))

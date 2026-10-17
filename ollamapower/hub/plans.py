@@ -302,14 +302,35 @@ class PlanBook:
             if not self.current_helpers(model):
                 return None  # every helper is away (paused, yielding, outside its schedule): not a failure
             return SplitSpec(ctx=ctx, exclude=exclude)
-        if rec["choice"] is None and model_key(model) in self.too_big and self.current_helpers(model):
-            # Not benchmarked yet, but plain Ollama would page it from disk: split is the only usable way.
-            return SplitSpec(ctx=ctx, exclude=exclude)
         if rec["choice"] == "split" and not self.key_problem(model, rec):
             ids = tuple(h["id"] for h in rec["key"]["helpers"])
             variant = rec["key"].get("variant", "")
             return SplitSpec(ctx=ctx, helpers=ids, exclude=exclude, layout=rec["key"], variant=variant)
+        if model_key(model) in self.too_big and self.current_helpers(model):
+            # Plain Ollama can't hold it (it pages it from disk, or runs out of memory): split mode is the
+            # only usable way, whatever an earlier attempt decided - helpers may have room now.
+            return SplitSpec(ctx=ctx, exclude=exclude)
         return None
+
+    def local_refusal(self, model: str) -> str | None:
+        """Why ``model`` must not go to plain Ollama now, or None. A model too big for this PC would
+        page from disk or kill Ollama (out of memory) - for everyone using it - so unless its owner
+        pinned it to Ollama, the client gets a clear "can't run it now, because" instead."""
+        from .runtime import model_key
+
+        if not model or self.hub.state is None or model_key(model) not in self.too_big:
+            return None
+        rec = self.record(model)
+        if rec["pin"] == "local":
+            return None
+        degraded = rec["degraded"] if isinstance(rec["degraded"], dict) else {}
+        why = degraded.get("reason") or ("" if self.current_helpers(model) else "no helper can lend right now")
+        why = why or str(rec["reason"] or "split mode isn't available")
+        return (
+            f"{model} is too big for this PC alone, and split mode can't run it right now: {why}. "
+            f"Free memory on the helpers or add one; `ollamapower models pin {model} local` makes "
+            "the hub try Ollama anyway"
+        )
 
     def stale(self, model: str, problem: str) -> None:
         """Split mode found its setup changed since the benchmark: route to Ollama, benchmark again.

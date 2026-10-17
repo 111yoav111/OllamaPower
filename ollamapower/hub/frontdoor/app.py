@@ -517,6 +517,12 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
                     if served is not None:
                         handed_off = isinstance(served, ProxyStreamResponse)
                         return served
+                refusal = hub.plans.local_refusal(stream.model) if forced is None else None
+                if refusal is not None:
+                    finish("rejected", 503)
+                    return error(
+                        path, 503, refusal, {**(cors(request.headers.get("origin")) or {}), "Retry-After": "60"}
+                    )
                 if hub.split.holds(stream.model):
                     files = hub.split.session.files if hub.split.session is not None else None
                     if path in EMBED_ENDPOINTS and files is not None and files.capabilities:
@@ -573,7 +579,14 @@ def create_app(hub: Hub, *, upstream_transport: httpx.AsyncBaseTransport | None 
         except httpx.HTTPError as exc:
             log.warning("Ollama unavailable for %s %s: %s", method, path, type(exc).__name__)
             finish("upstream_error", 502)
-            return error(path, 502, f"Ollama is not reachable at {config.ollama.url}")
+            if isinstance(exc, httpx.ConnectError):
+                return error(path, 502, f"Ollama is not reachable at {config.ollama.url}")
+            return error(
+                path,
+                502,
+                "Ollama stopped answering in the middle of the request (it may have crashed, e.g. out of "
+                "memory loading the model): see `journalctl -u ollama`",
+            )
         except ClientDisconnect:
             finish("client_disconnect", 499)
             return Response(status_code=499)
