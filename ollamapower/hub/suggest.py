@@ -102,6 +102,11 @@ def _pool(nodes: list[Node]) -> tuple[list[Device], list[str]]:
             ram = _helper_ram(node) if node.lending.get("allow_cpu") and not unified else 0
             if ram:  # a helper lends its RAM beside its GPU when its owner allows CPU lending
                 devices.append(helper_device(node, {"device": "CPU", "free_mib": ram // MIB}))
+            elif not node.lending.get("allow_cpu") and not unified and (spare := _helper_ram(node) or 0) >= GIB:
+                reasons.append(
+                    f"{node.name} could also lend ~{spare / GIB:.1f} GB of RAM: "
+                    "`ollamapower agent rules --allow-cpu` on it"
+                )
         elif node.lending.get("allow_cpu"):
             ram = _helper_ram(node)
             if ram:

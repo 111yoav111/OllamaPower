@@ -204,3 +204,12 @@ def test_a_cpu_helper_shows_the_ram_it_lends_not_an_empty_gpu():
     assert lending.summary()["ram_lendable"] == 21 * GIB and off.summary()["ram_lendable"] == 0
     row = render_nodes([lending.summary()])[1][0]
     assert "24.0/21.0 GB RAM" in row and "0.0/0.0 GB" not in row
+
+
+def test_a_gpu_helper_that_could_lend_ram_too_says_how():
+    from ollamapower.hub.suggest import _pool
+
+    gpu = [{"name": "RTX", "total": 12 * GIB}]
+    _, reasons = _pool([helper("desktop", gpus=gpu)])  # 32 GB, 8 used, 3 kept: 21 GB it could lend
+    assert reasons == ["desktop could also lend ~21.0 GB of RAM: `ollamapower agent rules --allow-cpu` on it"]
+    assert _pool([helper("desktop", gpus=gpu, allow_cpu=True)])[1] == []
