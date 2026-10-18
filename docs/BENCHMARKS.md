@@ -71,7 +71,7 @@ modes). Split mode is used only when it wins by `planner.min_gain`.
 ### First real two-PC run (2026-10-17)
 
 **Hub:** RTX 3060 12 GB, i7-11700F, 15.3 GB RAM, wired. **Helper:** a laptop
-with an i3-1115G4 (2 cores), 7.4 GB RAM, no GPU, on **Wi-Fi**, lending ~2 GB of
+with an Intel Core i3-1115G4 (2 cores, 4 threads), integrated Intel UHD graphics, 7.4 GB RAM, on **Wi-Fi**, lending ~2 GB of
 RAM. llama.cpp b11347 (Vulkan on the hub, CPU on the helper), secure tunnel.
 
 | Model | Engine | Load s | TTFT ms | Prompt tok/s | Gen tok/s |
@@ -109,8 +109,9 @@ Reading it:
 
 ### Roles swapped: a model too big for the hub (2026-10-17)
 
-**Hub:** the laptop above (7.4 GB RAM, no GPU, Wi-Fi). **Helper:** the desktop
-above (RTX 3060 12 GB + RAM), lending its GPU.
+**Hub:** the laptop above (Intel Core i3-1115G4, integrated Intel UHD graphics, 7.4 GB
+RAM, on Wi-Fi). **Helper:** the desktop above (Intel Core i7-11700F, RTX 3060 12 GB,
+15.3 GB RAM, wired), lending its GPU and RAM.
 
 | Model | Engine | Load s | TTFT ms | Prompt tok/s | Gen tok/s |
 |---|---|---|---|---|---|

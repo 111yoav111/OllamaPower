@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 250" width="760" height="250" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 350" width="760" height="350" role="img" aria-labelledby="t d">
   <title id="t">A model too big for a laptop, with and without OllamaPower</title>
-  <desc id="d">gpt-oss 20B (13.8 GB) on a laptop with 7.4 GB of RAM. The laptop alone: about 0.3 tokens per second (estimated; the model would be read from disk). The laptop plus a desktop's RTX 3060 through OllamaPower, over Wi-Fi: 5.7 tokens per second, measured, about 17 times faster.</desc>
+  <desc id="d">gpt-oss 20B (13.8 GB) on a laptop with 7.4 GB of RAM. The laptop alone: about 0.3 tokens per second (estimated; the model would be read from disk). The laptop plus a desktop's RTX 3060 through OllamaPower, over the laptop's Wi-Fi: 5.7 tokens per second, measured, about 17 times faster. Laptop (the hub): Intel Core i3-1115G4, Intel UHD Graphics (integrated), 7.4 GB RAM. Desktop (the helper): Intel Core i7-11700F, NVIDIA GeForce RTX 3060 12 GB, 15.3 GB RAM. Connection: laptop on Wi-Fi (about 90 Mbit/s), desktop wired.</desc>
   <style>
     .surface { fill: #fcfcfb; }
     .title { fill: #0b0b0b; font: 600 16px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
@@ -10,20 +10,22 @@
     .note { fill: #52514e; font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
     .tick { fill: #6b6a65; font: 11px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
     .grid { stroke: #e1e0d9; stroke-width: 1; }
+    .spec { fill: #0b0b0b; font: 600 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .specv { fill: #52514e; font: 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
     .base { stroke: #c3c2b7; stroke-width: 1; }
     .before { fill: #898781; }
     .after { fill: #2a78d6; }
     @media (prefers-color-scheme: dark) {
       .surface { fill: #1a1a19; }
-      .title, .label, .value { fill: #f0efec; }
-      .sub, .note { fill: #c3c2b7; }
+      .title, .label, .value, .spec { fill: #f0efec; }
+      .sub, .note, .specv { fill: #c3c2b7; }
       .tick { fill: #a3a29b; }
       .grid { stroke: #2c2c2a; }
       .base { stroke: #383835; }
       .after { fill: #3987e5; }
     }
   </style>
-  <rect class="surface" x="0" y="0" width="760" height="250" rx="12"/>
+  <rect class="surface" x="0" y="0" width="760" height="350" rx="12"/>
   <text class="title" x="24" y="36">gpt-oss 20B (13.8 GB) on a laptop with 7.4 GB of RAM</text>
   <text class="sub" x="24" y="58">Generation speed, tokens per second (higher is better)</text>
 
@@ -48,5 +50,13 @@
   <text class="value" x="659" y="161">5.7</text>
   <line class="base" x1="250" y1="80" x2="250" y2="190"/>
 
-  <text class="note" x="24" y="232">~17x faster. Measured on real PCs; the laptop alone can't hold the model, so Ollama would read it from disk.</text>
+  <line class="grid" x1="24" y1="224" x2="736" y2="224"/>
+  <text class="spec" x="24" y="250">Laptop (the hub)</text>
+  <text class="specv" x="196" y="250">Intel Core i3-1115G4 · Intel UHD Graphics (integrated) · 7.4 GB RAM</text>
+  <text class="spec" x="24" y="274">Desktop (the helper)</text>
+  <text class="specv" x="196" y="274">Intel Core i7-11700F · NVIDIA GeForce RTX 3060 (12 GB) · 15.3 GB RAM</text>
+  <text class="spec" x="24" y="298">Connection</text>
+  <text class="specv" x="196" y="298">the laptop on Wi-Fi (~90 Mbit/s), the desktop wired</text>
+
+  <text class="note" x="24" y="330">~17x faster. Measured on these PCs; the laptop alone can't hold the model, so Ollama would read it from disk.</text>
 </svg>

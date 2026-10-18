@@ -5,7 +5,7 @@ container: what was tried, what broke, what was fixed, and what is still open.
 The numbers are in [`BENCHMARKS.md`](BENCHMARKS.md).
 
 **Hub:** RTX 3060 12 GB (Vulkan), i7-11700F, 15.3 GB RAM, wired, Ollama 0.34.4.
-**Helper:** laptop, i3-1115G4 (2 cores), 7.4 GB RAM, no GPU, Wi-Fi (3.3 ms
+**Helper:** laptop, Intel Core i3-1115G4 (2 cores, 4 threads), integrated Intel UHD graphics, 7.4 GB RAM, Wi-Fi (3.3 ms
 RTT, ~94 Mbit/s), lending 2-2.8 GB of RAM. llama.cpp b11347, secure tunnel.
 **Models:** Qwen3-30B-A3B (MoE, Q4_K_M, 18.6 GB, an abliterated build) and
 qwen3:14b.
@@ -25,13 +25,14 @@ qwen3:14b.
 | Disk cache on the helper | First load over Wi-Fi 132-238 s, later loads 17-70 s. |
 
 Not testable on this hardware: direct tunnel mode (the helper's owner must
-allow it), auto-yield (the laptop has no GPU load to watch), schedules, the MTP
+allow it), auto-yield (the laptop's integrated GPU isn't lent, so there's no load to watch), schedules, the MTP
 and tensor-split variants (wrong model types).
 
 ## Roles swapped: the laptop as the hub, the desktop as a GPU helper
 
 The case OllamaPower is built for: a model too big for the hub. The laptop
-(7.4 GB RAM, no GPU) became the hub, the desktop (RTX 3060 + RAM) a helper,
+(Intel Core i3-1115G4, integrated graphics only, 7.4 GB RAM) became the hub, the desktop
+(Intel Core i7-11700F, RTX 3060 12 GB, 15.3 GB RAM) a helper,
 still over the laptop's Wi-Fi.
 
 | Model | Laptop alone (Ollama) | Laptop + desktop (split) |

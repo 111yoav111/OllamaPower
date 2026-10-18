@@ -13,11 +13,14 @@ them together: the model's layers are spread over the PCs on your network, and
 your apps keep talking to Ollama as if nothing changed.
 
 <p align="center">
-  <img src="docs/images/speed.svg" width="760" alt="gpt-oss 20B on a laptop with 7.4 GB of RAM: about 0.3 tokens per second alone (estimated), 5.7 measured with a desktop's RTX 3060 through OllamaPower, about 17 times faster">
+  <img src="docs/images/speed.svg" width="760" alt="gpt-oss 20B on a laptop (Intel Core i3-1115G4, integrated graphics, 7.4 GB RAM): about 0.3 tokens per second alone (estimated), 5.7 measured with a desktop's RTX 3060 (Intel Core i7-11700F, 15.3 GB RAM) through OllamaPower over the laptop's Wi-Fi, about 17 times faster">
 </p>
 
-The 5.7 tok/s is measured on real PCs; the "alone" figure is the hub's own
-estimate, because the laptop can't hold the model (trying it crashed Ollama).
+The test PCs: a **laptop** as the hub (Intel Core i3-1115G4, integrated Intel
+UHD graphics, 7.4 GB RAM) on **Wi-Fi**, and a **desktop** as the helper (Intel
+Core i7-11700F, NVIDIA GeForce RTX 3060 12 GB, 15.3 GB RAM), wired. The 5.7 tok/s
+is measured on them; the "alone" figure is the hub's own estimate, because the
+laptop can't hold the model (trying it crashed Ollama).
 The speed-up needs a helper with a GPU: a CPU-only helper on Wi-Fi was slower
 than a strong hub on its own (the hub noticed and kept Ollama). Details:
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), [`docs/FIELD_TEST.md`](docs/FIELD_TEST.md).
