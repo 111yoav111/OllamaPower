@@ -256,3 +256,34 @@ def test_sudo_timing_out_is_a_clean_error(monkeypatch):
     monkeypatch.setattr(subprocess, "run", slow)
     with pytest.raises(s.SetupError, match="didn't finish"):
         s.sudo_runner(s.Step("x", ("systemctl", "daemon-reload")))
+
+
+def test_lan_addresses_are_what_helpers_type():
+    assert s.lan_addresses(
+        {
+            "wlan0": [addr("192.168.1.32", "255.255.255.0")],
+            "enp3s0": [addr("192.168.1.156", "255.255.255.0")],
+            "docker0": [addr("172.17.0.1", "255.255.0.0")],
+            "lo": [addr("127.0.0.1", "255.0.0.0")],
+        }
+    ) == ["192.168.1.32", "192.168.1.156"]
+
+
+@pytest.mark.parametrize(
+    "pasted",
+    ["abc123", '  OLLAMAPOWER_TOKEN="abc123"  ', "export OLLAMAPOWER_TOKEN='abc123'", "OLLAMAPOWER_TOKEN=abc123"],
+)
+def test_a_pasted_token_line_or_bare_token_both_work(pasted):
+    from ollamapower.agent.cli import parse_token
+
+    assert parse_token(pasted) == "abc123"
+
+
+def test_op_alone_says_what_to_do_next(tmp_path, monkeypatch):
+    from ollamapower.__main__ import next_steps
+
+    monkeypatch.setenv("OLLAMAPOWER_CONFIG_DIR", str(tmp_path))
+    text = "\n".join(next_steps())
+    assert "Not set up yet" in text and "op init" in text and "op agent --hub" in text
+    (tmp_path / "agent.toml").write_text("")
+    assert "This PC is a helper" in "\n".join(next_steps())

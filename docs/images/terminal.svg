@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" width="760" height="300" role="img" aria-labelledby="t d">
+  <title id="t">OllamaPower in a terminal</title>
+  <desc id="d">The command `op models suggest` on a laptop hub with a desktop helper: gpt-oss abliterated 20B, 12.8 GB, mixture of experts, about 0.3 tokens per second alone and 5.7 pooled. Then `op status` shows one helper lending its RTX 3060 and RAM.</desc>
+  <style>
+    .win { fill: #1e1e1c; }
+    .bar { fill: #2b2b29; }
+    .dot1 { fill: #e34948; } .dot2 { fill: #eda100; } .dot3 { fill: #1baf7a; }
+    .t { fill: #e8e7e3; font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; white-space: pre; }
+    .dim { fill: #a3a29b; }
+    .cmd { fill: #7fb6f2; }
+    .ok { fill: #4cc38a; }
+    .head { fill: #c3c2b7; font-weight: 600; }
+  </style>
+  <rect class="win" x="0" y="0" width="760" height="300" rx="12"/>
+  <path class="bar" d="M12,0 h736 a12,12 0 0 1 12,12 v20 h-760 v-20 a12,12 0 0 1 12,-12 z"/>
+  <circle class="dot1" cx="22" cy="16" r="5"/><circle class="dot2" cx="40" cy="16" r="5"/><circle class="dot3" cx="58" cy="16" r="5"/>
+  <text class="t dim" x="380" y="21" text-anchor="middle">laptop: the hub</text>
+
+  <text class="t" x="20" y="62"><tspan class="dim">$ </tspan><tspan class="cmd">op models suggest</tspan></text>
+  <text class="t head" x="20" y="86">MODEL                       SIZE    TYPE  ALONE  POOLED  VERDICT</text>
+  <text class="t" x="20" y="106">gpt-oss-abliterated:20b   12.8 GB   MoE    ~0.3     5.7  <tspan class="ok">pooled: 5.7 tok/s (vs ~0.3 alone)</tspan></text>
+  <text class="t dim" x="20" y="126">Pool now: desktop RTX 3060 11.0 GB, desktop CPU 8.0 GB · hub RAM 4.4 GB</text>
+
+  <text class="t" x="20" y="166"><tspan class="dim">$ </tspan><tspan class="cmd">op status</tspan></text>
+  <text class="t" x="20" y="190">Front door:  http://127.0.0.1:11434</text>
+  <text class="t" x="20" y="210">Ollama:      0.40.5 at http://127.0.0.1:11435</text>
+  <text class="t" x="20" y="230">Helpers:     <tspan class="ok">1 lending</tspan>, 1 known, 11.0 GB VRAM + 8.0 GB RAM lendable</text>
+  <text class="t" x="20" y="262"><tspan class="dim">$ </tspan><tspan class="cmd">ollama run huihui_ai/gpt-oss-abliterated:20b</tspan></text>
+  <text class="t dim" x="20" y="282">&gt;&gt;&gt; Send a message (/? for help)</text>
+</svg>

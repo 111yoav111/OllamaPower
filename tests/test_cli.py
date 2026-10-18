@@ -36,17 +36,20 @@ def test_version():
     assert result.exit_code == 0 and __version__ in result.output
 
 
-def test_no_args_shows_help():
-    assert "Usage" in run().output
+def test_no_args_shows_the_next_step_and_everyday_commands():
+    result = run()
+    assert result.exit_code == 0
+    assert "Next step:" in result.output and "op --help" in result.output
 
 
 def test_agent_example_config_prints_the_packaged_example():
     from pathlib import Path
 
+    from ollamapower import config as c
+
     result = run("agent", "example-config")
-    root = Path(__file__).resolve().parent.parent
     assert result.exit_code == 0
-    assert result.output == (root / "agent.example.toml").read_text(encoding="utf-8")
+    assert result.output == (Path(c.__file__).parent / "agent.example.toml").read_text(encoding="utf-8")
 
 
 def test_init_creates_everything_once(cfg_env):
@@ -301,3 +304,24 @@ def test_cli_output_survives_a_narrow_encoding(tmp_path):
     )
     assert result.returncode == 0, result.stderr.decode("cp1252", "replace")
     assert "msg=loading… hub ? helper ?" in result.stdout.decode("cp1252")
+
+
+def test_op_alone_warns_when_op_is_another_program(monkeypatch):
+    import shutil
+
+    from ollamapower.__main__ import op_clash
+
+    paths = {"op": "/usr/bin/op", "ollamapower": "/home/u/.local/bin/ollamapower"}
+    monkeypatch.setattr(shutil, "which", lambda name: paths.get(name))
+    assert "1Password" in op_clash()
+    paths["op"] = "/home/u/.local/bin/op"  # ours, next to ollamapower
+    assert op_clash() == ""
+
+
+def test_op_alone_shows_a_broken_config_instead_of_not_set_up(tmp_path, monkeypatch):
+    from ollamapower.__main__ import next_steps
+
+    monkeypatch.setenv("OLLAMAPOWER_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "config.toml").write_text("[hub]\nport = 'not a number'\n")
+    text = "\n".join(next_steps())
+    assert "has a problem" in text and "Not set up yet" not in text

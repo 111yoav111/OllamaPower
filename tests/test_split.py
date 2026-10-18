@@ -2,8 +2,7 @@
 
 The real control plane, relay, planner, Ollama handoff and API translation
 run; only ``llama-server``/``ggml-rpc-server`` are small fakes (see
-``fake_llamacpp.py``) and Ollama is the usual fake. ``test_split_real.py``
-repeats the core of this with the real llama.cpp build.
+``fake_llamacpp.py``) and Ollama is the usual fake.
 """
 
 from __future__ import annotations

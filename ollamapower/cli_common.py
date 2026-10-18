@@ -196,7 +196,8 @@ def show(fetch: Callable[[], Any], render: Callable[[Any], Lines], as_json: bool
 def control_text(c: dict[str, Any]) -> str:
     """The control plane's state, and why it is off: turned off on purpose, or on but without a usable token."""
     if c["enabled"]:
-        return f"port {c['port']}"
+        join = c.get("join") or []
+        return f"port {c['port']}" + (f" · helpers join with: op agent --hub {join[0]}" if join else "")
     if not c.get("configured", True):
         return "off (control.enabled = false in config.toml; helpers can't join)"
     return "not running: no usable cluster token, see the warnings (helpers can't join)"

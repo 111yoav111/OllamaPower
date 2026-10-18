@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from collections import deque
 from pathlib import Path
@@ -66,6 +67,31 @@ def _load_agent(config_dir: Path) -> Any:
     except ConfigError as exc:
         typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(2) from None
+
+
+def parse_token(text: str) -> str:
+    """The token from what the user pasted: the bare token, or the whole `OLLAMAPOWER_TOKEN="..."` line."""
+    text = text.strip().removeprefix("export ").strip()
+    name, sep, value = text.partition("=")
+    if sep and name.strip() == "OLLAMAPOWER_TOKEN":
+        text = value.strip()
+    return text.strip().strip("'\"").strip()
+
+
+def ask_for_token(env_path: Path, problem: str | None) -> tuple[str | None, str | None]:
+    """Ask for the cluster token (hidden), save it owner-only in .env: no file to create by hand."""
+    from ..core.auth import token_weakness
+    from ..files import token_problem, write_token
+
+    typer.echo(f"{problem}.\nOn the hub, run `op token show` and paste what it prints here (it won't be shown).")
+    pasted = typer.prompt("Cluster token", hide_input=True, default="", show_default=False)
+    token = parse_token(pasted)
+    weakness = token_weakness(token) if token else "is empty"
+    if weakness:
+        return None, f"That token {weakness}"
+    write_token(env_path, token)
+    typer.secho(f"Saved in {env_path} (only you can read it).", fg=typer.colors.GREEN)
+    return token_problem(env_path)
 
 
 def parse_hub_address(value: str, default_port: int) -> tuple[str, int]:
@@ -128,9 +154,11 @@ def agent(
     if name:
         cfg.agent.name = name
     token, problem = token_problem(cfg.env_path)
+    if (problem or token is None) and sys.stdin.isatty() and not os.environ.get("OLLAMAPOWER_TOKEN"):
+        token, problem = ask_for_token(cfg.env_path, problem)
     if problem or token is None:
         typer.secho(
-            f"{problem}. On the hub run `ollamapower token show` and put that line in {cfg.env_path} "
+            f"{problem}. On the hub run `op token show` and put that line in {cfg.env_path} "
             "(or set OLLAMAPOWER_TOKEN to it).",
             fg=typer.colors.RED,
             err=True,

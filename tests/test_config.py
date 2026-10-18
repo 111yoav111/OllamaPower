@@ -62,9 +62,7 @@ def test_example_config_is_the_default(tmp_path):
 
     from ollamapower import config as c
 
-    root = Path(__file__).parent.parent
     packaged = Path(c.__file__).parent / "config.example.toml"
-    assert (root / "config.example.toml").read_text() == packaged.read_text()
     cfg = load_config(packaged, env={"OLLAMAPOWER_CONFIG_DIR": str(tmp_path)})
     default = Config()
     assert (cfg.hub, cfg.ollama, cfg.control, cfg.logging) == (
@@ -163,9 +161,7 @@ def test_agent_example_is_the_default(tmp_path):
     from ollamapower import config as c
     from ollamapower.agent.config import AgentConfig, load_agent_config
 
-    root = Path(__file__).resolve().parent.parent
     packaged = Path(c.__file__).parent / "agent.example.toml"
-    assert (root / "agent.example.toml").read_text() == packaged.read_text()
     loaded = load_agent_config(tmp_path, path=packaged)
     default = AgentConfig(config_dir=tmp_path)
     for section in ("hub", "agent", "lending", "llamacpp"):

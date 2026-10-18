@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 250" width="760" height="250" role="img" aria-labelledby="t d">
+  <title id="t">A model too big for a laptop, with and without OllamaPower</title>
+  <desc id="d">gpt-oss 20B (13.8 GB) on a laptop with 7.4 GB of RAM. The laptop alone: about 0.3 tokens per second (estimated; the model would be read from disk). The laptop plus a desktop's RTX 3060 through OllamaPower, over Wi-Fi: 5.7 tokens per second, measured, about 17 times faster.</desc>
+  <style>
+    .surface { fill: #fcfcfb; }
+    .title { fill: #0b0b0b; font: 600 16px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .sub { fill: #52514e; font: 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .label { fill: #0b0b0b; font: 14px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .value { fill: #0b0b0b; font: 600 14px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .note { fill: #52514e; font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .tick { fill: #6b6a65; font: 11px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .grid { stroke: #e1e0d9; stroke-width: 1; }
+    .base { stroke: #c3c2b7; stroke-width: 1; }
+    .before { fill: #898781; }
+    .after { fill: #2a78d6; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #1a1a19; }
+      .title, .label, .value { fill: #f0efec; }
+      .sub, .note { fill: #c3c2b7; }
+      .tick { fill: #a3a29b; }
+      .grid { stroke: #2c2c2a; }
+      .base { stroke: #383835; }
+      .after { fill: #3987e5; }
+    }
+  </style>
+  <rect class="surface" x="0" y="0" width="760" height="250" rx="12"/>
+  <text class="title" x="24" y="36">gpt-oss 20B (13.8 GB) on a laptop with 7.4 GB of RAM</text>
+  <text class="sub" x="24" y="58">Generation speed, tokens per second (higher is better)</text>
+
+  <!-- x scale: 0..6 tok/s over x=250..670 (70 px per tok/s) -->
+  <line class="grid" x1="390" y1="78" x2="390" y2="190"/>
+  <line class="grid" x1="530" y1="78" x2="530" y2="190"/>
+  <line class="grid" x1="670" y1="78" x2="670" y2="190"/>
+  <text class="tick" x="250" y="206" text-anchor="middle">0</text>
+  <text class="tick" x="390" y="206" text-anchor="middle">2</text>
+  <text class="tick" x="530" y="206" text-anchor="middle">4</text>
+  <text class="tick" x="670" y="206" text-anchor="middle">6</text>
+
+  <!-- laptop alone: 0.33 -> 23 px -->
+  <text class="label" x="24" y="111">Laptop alone (Ollama)</text>
+  <path class="before" d="M250,92 h19 a4,4 0 0 1 4,4 v20 a4,4 0 0 1 -4,4 h-19 z"/>
+  <text class="value" x="283" y="111">~0.3 (estimated)</text>
+
+  <!-- laptop + desktop: 5.7 -> 399 px -->
+  <text class="label" x="24" y="161">Laptop + desktop GPU</text>
+  <text class="note" x="24" y="179">with OllamaPower, over Wi-Fi</text>
+  <path class="after" d="M250,142 h395 a4,4 0 0 1 4,4 v20 a4,4 0 0 1 -4,4 h-395 z"/>
+  <text class="value" x="659" y="161">5.7</text>
+  <line class="base" x1="250" y1="80" x2="250" y2="190"/>
+
+  <text class="note" x="24" y="232">~17x faster. Measured on real PCs; the laptop alone can't hold the model, so Ollama would read it from disk.</text>
+</svg>

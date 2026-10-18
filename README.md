@@ -5,30 +5,65 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
 ![Ollama compatible](https://img.shields.io/badge/Ollama-drop--in-black.svg)
-![Linux · macOS · Windows](https://img.shields.io/badge/os-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-lightgrey.svg)
+![Tested on Linux](https://img.shields.io/badge/tested%20on-Linux-success.svg)
+![macOS · Windows: manual setup](https://img.shields.io/badge/macOS%20%C2%B7%20Windows-manual%20setup-lightgrey.svg)
 
 Your laptop can't hold a 14 GB model. Your desktop's GPU can. OllamaPower puts
 them together: the model's layers are spread over the PCs on your network, and
 your apps keep talking to Ollama as if nothing changed.
 
-| Real run: gpt-oss 20B (a 13.8 GB build) on a laptop with 7.4 GB of RAM | Speed |
-|---|---|
-| The laptop alone (Ollama would read the model from disk) | ~0.3 tok/s (estimated) |
-| **The laptop + a desktop's RTX 3060, over Wi-Fi** | **5.7 tok/s: ~17x faster** |
+<p align="center">
+  <img src="docs/images/speed.svg" width="760" alt="gpt-oss 20B on a laptop with 7.4 GB of RAM: about 0.3 tokens per second alone (estimated), 5.7 measured with a desktop's RTX 3060 through OllamaPower, about 17 times faster">
+</p>
 
-Measured on real hardware; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) and
-[`docs/FIELD_TEST.md`](docs/FIELD_TEST.md).
+The 5.7 tok/s is measured on real PCs; the "alone" figure is the hub's own
+estimate, because the laptop can't hold the model (trying it crashed Ollama).
+The speed-up needs a helper with a GPU: a CPU-only helper on Wi-Fi was slower
+than a strong hub on its own (the hub noticed and kept Ollama). Details:
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), [`docs/FIELD_TEST.md`](docs/FIELD_TEST.md).
 
-```text
-Open WebUI, scripts, the ollama CLI
-        │
-        ▼
-Hub (127.0.0.1:11434, looks exactly like Ollama)
-  ├─ the model fits this PC?  ──► Ollama, as before
-  └─ too big?                 ──► split mode: llama-server on the hub
-                                    ├══ TLS 1.3 ══► Helper 1: GPU and/or RAM, some layers
-                                    └══ TLS 1.3 ══► Helper 2: GPU and/or RAM, more layers
+## Quick start
+
+```bash
+# 0. On every PC: install it (needs Python 3.11+ and pipx; per OS below)
+pipx install git+https://github.com/111yoav111/OllamaPower
+
+# 1. On the PC where you use Ollama (the hub):
+op init                     # creates its settings and a cluster token
+op setup                    # Linux: moves Ollama aside, opens the firewall (asks first)
+op token show               # the token your helpers will ask for
+op hub                      # runs until you stop it: keep this terminal open
+
+# 2. On every PC that should help (a helper):
+op agent --hub 192.168.1.10 # the address `op hub` printed; paste the token when asked
 ```
+
+Your apps keep using Ollama exactly as before, and models too big for the hub
+now run across your PCs. Lost? Run `op` on its own: it tells you the next step.
+On macOS and Windows, move Ollama by hand instead of `op setup` ([step 2](#2-the-hub-the-pc-with-ollama)).
+`op` is also the 1Password CLI's name: if you use that, type `ollamapower`
+instead (the same commands).
+
+> **What this changes on your PC:** Ollama moves from port 11434 to 11435 (one
+> settings file of OllamaPower's own), and the firewall lets your local network
+> reach port 9000 on the hub and 9001 on helpers. `op uninstall` (and
+> `op agent uninstall` on helpers) puts it all back. Nothing starts at boot, and
+> OllamaPower never runs as root.
+
+<p align="center">
+  <img src="docs/images/terminal.svg" width="760" alt="A terminal: op models suggest shows gpt-oss 20B running pooled at 5.7 tokens per second against 0.3 alone, and op status shows one helper lending its GPU and RAM">
+</p>
+
+## How it works
+
+<p align="center">
+  <img src="docs/images/how-it-works.svg" width="760" alt="Your apps talk to the OllamaPower hub on port 11434. A model that fits goes to Ollama on 11435; a model too big is split across helper PCs over encrypted TLS 1.3 tunnels.">
+</p>
+
+The hub takes Ollama's usual address, so nothing else changes. A model that
+fits your PC goes straight to Ollama. A model that doesn't is split: its layers
+are spread over the hub and your helpers, which lend their GPU and RAM, and the
+hub stitches the answer back together, streaming like Ollama does.
 
 ## Why it's nice
 
@@ -39,7 +74,7 @@ Hub (127.0.0.1:11434, looks exactly like Ollama)
 - **Never slower.** The hub benchmarks Ollama against split mode and uses split
   only when it measured at least 10 % faster, or when Ollama can't run the model
   at all. If split mode fails before an answer starts, Ollama answers instead.
-- **Tells you what you can run.** `ollamapower models suggest` lists the models
+- **Tells you what you can run.** `op models suggest` lists the models
   your PCs can run together and how fast, before you download anything.
 - **Any PC counts.** GPUs, RAM, old desktops, laptops without a GPU, Wi-Fi.
   Mixture-of-experts models keep their experts in RAM and their hot parts on the
@@ -51,35 +86,21 @@ Hub (127.0.0.1:11434, looks exactly like Ollama)
 - **A terminal UI** for the hub and for every helper, a priority queue, and a
   full CLI.
 
-## What it can and can't do
+## When does it help?
 
-LLM generation is limited by **memory**: every token reads the weights it
-uses, so a model must fit somewhere, and its speed is roughly the bytes read
-per token divided by the memory bandwidth. VRAM moves hundreds of GB/s, RAM
-tens of GB/s, a gigabit LAN about 0.12 GB/s. Splitting a model between
-machines at layer boundaries costs only a few network round trips per token,
-so the network matters for loading the model, much less for running it.
-No machine has to be strong: a hub without a GPU and helpers without GPUs
-all count.
-
-| Situation | Does pooling help? |
+| Your situation | Does OllamaPower help? |
 |---|---|
-| The model fits in the Hub's own memory, at full speed | **No.** OllamaPower leaves it on plain Ollama. |
-| The model doesn't fit in the Hub's RAM/VRAM (Ollama pages it from disk, or refuses) | **Yes, the main case** (measured: ~17x faster for a 13.8 GB model on a 7.4 GB laptop with a GPU helper). Spread over the Hub's and helpers' RAM (and any GPUs), it runs instead of crawling; the hub sends it to split mode on the first request. Helpers without a GPU lend RAM once their owner allows it (`ollamapower agent rules --allow-cpu`). |
-| Mixture-of-experts models (gpt-oss-120b, Qwen3-235B-A22B, ...) too big for the Hub | **Yes, the best case** (estimated). Each token reads only a few experts, so the pooled RAM of ordinary PCs runs them at usable speed (estimates in [`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)). *(v2)* |
-| The model fits in the Hub's GPU **plus** its RAM, and the only helper is a CPU on Wi-Fi | **No** (measured): a 30B MoE ran at 21-26 tok/s on Ollama alone and 8-10 tok/s split with a 2-core laptop helper. The hub measured this and kept Ollama ([`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)). |
-| Dense 70B on ordinary PCs | **It runs** (~1-2 tok/s estimated) where a single PC pages from disk. *(v2)* |
-| Ollama spills part of a model to the Hub's CPU and a helper has a GPU | **Often faster**: those layers run on the helper's GPU. *(v1, works now)* |
-| Helper on Wi-Fi | **Allowed.** A few round trips per token, and the first load of a big model is slow (16 min for 13 GB over ~90 Mbit/s Wi-Fi; later loads come from the helper's disk cache). A cable is much faster. |
-| Phones, tablets | Clients only, not helpers. |
+| The model already runs well on your PC | **No:** it stays on plain Ollama, untouched. |
+| The model is too big for your PC, and another PC has a GPU | **Yes, the main case:** measured ~17x faster above. |
+| The only helper is a weak PC without a GPU, on Wi-Fi | **Usually not:** the hub measures it and keeps Ollama when split is slower. |
+| Huge models (Qwen3-235B, gpt-oss-120b) on several ordinary PCs | **What it's designed for**, but estimated only: not measured yet. |
 
-**Golden rule: OllamaPower must never make things slower.** A model that fits
-on the hub's GPU is never split. Any other model runs split only after a
-benchmark showed split generating at least 10 % (`planner.min_gain`) faster
-than plain Ollama, and only while nothing that benchmark depended on has
-changed. If split mode fails, Ollama serves the request.
+**It never makes things slower:** a model that fits your GPU is never split, and
+any other model is split only after the hub measured split mode at least 10 %
+faster than Ollama (or Ollama can't run it at all). More cases and the reasons:
+[`docs/REFERENCE.md`](docs/REFERENCE.md#when-pooling-helps).
 
-## Quick start
+## Setup, step by step
 
 Two roles, one program:
 
@@ -94,7 +115,8 @@ TCP **9000**, and the hub reaches each helper on TCP **9001** for split mode.
 ### 1. Install (on every PC)
 
 OllamaPower is installed with [pipx](https://pipx.pypa.io), which keeps it in
-its own environment and puts `ollamapower` on your PATH.
+its own environment and puts two commands on your PATH: `op`, and its long name
+`ollamapower` (use that one if `op` is taken, e.g. by the 1Password CLI).
 
 **Linux**
 
@@ -121,33 +143,27 @@ py -m pipx ensurepath          # then open a new terminal
 pipx install git+https://github.com/111yoav111/OllamaPower
 ```
 
-Check it worked with `ollamapower version`. To update later:
-`pipx upgrade ollamapower`.
+Check it worked with `op version`. To update later:
+`pipx install --force git+https://github.com/111yoav111/OllamaPower`.
 
 ### 2. The Hub (the PC with Ollama)
 
 ```bash
-ollamapower init       # creates the config dir, a cluster token, config.toml
-ollamapower setup      # moves Ollama to port 11435 and opens port 9000 to your LAN
-ollamapower doctor     # checks everything
-ollamapower hub        # start it (terminal UI; --no-tui for plain logs)
+op init       # creates the config dir, a cluster token, config.toml
+op setup      # moves Ollama to port 11435 and opens port 9000 to your LAN
+op doctor     # checks everything
+op hub        # start it (terminal UI; --no-tui for plain logs)
 ```
 
 OllamaPower takes Ollama's usual port (11434), so your apps keep working
 unchanged, and Ollama moves next door to 11435. `setup` explains what it will
 do, shows each command and asks first; `--print` only shows them.
 
-**Is `sudo` safe here?** OllamaPower itself never runs as root (it refuses to).
-`setup` and `uninstall` call `sudo` only for a few fixed commands, never through a
-shell, and the only values in them are checked port numbers, `127.0.0.1` and your
-local network's address. It writes one file of its own
-(`/etc/systemd/system/ollama.service.d/ollamapower.conf`) and never edits yours.
-The firewall opens port 9000 only to your local network (never wider than a /16,
-never Docker or VM bridges), and that port only lets in helpers that hold your
-cluster token; Ollama's own API stays private to this PC. Setup restarts Ollama
-once, which stops anything it is generating at that moment.
+**Is `sudo` safe here?** Only `setup` and `uninstall` use it, for a few fixed
+commands they show you first; OllamaPower itself never runs as root, and Ollama's
+own API stays private to this PC. The details: [`SECURITY.md`](SECURITY.md).
 
-**Changed your mind?** `ollamapower uninstall` puts back exactly what `setup`
+**Changed your mind?** `op uninstall` puts back exactly what `setup`
 changed: Ollama on 11434, and only the firewall rules setup added (a rule you had
 before stays). Remember that while the
 hub isn't running, apps using port 11434 find no Ollama there.
@@ -161,58 +177,47 @@ On macOS and Windows, move Ollama by hand:
 | Windows | `setx OLLAMA_HOST 127.0.0.1:11435`, then quit Ollama from the tray icon and start it again |
 
 and allow incoming TCP port **9000** when the firewall asks on the first run
-(for **private** networks only). Find the hub's LAN address with `ip -4 addr`
-(Linux), `ipconfig getifaddr en0` (macOS) or `ipconfig` (Windows), e.g.
-`192.168.1.10`.
+(for **private** networks only).
+
+When the hub starts, it prints the exact command for your helpers, with this
+PC's address (`op agent --hub 192.168.1.10`); `op status` shows it too.
 
 Finally, print the cluster token for the helpers:
 
 ```bash
-ollamapower token show     # prints OLLAMAPOWER_TOKEN="..." - treat it like a password
+op token show     # prints OLLAMAPOWER_TOKEN="..." - treat it like a password
 ```
 
 ### 3. Each Helper
 
-Give the helper the token, either in a `.env` file in its config dir (create
-the folder if needed and paste the whole line `token show` printed):
-
-| OS | Token file |
-|---|---|
-| Linux | `~/.config/ollamapower/.env` |
-| macOS | `~/Library/Application Support/ollamapower/.env` |
-| Windows | `%APPDATA%\ollamapower\.env` |
-
-or as an environment variable for the current terminal:
+Start it with the hub's LAN address, the one `op hub` printed:
 
 ```bash
-export OLLAMAPOWER_TOKEN="..."             # Linux / macOS
+op agent --hub 192.168.1.10
 ```
 
-```powershell
-$env:OLLAMAPOWER_TOKEN = "..."             # Windows PowerShell
-```
-
-Then start it, with the hub's LAN address:
-
-```bash
-ollamapower agent --hub 192.168.1.10
-```
+The first time, it asks for the **cluster token**: run `op token show` on the
+hub and paste what it prints (it isn't shown while you paste, and it's saved
+for next time, readable only by you). On a headless helper, put that line in
+its `.env` instead (`~/.config/ollamapower/.env` on Linux,
+`~/Library/Application Support/ollamapower/.env` on macOS,
+`%APPDATA%\ollamapower\.env` on Windows) or set `OLLAMAPOWER_TOKEN`.
 
 On first connect it shows the hub's **key fingerprint**: check it matches the
-one in the hub's Overview tab (or `ollamapower status` on the hub) and
+one in the hub's Overview tab (or `op status` on the hub) and
 confirm. The helper appears on the hub's Nodes tab. It downloads its
 llama.cpp build once (about 30 MB) and then waits to be used.
 
 The hub connects to the helper on TCP port **9001** to run a model split across
-the PCs. On Linux, `ollamapower agent setup` opens it to your local network
-(asking first; `ollamapower agent uninstall` closes it again). Windows and macOS
+the PCs. On Linux, `op agent setup` opens it to your local network
+(asking first; `op agent uninstall` closes it again). Windows and macOS
 ask on the first split run: allow it for **private** networks. Another port:
 `relay_port` in `agent.toml`.
 
 A helper with **no GPU** lends only after its owner allows it:
 
 ```bash
-ollamapower agent rules --allow-cpu
+op agent rules --allow-cpu
 ```
 
 ### 4. Use it
@@ -221,479 +226,39 @@ Nothing changes for your apps: Open WebUI, scripts and the `ollama` CLI keep
 using `http://127.0.0.1:11434`. To see what your PCs can now run together:
 
 ```bash
-ollamapower models suggest
+op models suggest
 ```
 
 A model too big for the hub alone is split across the PCs on its first
-request. `ollamapower status` on the hub shows what is happening.
-
-### Starting it from a source checkout
-
-Instead of pipx you can clone the repository and use the start scripts,
-which use the checkout's `.venv` if there is one (see
-[Development](#development)), else the installed `ollamapower`. Extra
-arguments are passed on:
-
-| | Linux / macOS | Windows |
-|---|---|---|
-| Hub | `scripts/start_hub.sh` | `scripts\start_hub.bat` |
-| Helper | `scripts/start_agent.sh --hub 192.168.1.10` | `scripts\start_agent.bat --hub 192.168.1.10` |
+request. `op status` on the hub shows what is happening.
 
 ### Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `ollamapower: command not found` | Open a new terminal after `pipx ensurepath`. |
-| Helper says the token is missing or wrong | Run `ollamapower token show` on the hub again and copy the whole line into the helper's `.env`. |
-| Helper can't reach the hub | Is `ollamapower hub` running? Is port 9000 open in the hub's firewall (`ollamapower setup`)? Are both PCs on the same network? Try `ping <hub address>` from the helper. |
-| Helper refuses: the hub's key changed | Only if you re-created the hub's key yourself: `ollamapower agent forget-hub` on the helper, then connect again. |
+| `op: command not found` | Open a new terminal after `pipx ensurepath`. |
+| Helper says the token is missing or wrong | Run `op agent` in a terminal: it asks for the token (paste what `op token show` prints on the hub). Headless: put that line in the helper's `.env`. |
+| Helper can't reach the hub | Is `op hub` running? Is port 9000 open in the hub's firewall (`op setup`)? Are both PCs on the same network? Try `ping <hub address>` from the helper. |
+| Helper refuses: the hub's key changed | Only if you re-created the hub's key yourself: `op agent forget-hub` on the helper, then connect again. |
 | A model you pulled doesn't show up | It went to another Ollama: don't run `ollama serve` yourself (it ignores the service's settings, e.g. `OLLAMA_MODELS`). With the hub running, a plain `ollama pull <model>` reaches the right Ollama. |
 | Split mode fails with "couldn't reach <helper> ... is its firewall blocking it?" | Allow incoming TCP 9001 (`relay_port`) in that helper's firewall. |
-| Hub says port 11434 is in use | Ollama still listens there: run `ollamapower setup` (or move it by hand, step 2). |
-| Apps find no Ollama / no models | The hub isn't running (Ollama is on 11435): start `ollamapower hub`, or `ollamapower uninstall` to put Ollama back on 11434. Don't start `ollama serve` yourself: it's a second, empty Ollama. |
-| Anything else | `ollamapower doctor` on the hub, `ollamapower logs` for the event log. |
-
-## Set up the Hub (details)
-
-```bash
-ollamapower init      # config dir, a cluster token in .env, config.toml, state.json
-ollamapower setup     # Linux: moves Ollama to port 11435, opens 9000 to your LAN (asks for sudo)
-ollamapower doctor    # checks everything (and shows the manual steps elsewhere)
-ollamapower hub       # run it with the terminal UI (--no-tui: headless, plain logs)
-```
-
-OllamaPower takes Ollama's usual address, `127.0.0.1:11434`, so your clients
-(Open WebUI, scripts, the `ollama` CLI) keep working without any change. The
-real Ollama moves to `127.0.0.1:11435`: `ollamapower setup` does it on Linux
-(a drop-in file of its own, `/etc/systemd/system/ollama.service.d/ollamapower.conf`,
-which `ollamapower uninstall` deletes again), and `ollamapower doctor` prints the
-steps for other systems.
-
-`doctor` also checks that neither Ollama's port nor the front door's (11434)
-answers on a network address, that `OLLAMA_HOST` is a valid loopback address,
-the cluster token, the hub key, the permissions of the config directory and
-its secrets, and the pinned llama.cpp build (installed, verified, runs). It
-exits 1 if anything is an `[ERROR]`.
-
-`hub` refuses to run as root/Administrator (`--allow-root` overrides) and to
-listen on anything but loopback (remote access is OllamaGate's job).
-
-### The hub TUI
-
-| Tab | Shows |
-|---|---|
-| **1 Overview** | front door, Ollama, queue, the running split session (layers per device), requests, helpers and lendable VRAM, control-plane port and key fingerprint, the hub's GPU/VRAM bars, loaded models (VRAM %, last tok/s, spill warning), active requests, recent events, warnings |
-| **2 Nodes** | every helper: status (🟢 lending · 🟡 paused or stepping back · 🔴 offline · ⚠ incompatible), name, IP, GPU, VRAM total/free/lendable, GPU %, CPU/RAM, link (RTT, Mbps, wired/Wi-Fi), role, tunnel mode |
-| **3 Node detail** | full capabilities, GPU/VRAM/CPU sparklines, network-test history, last tunnel test (secure vs direct) |
-| **4 Models** | installed models: size, loaded VRAM %, whether they fit the hub's VRAM, engine and mode (auto/pinned), Ollama vs split tok/s from the last benchmark, why; benchmark and first-load progress |
-| **5 Log** | filterable event feed: joins, leaves, pauses, bans, failed logins, net tests |
-
-Keys: `1`–`5` tabs · `Enter` helper details · `P` pause/resume a helper (the
-hub stops using it) · `K` kick · `N` network test · `T` tunnel mode · `M` tunnel test · `X`
-forget an offline helper · `/` filter · `Q` quit. Destructive actions ask
-first. Models tab: `B` benchmark · `L` pin split · `F` force local · `U` automatic.
-
-### The front door
-
-| Route | What happens |
-|---|---|
-| `POST /api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | queued by priority, then streamed through (NDJSON / SSE, never buffered) |
-| `GET /api/ps` | Ollama's answer plus an `ollamapower` field per model (`engine`, `nodes`) that normal clients ignore |
-| everything else under `/`, `/api/*`, `/v1/*` (tags, show, pull, create, copy, delete, push, blobs, ...) | passed straight through, not queued |
-| `GET /ollamapower/status` | the hub's status as JSON |
-
-At most `hub.max_concurrency` inference requests (default 4) go to Ollama at
-once; the rest wait, highest priority first. Set the priority per request with
-a header:
-
-```
-X-OllamaPower-Priority: critical | high | normal | low      (default: normal)
-```
-
-A waiting request that keeps being overtaken goes next after 10 overtakes, so
-low priority work is delayed, never starved. A full queue (`hub.max_queue`) or
-a wait longer than `hub.queue_timeout` gets `503` with `Retry-After`. If a
-client disconnects, its generation is stopped in Ollama right away.
-
-> Set `hub.max_concurrency` to your `OLLAMA_NUM_PARALLEL`. Higher, and Ollama
-> queues the extra requests itself (first come first served, priorities lost);
-> lower, and Ollama sits partly idle.
-
-### Status and logs
-
-```bash
-ollamapower status            # front door, Ollama, queue, loaded models (VRAM %, last tok/s), active requests, warnings
-ollamapower status --watch    # refreshes every 2 s
-ollamapower status --json     # the same data as /ollamapower/status
-ollamapower logs [--follow] [--kind request] [--file events|requests] [-n 50] [--json]
-```
-
-`status` warns when a loaded model doesn't fully fit in VRAM (Ollama spilled
-part of it to the CPU): the case where split mode may help. The hub benchmarks
-such a model with helpers while it is idle (`planner.auto_benchmark`) and switches
-only if split mode is measurably faster.
-
-Logs are JSON lines in `<config dir>/logs/` (`events.jsonl`, `requests.jsonl`),
-rotated at 10 MB x 5. They hold metadata only (path, model, priority, status,
-queue and total time) - never prompts or responses.
-
-`status` talks to the running hub over a local-only channel (a `0600` Unix
-socket, or `127.0.0.1` on Windows, plus a secret in an owner-only file).
-
-## Adding helpers
-
-A helper is any other PC on your LAN with a GPU (or spare CPU/RAM). Install
-OllamaPower there too, then:
-
-1. On the **hub**: `ollamapower token show` prints the cluster token line.
-   Put it in the helper's `.env` (in the helper's config dir, see below), or
-   set `OLLAMAPOWER_TOKEN` there. Anyone with the token can join, so treat it
-   like a password.
-2. On the **helper**:
-
-   ```bash
-   ollamapower agent --hub 192.168.1.10          # the hub PC's LAN address (control port 9000)
-   ```
-
-   On first contact the agent shows the hub's **key fingerprint**; compare it
-   with the one the hub prints (`ollamapower init`, `ollamapower status` or the
-   Overview tab, where it is shown whole on two lines) and confirm; compare
-   every pair, not just the first few. Headless helpers pass it up front:
-   `--hub-fingerprint AB:CD:...`. The key is then pinned in `known_hub`; if
-   the hub's key ever changes, the agent refuses to connect and says so.
-
-The helper appears on the hub's Nodes tab. Helpers on Wi-Fi take part too:
-a split model costs only a few round trips per token, but the first load of
-a big model over Wi-Fi is slow (the helper's disk cache makes later loads
-fast), so the hub notes it.
-
-### What a helper lends (its owner decides)
-
-The helper's owner controls lending in the agent TUI (`E`), with
-`ollamapower agent rules`, or in `agent.toml`
-([`agent.example.toml`](agent.example.toml) lists every setting;
-`ollamapower agent example-config > agent.toml` in the config directory
-writes it on a machine that installed OllamaPower without this repository):
-
-| Rule | Default | Effect |
-|---|---|---|
-| `max_vram_gb`, `max_vram_percent` | no cap | most VRAM the hub may use |
-| `gpus` | all | which GPUs to lend |
-| `allow_cpu` | off | lend CPU/RAM when there is no GPU |
-| `allow_direct` | off | allow trusted-LAN direct mode (below) |
-| `disk_cache` | on | keep received model weights on disk, so the next load skips the network |
-| `schedule` | always | when to lend, local time, e.g. `22:00-08:00` or `09:00-12:00,20:00-23:00` (windows may cross midnight) |
-| `auto_yield` | on | step back when you use the GPU yourself (below) |
-| `yield_gpu_percent`, `yield_seconds` | 60 %, 20 s | what counts as "you are using it" |
-
-`P` in the agent TUI (or `ollamapower agent pause`) stops lending at once:
-any split session using the helper ends immediately.
-
-**Schedule and auto-yield are gentler.** When the schedule ends, or the
-helper's GPU has been busier than `yield_gpu_percent` for `yield_seconds`
-while the hub wasn't using it (you started a game or a render), the helper
-tells the hub it is stepping back. The hub lets the answers it is generating
-finish (up to 30 s), stops split mode, and serves the model from Ollama;
-nothing counts as a failure. When the helper lends again (the schedule
-starts, or the GPU has been calm for `yield_seconds`), split mode resumes
-without a new benchmark. The agent TUI and `agent status` say why the helper
-isn't lending right now. Limits: while the hub is actively using the GPU,
-your own load can't be told apart from it, so the helper steps back within
-`yield_seconds` of the hub's next pause; GPUs that don't report their load
-(Apple, some AMD) can't auto-yield - use the schedule or `P`.
-
-```bash
-ollamapower agent status [--json] [--watch]
-ollamapower agent pause | resume
-ollamapower agent rules --max-vram-gb 8 --gpus 0
-ollamapower agent net-test
-ollamapower agent example-config      # every agent.toml setting, commented
-ollamapower agent forget-hub [--hub 192.168.1.10[:9000] | --hub [fd00::1]:9000]
-                                      # only after you replaced the hub's key yourself (default: all)
-```
-
-### Managing helpers from the hub
-
-```bash
-ollamapower nodes list [--json] [--watch]
-ollamapower nodes show <name|id> [--json]
-ollamapower nodes pause|resume <name|id>      # the hub stops/starts using it
-ollamapower nodes kick <name|id>              # disconnect now (it reconnects after a minute)
-ollamapower nodes net-test <name|id>          # round-trip time and throughput both ways
-ollamapower nodes tunnel <name|id> secure|direct
-ollamapower nodes tunnel-test <name|id>       # split-mode tunnel speed: secure, and direct if allowed
-ollamapower nodes forget <name|id>            # an offline helper and its settings
-ollamapower models list [--json]
-```
-
-### Tunnel modes (how split-mode traffic travels)
-
-- **secure** (default): mutually authenticated TLS 1.3 between the hub and
-  the helper. For every split session both sides make a fresh key and
-  certificate and exchange only the certificates, over the already
-  authenticated control channel; each side then trusts exactly the other's
-  certificate for that session. `llama-server` on the hub talks to a local
-  relay, which carries the traffic through TLS to the helper's relay, which
-  hands it to `rpc-server` on the helper's loopback.
-- **direct**: plain TCP on a trusted, wired LAN, a bit faster. It is used only
-  if **both** owners opt in - the hub's owner with `nodes tunnel <helper>
-  direct` (or `T`), the helper's owner with `allow_direct`; if only one did,
-  secure is used. While it is on, the TUI and `status` show a warning.
-
-In both modes the helper's relay listens only while a session runs, and
-drops any connection that doesn't come from the hub's address before reading
-a byte (so strangers can't even start a TLS handshake).
-
-**What does encryption cost?** `ollamapower nodes tunnel-test <helper>` (or
-`M` on the Nodes tab) sends traffic through the real path - the helper's
-relay to a small echo server - and reports round-trip time and throughput for
-secure mode, and for direct mode too if the helper's owner allows it, plus the
-difference. The result is kept and shown in `nodes show`. On our test machine
-(loopback, 4 CPUs) the Python TLS relay carried about 1.8-2 Gbit/s and added
-about 0.03 ms per round trip: more than a gigabit LAN can carry, and under 1 %
-of a typical token's time for real models. Measure your own LAN; see
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
-
-## Split mode and the planner
-
-One model across the hub's GPU and the helpers' GPUs, for models that don't
-fit on the hub alone. The hub decides by itself, by measuring:
-
-```bash
-ollamapower models list                      # engine per model, why, last benchmark (Ollama vs split tok/s)
-ollamapower models suggest [--ctx N] [--json] # what the PCs connected now can run, and how fast
-ollamapower models show <model>              # memory estimate, plan, benchmark history
-ollamapower models benchmark <model> [--ctx N]
-ollamapower models pin <model> split|local   # override the benchmark   (TUI: L / F)
-ollamapower models force-local <model>       # same as `pin <model> local`
-ollamapower models unpin <model>             # automatic again           (TUI: U)
-ollamapower models exclude <model> <helper> [--undo]
-ollamapower models benchmarks [--markdown]   # every result; --markdown for docs/BENCHMARKS.md
-ollamapower llamacpp install | status [--config-dir DIR]   # the pinned llama.cpp (also done automatically)
-```
-
-### Which models can I run? (`models suggest`)
-
-For every installed model: dense or MoE, the planner's predicted speed on the
-hub alone and pooled over what the helpers lend right now (each helper's best
-GPU within its owner's caps, else its RAM if CPU lending is allowed), the
-measured speeds once benchmarked, or how much memory is missing. Then popular
-models you could pull, estimated from a small built-in table of approximate
-sizes. Nothing is started or loaded; `~` marks a prediction. A hub with a
-12 GB GPU and 32 GB RAM, a helper with a 12 GB GPU, a laptop lending RAM:
-
-```text
-MODEL                             SIZE TYPE   ALONE POOLED  VERDICT
-gpt-oss:120b                   60.5 GB MoE     ~1.0    ~13  pooled: ~13 tok/s (vs ~1.0 alone)
-qwen3:8b                        4.8 GB dense    ~52      -  runs fine on the hub
-Could pull (estimates from approximate sizes, not installed):
-qwen3:30b-a3b                  17.7 GB MoE      ~29    ~92  estimate, not installed: pooled: ~92 tok/s (vs ~29 alone)
-llama3.3:70b                   40.0 GB dense   ~0.4   ~1.2  estimate, not installed: pooled: ~1.2 tok/s (vs ~0.4 alone)
-1 more popular model(s) wouldn't fit even pooled (--json lists them).
-Pool now: desk RTX 4070 11.0 GB, laptop CPU 21.0 GB · hub RAM 29.0 GB
-```
-
-### How the hub decides
-
-1. **Does it fit?** From the model's GGUF file: weights + KV cache at the
-   plan's context + `planner.memory_margin` (10 %), against the hub's VRAM.
-   Ollama's `/api/ps` showing the model partly on the CPU (a *spill*) counts
-   as "doesn't fit" too. A model that fits stays on Ollama.
-2. **Benchmark.** The same workload on plain Ollama and on each split
-   candidate (all eligible helpers, best link first; GPU-only helpers before
-   adding CPU-only ones): a ~512-token prompt, then 128 tokens at temperature
-   0 with a fixed seed, through the real front door, tunnel and all. Measured:
-   load time, time to first token, prompt and generation tokens/s. Results
-   are kept in `state.json` (last 20 per model).
-3. **Choose.** Split only if its generation speed beats Ollama by
-   `planner.min_gain`, or if Ollama couldn't run the model at all.
-4. **Keep it honest.** The choice is tied to the model's digest, the context,
-   the llama.cpp build and the exact helpers with their tunnel modes. If any
-   of these changes (a helper leaves, the model is re-pulled), the model goes
-   back to Ollama until it is benchmarked again.
-
-Benchmarks run when you ask (`models benchmark`, `B` in the Models tab) and,
-with `planner.auto_benchmark` (on by default), by themselves for models that
-were used in the last day and don't fit - but only after the hub has been idle
-for `planner.idle_seconds` (5 minutes). An automatic benchmark unloads
-Ollama's models while it runs and gives way the moment a request arrives.
-
-Your pins always win over the benchmark (`models pin`, `force-local`); a
-pinned model is still never split if it fits on the hub's GPU alone.
-
-### What a split session does
-
-The first request for a model routed to split mode starts a session:
-
-1. The hub finds the model's GGUF file in Ollama's store (via `/api/show`; no
-   second copy).
-2. Ollama is asked to unload its models (`keep_alive: 0`) and the hub waits
-   until `/api/ps` is empty, so the two never fight over VRAM.
-3. Each helper of the plan starts `rpc-server` (bound to its loopback) and
-   reports how much memory its owner lends right now.
-4. The hub places the layers: its own GPU first, then the helpers, the rest on
-   its CPU; a helper never gets more than its owner's cap. `llama-server`
-   starts on `127.0.0.1` with exactly that placement. The first load sends
-   the weights to the helpers (the Models tab shows progress and an ETA in
-   secure mode); helpers cache them on disk, so later loads are quick.
-
-Clients don't notice: `/api/chat` and `/api/generate` are translated to and
-from llama-server (streaming NDJSON, the final `done` object with token counts
-and durations, tool calls, `format`, `think`, sampling options), `/v1/*`
-requests pass straight through, and `/api/ps` lists the split model with
-`"ollamapower": {"engine": "split", "nodes": [...]}`. The session stops after
-`split.keep_alive` seconds idle (Ollama gets the GPU back on its next
-request), when a helper leaves or its owner pauses, or when the plan changes.
-
-`rpc-server` and `llama-server` die with the process that started them, even
-when it is killed outright (`kill -9`, Task Manager): on Linux through
-`PR_SET_PDEATHSIG`, on Windows through a kill-on-close Job Object. macOS has no
-equivalent; after a hard kill there, end leftovers with `pkill rpc-server` or
-`pkill llama-server` (a normal stop, Ctrl+C or `kill`, cleans up everywhere).
-
-### When something breaks
-
-- **Before the first token** (a helper vanished, llama-server didn't start or
-  stalled): the request is answered by Ollama instead, transparently.
-- **Mid-answer:** the stream ends with an Ollama-style `{"error": ...}`
-  object (never a fake `done`), and the model is marked *degraded*.
-- **Stalls:** no token for `split.stall_timeout` seconds counts as a failure.
-- A degraded model runs on Ollama for at least `planner.retry_after` seconds
-  and until every helper of its plan is back; then split mode is used again.
-  Each failure in a row doubles the wait (up to an hour); an answer through
-  split mode starts it over. Failures that won't go away by themselves
-  (llama.cpp can't load the model, llama.cpp missing or the wrong build) wait
-  until the model, its context or llama.cpp change. A helper pausing or
-  leaving its schedule is never a failure. The reason, and the last lines of
-  llama-server's output on a crash, are in the warnings and the event log.
-
-Limits today: images (vision models' projector isn't loaded), raw/suffix
-`generate` prompts and per-request `num_ctx` are not supported in split mode
-(images get a clear 400; the context is fixed per plan); sharded models,
-adapters (LoRA) and safetensors imports can't be split; embeddings always run
-on Ollama; one split model at a time; one GPU per helper.
-
-### The llama.cpp download
-
-Every machine runs the same pinned llama.cpp release (**b11347**), downloaded
-from llama.cpp's GitHub releases on first use and checked against SHA-256
-hashes stored in OllamaPower (llama.cpp publishes none). Helpers download it
-when the agent starts (`auto_install = false` under `[llamacpp]` in
-`agent.toml` turns that off). Sizes:
-
-| Backend (`llamacpp.backend`) | Linux | Windows | macOS |
-|---|---|---|---|
-| `cpu` | 17.6 MB | 19.3 MB | 11.4 MB (Intel) |
-| `metal` (Apple Silicon) | - | - | 11.8 MB |
-| `vulkan` (any GPU) | 31.5 MB | 33.2 MB | - |
-| `cuda12` (NVIDIA) | 765 MB | 654 MB | - |
-| `cuda13` (NVIDIA) | 592 MB | 577 MB | - |
-| `rocm` (AMD) | 243 MB | 256 MB | - |
-
-`auto` picks Metal on Apple Silicon, Vulkan when there is a GPU and CPU
-otherwise, so a typical helper downloads about 30 MB once. CUDA is usually
-faster on NVIDIA but much bigger (it includes the CUDA runtime), so it is an
-opt-in. Machines in one cluster may use different backends; only the build
-must match (a helper with another build is shown as incompatible). Nothing is
-kept in RAM only: the build lives in `<config dir>/llamacpp/`, and received
-model weights are cached in `<config dir>/rpc-cache/` when `disk_cache` is on.
-
-## Configuration
-
-`ollamapower init` copies [`config.example.toml`](config.example.toml) to the
-config directory:
-
-| OS | Config dir |
-|---|---|
-| Linux | `~/.config/ollamapower/` |
-| macOS | `~/Library/Application Support/ollamapower/` |
-| Windows | `%APPDATA%\ollamapower\` |
-
-Every value in `config.toml` and a helper's `agent.toml` can be overridden
-with `OLLAMAPOWER_<SECTION>__<KEY>` env vars, e.g.
-`OLLAMAPOWER_HUB__MAX_CONCURRENCY=2` on the hub or
-`OLLAMAPOWER_LENDING__MAX_VRAM_GB=8` on a helper; `OLLAMAPOWER_CONFIG_DIR`
-moves the directory. Both files read the same environment, so each one skips
-the variables that belong to the other (`[hub]` and `[llamacpp]` exist in both
-with different keys); a name neither file knows is an error, as is an unknown
-key in a file. A value set by an env var wins over the file while it is set:
-editing that rule in the agent TUI or with `agent rules` changes the running
-agent but is not written to `agent.toml`. Values are checked strictly: whole
-numbers stay whole (`2.5` is refused, not truncated), TOML strings are not read
-as numbers, and `ollama.url` needs an explicit port. The cluster token lives only in `.env` (or the `OLLAMAPOWER_TOKEN`
-env var). On disk, all owner-only: `config.toml`, `.env`, `hub_key.pem`,
-`state.json` (+ `.bak`), `logs/`, and while running `run/`. A helper keeps
-`agent.toml`, `.env`, `known_hub` and `node_id` in the same kind of directory
-(`--config-dir` on `agent` commands to choose another; `llamacpp
-install|status --config-dir` too), and `agent-run/` while running.
-
-## How it works
-
-```
-clients ──► OllamaPower Hub (127.0.0.1:11434, Ollama-compatible API)
-              ├─ local-ollama → Ollama on 127.0.0.1:11435
-              └─ split        → llama-server --rpc → local relay ══ TLS 1.3 ══► helper relay → rpc-server (127.0.0.1)
-```
-
-- **Ollama doesn't do multi-machine inference.** Split mode uses llama.cpp's RPC
-  backend (`rpc-server` on helpers, `llama-server --rpc` on the Hub), loading the
-  GGUF blob Ollama already has on disk, so there is no second copy of the model.
-- llama.cpp RPC has no authentication or encryption, so `rpc-server` only ever
-  listens on the helper's loopback. The Hub reaches it through a mutually
-  authenticated TLS 1.3 tunnel (or, if both owners opt in, plain TCP limited
-  to the hub's address).
-- No GUI, ever: a terminal UI (Textual) plus a full CLI, and a headless mode.
-
-## Roadmap
-
-| Phase | Delivers |
-|---|---|
-| 0 Bootstrap (done) | Style notes, DCP reuse map, DCP networking/crypto/auth/scheduling ported with tests, lint + test + audit CI |
-| 1 Front door (done) | Ollama-compatible passthrough with true streaming, priority queue, `/ollamapower/status`, `doctor` port migration |
-| 2 Agents & telemetry (done) | Control plane with protocol version and Hub key pinning, GPU telemetry, net tests, Hub and agent TUIs, CLI |
-| 3 Split MVP (done) | llama.cpp pin/download/verify, Ollama blob resolver, `rpc-server`/`llama-server` lifecycle, layer placement under the lending caps, API translation, direct-mode relay |
-| 4 Secure tunnel (done) | Per-session pinned TLS 1.3 relays, hub-address allowlist checked before TLS, two-owner direct mode, `nodes tunnel-test` overhead measurement |
-| 5 Planner (done) | Memory estimate, spill detection, benchmarks through the real path, automatic "never slower" choice tied to a benchmark key, pins and exclusions, idle auto-benchmarks, transparent fallback, degraded plans and recovery |
-| **6 Lending & polish** (done) | Lending schedules, auto-yield with graceful drain, `agent.example.toml`, start scripts, `models benchmarks --markdown` for real numbers |
-
-**v2: any PC helps** ([`docs/DESIGN_V2.md`](docs/DESIGN_V2.md)):
-
-| Phase | Delivers |
-|---|---|
-| A RAM pooling (done) | The hub's and helpers' RAM pooled (GPU-less hubs and helpers first-class); a helper lends its GPU and its RAM together; MoE experts in each machine's RAM, hot parts on its GPU (hub); an MoE-aware cost model predicting tok/s; a model too big for the hub routed to split at once and benchmarked without the hopeless Ollama run; Wi-Fi helpers |
-| B `models suggest` (done) | "With these PCs you can run X at about N tok/s", for installed models and a catalog of popular ones |
-| C Speculative decoding (done) | Models with MTP heads: drafted tokens checked in one trip through every machine; benchmarked, kept only if faster |
-| D Tensor split (done) | Dense models on wired machines, every machine working on every token (llama.cpp's experimental `-sm tensor`); benchmarked, kept only if faster |
-| E Later | Helpers fetch their slice of the model themselves; most-used experts pinned to GPUs |
-
-OllamaPower only makes the Hub stronger. Remote access, device pairing and
-per-device quotas are [OllamaGate](https://github.com/111yoav111/OllamaGate)'s
-job; the two will be merged later (OllamaGate in front, OllamaPower behind it).
-
-## Development
-
-Python 3.11+.
-
-```bash
-python -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-dev.lock
-.venv/bin/pip install --no-deps -e .
-.venv/bin/python -m pytest -q
-OLLAMAPOWER_TEST_LLAMACPP=/path/to/llama-b11347 .venv/bin/python -m pytest -q tests/test_split_real.py   # real llama.cpp
-.venv/bin/ruff check . && .venv/bin/ruff format --check .
-```
-
-Lock files are generated with
-`uv pip compile pyproject.toml [--extra dev] --universal --generate-hashes --python-version 3.11`.
-
-Project docs: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) (real measurements), [`docs/FIELD_TEST.md`](docs/FIELD_TEST.md) (the first two-PC run: what broke, what is open), [`docs/STYLE_NOTES.md`](docs/STYLE_NOTES.md) (conventions shared
-with OllamaGate), [`docs/DCP_REUSE.md`](docs/DCP_REUSE.md) (what came from DCP
-and why), [`SECURITY.md`](SECURITY.md).
+| "Split mode can't run it right now" (503) | The model is too big for the hub and the helpers lack room: close what uses their GPU (e.g. a model loaded in their own Ollama) or add a helper. `op models suggest` shows what's missing. |
+| Hub says port 11434 is in use | Ollama still listens there: run `op setup` (or move it by hand, step 2). |
+| Apps find no Ollama / no models | The hub isn't running (Ollama is on 11435): start `op hub`, or `op uninstall` to put Ollama back on 11434. Don't start `ollama serve` yourself: it's a second, empty Ollama. |
+| Anything else | `op doctor` on the hub, `op logs` for the event log. |
+
+## More
+
+Everything else - the hub's terminal UI and its keys, every command, what a
+helper's owner controls, tunnel modes, how the hub decides when to split, and
+all the settings - is in [`docs/REFERENCE.md`](docs/REFERENCE.md). Security:
+[`SECURITY.md`](SECURITY.md). Real measurements: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## Credits
 
 OllamaPower is the continuation of
 [DCP - Dynamic Compute Power](https://github.com/111yoav111/Dynamic-Compute-Power),
-whose encrypted protocol, token auth, priority queue and load balancer it reuses
+whose encrypted protocol, token auth and priority queue it reuses
 (MIT). Split mode is built on [llama.cpp](https://github.com/ggml-org/llama.cpp)'s
 RPC backend; models come from your local [Ollama](https://ollama.com).
 

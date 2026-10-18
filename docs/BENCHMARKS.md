@@ -8,7 +8,7 @@ with `ollamapower nodes tunnel-test <helper>` and `ollamapower status`
 ## Front-door overhead (requests Ollama serves)
 
 What the front door adds to a request it passes to Ollama
-(`scripts/bench_frontdoor.py`: a fake Ollama and the front door in separate
+(a benchmark script, `scripts/bench_frontdoor.py` in the git history: a fake Ollama and the front door in separate
 processes, small non-streaming `/api/chat` requests, then 200-chunk streams).
 
 **Loopback, development container (4 vCPUs, Python 3.11, uvicorn with h11).**

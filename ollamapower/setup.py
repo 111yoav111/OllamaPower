@@ -104,13 +104,25 @@ MIN_PREFIX = 16  # a firewall rule never covers more than a /16 (65 536 addresse
 def lan_networks(addrs: dict[str, list[object]] | None = None) -> dict[str, str]:
     """The private IPv4 networks this PC is on, each with its interfaces (``{"192.168.1.0/24": "eth0"}``):
     who the firewall rules let in. Never wider than a /16, never loopback, link-local or a container bridge."""
+    nets: dict[ipaddress.IPv4Network, list[str]] = {}
+    for name, _ip, net in _lan_entries(addrs):
+        nets.setdefault(net, []).append(name)
+    return {str(n): ", ".join(sorted(nets[n])) for n in sorted(nets)}
+
+
+def lan_addresses(addrs: dict[str, list[object]] | None = None) -> list[str]:
+    """This PC's own addresses on those networks (``192.168.1.10``): what helpers pass to ``--hub``."""
+    return sorted({ip for _name, ip, _net in _lan_entries(addrs)}, key=ipaddress.IPv4Address)
+
+
+def _lan_entries(addrs: dict[str, list[object]] | None) -> list[tuple[str, str, ipaddress.IPv4Network]]:
     import socket
 
     if addrs is None:
         import psutil
 
         addrs = psutil.net_if_addrs()  # type: ignore[assignment]
-    nets: dict[ipaddress.IPv4Network, list[str]] = {}
+    out = []
     for name, entries in (addrs or {}).items():
         if name.startswith(VIRTUAL_IFACES):
             continue
@@ -118,12 +130,12 @@ def lan_networks(addrs: dict[str, list[object]] | None = None) -> dict[str, str]
             if getattr(a, "family", None) != socket.AF_INET or not getattr(a, "netmask", None):
                 continue
             try:
-                net = ipaddress.IPv4Interface(f"{a.address}/{a.netmask}").network  # type: ignore[attr-defined]
+                iface = ipaddress.IPv4Interface(f"{a.address}/{a.netmask}")  # type: ignore[attr-defined]
             except ValueError:
                 continue
-            if lan_network_ok(net):
-                nets.setdefault(net, []).append(name)
-    return {str(n): ", ".join(sorted(nets[n])) for n in sorted(nets)}
+            if lan_network_ok(iface.network):
+                out.append((name, str(iface.ip), iface.network))
+    return out
 
 
 def lan_network_ok(net: ipaddress.IPv4Network) -> bool:

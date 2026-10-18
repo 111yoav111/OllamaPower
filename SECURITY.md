@@ -245,6 +245,31 @@ as it could use Ollama directly before.
   `secrets`, sent only inside the encrypted session and compared in constant
   time. Empty or short tokens are refused.
 
+### `setup` and `uninstall` (sudo)
+
+OllamaPower itself never runs as root: the hub and the agent refuse to, and so do
+`setup` and `uninstall`. Those two run as the user and call `sudo --` only for
+fixed argument lists, never through a shell; the only values in them are
+validated port numbers, `127.0.0.1` and this PC's private LAN networks (at most a
+/16, never Docker or VM bridges). Every command is shown, with a plain-language
+summary, before the user confirms; `--print` only shows them.
+
+- Ollama's port is set in a drop-in file of OllamaPower's own
+  (`/etc/systemd/system/ollama.service.d/ollamapower.conf`); the owner's
+  `override.conf` is never edited, and setup refuses if anything else already
+  sets `OLLAMA_HOST`. Uninstall deletes that one file.
+- Before adding a firewall rule, setup checks (read-only, independent of the
+  system language) whether it exists already; such a rule is left alone and
+  never removed by uninstall. Only rules really added are recorded, in an
+  owner-only file.
+- Uninstall refuses a record it didn't write (another port, a network that isn't
+  a private LAN, an unknown firewall), so a tampered record can't make it close
+  other ports. An uninstall that fails half-way keeps the record, and running it
+  again finishes the job.
+- Opening port 9000 exposes the control plane only: it drops non-private
+  addresses before any handshake and only admits helpers holding the cluster
+  token. Ollama's own API stays on loopback.
+
 ## Known gaps (closed in later phases)
 
 - **Trust on first use.** If someone already impersonates the hub at the

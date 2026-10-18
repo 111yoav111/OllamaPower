@@ -206,6 +206,21 @@ class Hub:
 
     # ----- snapshot --------------------------------------------------------------------
 
+    def join_addresses(self) -> list[str]:
+        """What helpers pass to ``--hub``: this PC's LAN addresses (with the port if it isn't the default)."""
+        from ..agent.config import DEFAULT_HUB_PORT
+        from ..config import is_loopback_host
+        from ..setup import lan_addresses
+
+        if self.control is None or is_loopback_host(self.config.control.host):
+            return []
+        port = self.config.control.port
+        try:
+            ips = lan_addresses()
+        except Exception:  # noqa: BLE001 - a hint, never a reason for status to fail
+            return []
+        return [ip if port == DEFAULT_HUB_PORT else f"{ip}:{port}" for ip in ips]
+
     def warnings(self) -> list[str]:
         warnings = list(self.extra_warnings)
         warnings.extend(self.split.warnings())
@@ -326,6 +341,7 @@ class Hub:
                 "configured": self.config.control.enabled,
                 "port": self.control.port if self.control is not None and self.control.server else None,
                 "fingerprint": self.fingerprint,
+                "join": self.join_addresses(),
                 "bans": {ip: round(left) for ip, left in self.control.bans.active().items()} if self.control else {},
             },
             "hub_hardware": {**self.local_static, "live": self.local_sample},

@@ -41,7 +41,9 @@ from .cli_common import (
 )
 from .textsafe import safe
 
-cli = typer.Typer(add_completion=False, no_args_is_help=True, help="OllamaPower - cluster-boosted Ollama")
+cli = typer.Typer(
+    add_completion=False, help="OllamaPower - run models bigger than any one PC by pooling the PCs you have"
+)
 nodes_cli = typer.Typer(no_args_is_help=True, help="Helpers known to the hub")
 models_cli = typer.Typer(no_args_is_help=True, help="Models and their plans")
 token_cli = typer.Typer(no_args_is_help=True, help="The cluster token helpers need")
@@ -63,9 +65,71 @@ def _one_of(value: str, allowed: tuple[str, ...], what: str) -> None:
         raise typer.BadParameter(f"{what} must be {' or '.join(allowed)}, not {value!r}")
 
 
-@cli.callback()
-def _root() -> None:
-    """OllamaPower - cluster-boosted Ollama."""
+@cli.callback(invoke_without_command=True)
+def _root(ctx: typer.Context) -> None:
+    """OllamaPower - run models bigger than any one PC by pooling the PCs you have."""
+    if ctx.invoked_subcommand is None:
+        for line in next_steps():
+            typer.echo(line)
+
+
+def op_clash() -> str:
+    """What `op` on the PATH is when it isn't OllamaPower's (the 1Password CLI has the same name), or ""."""
+    import shutil
+
+    op, ours = shutil.which("op"), shutil.which("ollamapower")
+    if not op or not ours or Path(op).parent == Path(ours).parent:
+        return ""
+    return f"another program ({op}, maybe the 1Password CLI)"
+
+
+def next_steps() -> list[str]:
+    """What `op` alone prints: where this PC is in the setup, the next step, and the everyday commands."""
+    from .config import ConfigError, load_config
+    from .doctor import ollama_version, who_answers
+
+    lines = [f"OllamaPower {__version__}: run models bigger than any one PC by pooling the PCs you have.", ""]
+    clash = op_clash()
+    if clash:
+        lines += [f"Note: `op` on this PC is {clash}, not OllamaPower: type `ollamapower` instead of `op`.", ""]
+    try:
+        config = load_config(None)
+    except ConfigError as exc:
+        return [*lines, f"Your config.toml has a problem: {exc}", "Fix it, or run `op doctor` for details."]
+    base = config.config_dir
+    if (base / "config.toml").exists():
+        front = who_answers(config.frontdoor_url)
+        if front == "ollamapower":
+            step = "The hub is running: `op status` shows what it does, `op models suggest` what you can run."
+        elif front == "ollama":
+            step = "Ollama still has port 11434: `op setup` moves it next door, then `op hub`."
+        elif ollama_version(config.ollama.url) is not None:
+            step = (
+                "Start the hub: `op hub`. Helpers join with the command it prints and the token `op token show` prints."
+            )
+        else:
+            step = "Ollama isn't answering: start it, then `op setup` and `op hub` (`op doctor` checks it all)."
+    elif (base / "agent.toml").exists() or (base / "known_hub").exists():
+        step = "This PC is a helper: `op agent` lends it to the hub (`op agent --hub <hub address>` the first time)."
+    else:
+        step = (
+            "Not set up yet. On the PC with Ollama: `op init`, `op setup`, `op hub`.\n"
+            "           On a PC that should help: `op agent --hub <hub address>` (it asks for the hub's token)."
+        )
+    lines += [
+        f"Next step: {step}",
+        "",
+        "Everyday commands:",
+        "  op hub                    start the hub (on the PC with Ollama)",
+        "  op agent --hub <address>  lend this PC to a hub",
+        "  op status                 what the hub is doing right now",
+        "  op models suggest         which models your PCs can run together, and how fast",
+        "  op doctor                 check everything, with fixes",
+        "  op setup / op uninstall   move Ollama aside for the hub / put it back",
+        "",
+        "All commands: op --help",
+    ]
+    return lines
 
 
 @cli.command()
@@ -353,6 +417,13 @@ def hub(
         typer.echo(f"OllamaPower {__version__}: front door {config.frontdoor_url} -> Ollama {config.ollama.url}")
         if control_sock is not None:
             typer.echo(f"Helpers connect to port {config.control.port}; hub key fingerprint:\n  {fingerprint}")
+            from .config import is_loopback_host
+            from .setup import lan_addresses
+
+            port = "" if config.control.port == 9000 else f":{config.control.port}"
+            ips = [] if is_loopback_host(config.control.host) else lan_addresses()
+            if ips:
+                typer.echo(f"On each helper PC: op agent --hub {ips[0]}{port}")
         typer.echo(f"Try it: curl {config.frontdoor_url}/api/tags   (and `ollamapower status` in another terminal)")
 
     async def main() -> None:
