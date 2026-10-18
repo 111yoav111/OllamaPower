@@ -70,8 +70,8 @@ def test_ollama_target_normalises():
 def test_lan_networks_are_private_narrow_and_never_container_bridges():
     nets = s.lan_networks(
         {
-            "enp3s0": [addr("192.168.1.156", "255.255.255.0")],
-            "wlan0": [addr("192.168.1.32", "255.255.255.0")],  # same network twice: one rule
+            "enp3s0": [addr("192.168.1.20", "255.255.255.0")],
+            "wlan0": [addr("192.168.1.21", "255.255.255.0")],  # same network twice: one rule
             "lo": [addr("127.0.0.1", "255.0.0.0")],
             "pub": [addr("8.8.8.8", "255.255.255.0")],
             "ll": [addr("169.254.3.3", "255.255.0.0")],
@@ -261,12 +261,12 @@ def test_sudo_timing_out_is_a_clean_error(monkeypatch):
 def test_lan_addresses_are_what_helpers_type():
     assert s.lan_addresses(
         {
-            "wlan0": [addr("192.168.1.32", "255.255.255.0")],
-            "enp3s0": [addr("192.168.1.156", "255.255.255.0")],
+            "wlan0": [addr("192.168.1.21", "255.255.255.0")],
+            "enp3s0": [addr("192.168.1.20", "255.255.255.0")],
             "docker0": [addr("172.17.0.1", "255.255.0.0")],
             "lo": [addr("127.0.0.1", "255.0.0.0")],
         }
-    ) == ["192.168.1.32", "192.168.1.156"]
+    ) == ["192.168.1.20", "192.168.1.21"]
 
 
 @pytest.mark.parametrize(

@@ -813,7 +813,7 @@ async def test_reconnect_fails_what_waited_on_the_old_connection(setup):
 def test_ipv4_helpers_on_the_dual_stack_listener_get_their_plain_address():
     from ollamapower.hub.control_server import plain_ip
 
-    assert plain_ip("::ffff:192.168.1.36") == "192.168.1.36"
-    assert plain_ip("192.168.1.36") == "192.168.1.36"
+    assert plain_ip("::ffff:192.168.1.30") == "192.168.1.30"
+    assert plain_ip("192.168.1.30") == "192.168.1.30"
     assert plain_ip("fe80::1%eth0") == "fe80::1%eth0"
     assert plain_ip("fd00::1") == "fd00::1"
